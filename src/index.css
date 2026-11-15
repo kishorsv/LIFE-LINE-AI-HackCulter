@@ -8,6 +8,10 @@
     --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
   }
 
+  html {
+    scroll-behavior: smooth;
+  }
+
   body {
     font-family: var(--font-sans);
   }
@@ -25,7 +29,39 @@
   font-variant-numeric: tabular-nums;
 }
 
+@keyframes scrollCueFloat {
+  0%, 100% {
+    transform: translateY(0);
+    opacity: 0.55;
+  }
+  50% {
+    transform: translateY(6px);
+    opacity: 1;
+  }
+}
+
+@keyframes pulseSignalTravel {
+  0% {
+    stroke-dashoffset: 240;
+  }
+  100% {
+    stroke-dashoffset: 0;
+  }
+}
+
+.animate-scroll-cue {
+  animation: scrollCueFloat 2.1s ease-in-out infinite;
+}
+
+.animate-pulse-travel {
+  stroke-dasharray: 240;
+  animation: pulseSignalTravel 3.6s linear infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
