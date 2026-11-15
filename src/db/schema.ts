@@ -124,6 +124,8 @@ export const emergencyIncidents = pgTable(
     index('incidents_user_idx').on(table.userId),
     index('incidents_status_idx').on(table.status),
     index('incidents_created_idx').on(table.createdAt),
+    index('incidents_user_created_idx').on(table.userId, table.createdAt),
+    index('incidents_sim_status_created_idx').on(table.isSimulated, table.status, table.createdAt),
     uniqueIndex('incidents_user_idempotency_idx').on(table.userId, table.idempotencyKey),
   ]
 );
@@ -226,7 +228,10 @@ export const notifications = pgTable(
     isSimulated: boolean('is_simulated').notNull().default(false),
     createdAt: timestamp('created_at').defaultNow().notNull(),
   },
-  (table) => [index('notifications_user_idx').on(table.userId)]
+  (table) => [
+    index('notifications_user_idx').on(table.userId),
+    index('notifications_user_read_created_idx').on(table.userId, table.isRead, table.createdAt),
+  ]
 );
 
 // 10. notification_delivery_logs
@@ -401,6 +406,7 @@ export const safetyReports = pgTable(
   (table) => [
     index('safety_reports_created_idx').on(table.createdAt),
     index('safety_reports_coords_idx').on(table.latitude, table.longitude),
+    index('safety_reports_sim_created_idx').on(table.isSimulated, table.createdAt),
   ]
 );
 

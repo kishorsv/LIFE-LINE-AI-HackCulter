@@ -2,6 +2,9 @@ import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { promisify } from 'node:util';
+
+const pbkdf2Async = promisify(crypto.pbkdf2);
 
 const resolvedDbPath = process.env.LIFELINE_DB_PATH
   ? path.resolve(process.env.LIFELINE_DB_PATH)
@@ -15,11 +18,21 @@ if (!fs.existsSync(dbDir)) {
 const sqlite = new DatabaseSync(resolvedDbPath);
 sqlite.exec('PRAGMA foreign_keys = ON;');
 sqlite.exec('PRAGMA journal_mode = WAL;');
+sqlite.exec('PRAGMA synchronous = NORMAL;');
 sqlite.exec('PRAGMA busy_timeout = 5000;');
+sqlite.exec('PRAGMA cache_size = -16000;');
+sqlite.exec('PRAGMA temp_store = MEMORY;');
+sqlite.exec('PRAGMA mmap_size = 67108864;');
 
 export function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16).toString('hex');
   const derived = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
+  return `${salt}:${derived}`;
+}
+
+export async function hashPasswordAsync(password: string): Promise<string> {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = (await pbkdf2Async(password, salt, 100000, 64, 'sha512')).toString('hex');
   return `${salt}:${derived}`;
 }
 
@@ -29,6 +42,16 @@ export function verifyPassword(password: string, stored: string): boolean {
   const [salt, original] = parts;
   if (!salt || !original) return false;
   const derived = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
+  if (derived.length !== original.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(derived, 'hex'), Buffer.from(original, 'hex'));
+}
+
+export async function verifyPasswordAsync(password: string, stored: string): Promise<boolean> {
+  const parts = stored.split(':');
+  if (parts.length !== 2) return false;
+  const [salt, original] = parts;
+  if (!salt || !original) return false;
+  const derived = (await pbkdf2Async(password, salt, 100000, 64, 'sha512')).toString('hex');
   if (derived.length !== original.length) return false;
   return crypto.timingSafeEqual(Buffer.from(derived, 'hex'), Buffer.from(original, 'hex'));
 }
@@ -415,10 +438,23 @@ export function runSqliteMigrations(): string {
     });
   }
 
+  if (!applied.has('v5_scalability_indexes')) {
+    runSqliteTransaction(() => {
+      sqlite.exec(`
+        CREATE INDEX IF NOT EXISTS incidents_user_created_idx ON emergency_incidents(user_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS incidents_sim_status_created_idx ON emergency_incidents(is_simulated, status, created_at DESC);
+        CREATE INDEX IF NOT EXISTS notifications_user_read_created_idx ON notifications(user_id, is_read, created_at DESC);
+        CREATE INDEX IF NOT EXISTS safety_reports_sim_created_idx ON safety_reports(is_simulated, created_at DESC);
+        CREATE INDEX IF NOT EXISTS audit_logs_created_idx ON audit_logs(created_at DESC);
+      `);
+      sqlite.prepare("INSERT OR IGNORE INTO schema_migrations (version) VALUES ('v5_scalability_indexes')").run();
+    });
+  }
+
   const latest = sqlite
     .prepare('SELECT version FROM schema_migrations ORDER BY applied_at DESC, version DESC LIMIT 1')
     .get() as { version: string } | undefined;
-  return latest?.version || 'v4_pulse_journeys_reports_responders';
+  return latest?.version || 'v5_scalability_indexes';
 }
 
 export function seedSqliteInitialData() {

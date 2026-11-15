@@ -1,4 +1,5 @@
 import { NextFunction, Request, Response } from 'express';
+import { cacheQueue } from '../services/cacheQueue.ts';
 
 interface RateLimitOptions {
   name: string;
@@ -8,7 +9,19 @@ interface RateLimitOptions {
   message?: string;
 }
 
-const buckets = new Map<string, number[]>();
+const buckets = new Map<string, { timestamps: number[]; lastSeen: number }>();
+const MAX_LOCAL_BUCKETS = 10_000;
+
+// Periodic background sweep prevents sliding-window memory growth under sustained DDoS/high traffic
+const sweepTimer = setInterval(() => {
+  const cutoff = Date.now() - 20 * 60 * 1000;
+  for (const [key, entry] of buckets.entries()) {
+    if (entry.lastSeen < cutoff) {
+      buckets.delete(key);
+    }
+  }
+}, 60_000);
+sweepTimer.unref();
 
 export function resetRateLimits() {
   buckets.clear();
@@ -21,17 +34,22 @@ export function checkSlidingWindowLimit(key: string, windowMs: number, maxReques
 } {
   const now = Date.now();
   const windowStart = now - windowMs;
-  const timestamps = (buckets.get(key) || []).filter((t) => t > windowStart);
+  const existing = buckets.get(key);
+  const timestamps = (existing?.timestamps || []).filter((t) => t > windowStart);
 
   if (timestamps.length >= maxRequests) {
     const oldest = timestamps[0] || now;
     const retryAfterSeconds = Math.max(1, Math.ceil((oldest + windowMs - now) / 1000));
-    buckets.set(key, timestamps);
+    buckets.set(key, { timestamps, lastSeen: now });
     return { allowed: false, remaining: 0, retryAfterSeconds };
   }
 
   timestamps.push(now);
-  buckets.set(key, timestamps);
+  if (!existing && buckets.size >= MAX_LOCAL_BUCKETS) {
+    const oldestKey = buckets.keys().next().value;
+    if (oldestKey !== undefined) buckets.delete(oldestKey);
+  }
+  buckets.set(key, { timestamps, lastSeen: now });
   return {
     allowed: true,
     remaining: Math.max(0, maxRequests - timestamps.length),
@@ -40,11 +58,17 @@ export function checkSlidingWindowLimit(key: string, windowMs: number, maxReques
 }
 
 export function createRateLimiter(options: RateLimitOptions) {
-  return (req: Request, res: Response, next: NextFunction) => {
+  return async (req: Request, res: Response, next: NextFunction) => {
     const ip = req.ip || req.socket.remoteAddress || 'unknown';
     const customKey = options.keyGenerator ? options.keyGenerator(req) : ip;
     const bucketKey = `${options.name}:${customKey}`;
-    const result = checkSlidingWindowLimit(bucketKey, options.windowMs, options.maxRequests);
+
+    const distributed = await cacheQueue.checkDistributedSlidingWindow(
+      bucketKey,
+      options.windowMs,
+      options.maxRequests
+    );
+    const result = distributed || checkSlidingWindowLimit(bucketKey, options.windowMs, options.maxRequests);
 
     res.setHeader('X-RateLimit-Limit', String(options.maxRequests));
     res.setHeader('X-RateLimit-Remaining', String(result.remaining));

@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { and, asc, desc, eq, sql } from 'drizzle-orm';
-import { db, hasPostgresConfig, pool } from './index.ts';
+import { db, hasPostgresConfig, pool, queryWithRetry } from './index.ts';
 import {
   aiAssessments,
   aiRecommendations,
@@ -21,14 +21,16 @@ import {
 } from './schema.ts';
 import {
   hashOneTimeCode,
-  hashPassword,
+  hashPasswordAsync,
   runSqliteMigrations,
   runSqliteTransaction,
   seedSqliteInitialData,
   sqlite,
   verifyOneTimeCode,
-  verifyPassword,
+  verifyPasswordAsync,
 } from './local-store.ts';
+import { cacheQueue } from '../services/cacheQueue.ts';
+import { metrics } from '../services/metrics.ts';
 
 export type UserRole =
   | 'regular_user'
@@ -400,8 +402,18 @@ async function runPostgresMigrations(): Promise<string> {
     await pool.query("INSERT INTO schema_migrations (version) VALUES ('v4_pulse_journeys_reports_responders') ON CONFLICT DO NOTHING");
   }
 
+  if (!applied.has('v5_scalability_indexes')) {
+    await queryWithRetry(`
+      CREATE INDEX IF NOT EXISTS incidents_user_created_idx ON emergency_incidents(user_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS incidents_sim_status_created_idx ON emergency_incidents(is_simulated, status, created_at DESC);
+      CREATE INDEX IF NOT EXISTS notifications_user_read_created_idx ON notifications(user_id, is_read, created_at DESC);
+      CREATE INDEX IF NOT EXISTS safety_reports_sim_created_idx ON safety_reports(is_simulated, created_at DESC);
+    `);
+    await queryWithRetry("INSERT INTO schema_migrations (version) VALUES ('v5_scalability_indexes') ON CONFLICT DO NOTHING");
+  }
+
   // Seed directory & demo accounts if PG database is newly provisioned
-  const orgCnt = await pool.query('SELECT COUNT(*)::int AS cnt FROM support_organizations');
+  const orgCnt = await queryWithRetry<{ cnt: number }>('SELECT COUNT(*)::int AS cnt FROM support_organizations');
   if (orgCnt.rows[0]?.cnt === 0) {
     const seedOrgs = [
       ['National Domestic Violence Hotline (Sample Reference)', 'Government Helpline', '1-800-799-7233', 'https://www.thehotline.org', 'support@example-hotline.org', 'Public Directory (Sample)', 'Sample Safety Helpline Registry', 'National Toll-Free Helpline · Text START to 88788', 'San Francisco', 'CA', 37.7749, -122.4194, '24/7 Confidential Support', true, 'Sample reference listing — verify local emergency numbers (911/112) in crisis.'],
@@ -426,9 +438,9 @@ async function runPostgresMigrations(): Promise<string> {
     }
   }
 
-  const userCnt = await pool.query('SELECT COUNT(*)::int AS cnt FROM users');
+  const userCnt = await queryWithRetry<{ cnt: number }>('SELECT COUNT(*)::int AS cnt FROM users');
   if (userCnt.rows[0]?.cnt === 0) {
-    const demoPass = hashPassword('LifelineDemo2026!');
+    const demoPass = await hashPasswordAsync('LifelineDemo2026!');
     const demoAccounts = [
       ['demo-user-maya', 'maya.demo@lifeline-ai.demo', 'Maya Lin (Demo User)', 'regular_user', '+1-415-555-0101', 'Allergic to penicillin. Prefers silent text check-ins during late commute.'],
       ['demo-operator-elena', 'operator.demo@lifeline-ai.demo', 'Elena Vance (Demo Operator)', 'emergency_operator', '+1-415-555-0190', 'Shift Lead — Youth & Women Rapid Safety Desk'],
@@ -697,7 +709,7 @@ export async function registerEmailUser(input: {
   const email = input.email.trim().toLowerCase();
   const displayName = input.displayName.trim() || email.split('@')[0];
   const uid = `local_${crypto.randomUUID()}`;
-  const passwordHash = hashPassword(input.password);
+  const passwordHash = await hashPasswordAsync(input.password);
   const verificationCode = String(crypto.randomInt(100000, 999999));
   const codeHash = hashOneTimeCode(verificationCode);
   const expiresAt = new Date(Date.now() + CODE_TTL_MS);
@@ -755,18 +767,22 @@ export async function loginEmailUser(email: string, password: string): Promise<A
   const normalizedEmail = email.trim().toLowerCase();
 
   if (dialect === 'postgres') {
+    const t0 = performance.now();
     const rows = await db.select().from(users).where(eq(users.email, normalizedEmail)).limit(1);
+    metrics.recordDbQuery(performance.now() - t0);
     const row = rows[0];
-    if (!row || !row.passwordHash || !verifyPassword(password, row.passwordHash)) {
+    if (!row || !row.passwordHash || !(await verifyPasswordAsync(password, row.passwordHash))) {
       throw new Error('Invalid email or password.');
     }
     return mapPgUser(row);
   }
 
+  const t0 = performance.now();
   const row = sqlite.prepare('SELECT * FROM users WHERE email = ?').get(normalizedEmail) as
     | Record<string, unknown>
     | undefined;
-  if (!row || !row.password_hash || !verifyPassword(password, String(row.password_hash))) {
+  metrics.recordDbQuery(performance.now() - t0);
+  if (!row || !row.password_hash || !(await verifyPasswordAsync(password, String(row.password_hash)))) {
     throw new Error('Invalid email or password.');
   }
   return mapSqliteUser(row);
@@ -976,7 +992,7 @@ export async function completePasswordReset(
       };
     }
 
-    const hash = hashPassword(newPassword);
+    const hash = await hashPasswordAsync(newPassword);
     await db
       .update(users)
       .set({
@@ -1019,7 +1035,7 @@ export async function completePasswordReset(
     return { ok: false, reason: 'Invalid reset code.' };
   }
 
-  const hash = hashPassword(newPassword);
+  const hash = await hashPasswordAsync(newPassword);
   sqlite
     .prepare(
       "UPDATE users SET password_hash = ?, reset_code_hash = '', reset_code_expires_at = NULL, reset_attempts = 0, updated_at = datetime('now') WHERE id = ?"
@@ -2120,44 +2136,58 @@ export async function updateIncidentStatus(input: {
   return getIncidentById(input.incidentId);
 }
 
-// Support Directory
+// Support Directory (cached cleanly for 60s — strictly public non-sensitive registry data)
 export async function listSupportDirectory(category?: string, query?: string) {
   const dialect = await ensureDialect();
+  const cacheKey = `support_directory:${dialect}:all`;
 
-  let rows: Record<string, unknown>[];
-  if (dialect === 'postgres') {
-    const res = await pool.query(
-      `SELECT o.*, l.address, l.city, l.region, l.latitude, l.longitude, l.operating_hours, l.is_24_hours, l.availability_note, l.last_updated_at
-       FROM support_organizations o
-       JOIN support_locations l ON l.organization_id = o.id
-       ORDER BY o.id ASC`
-    );
-    rows = res.rows;
-  } else {
-    rows = sqlite
-      .prepare(
+  type SupportDirectoryRow = {
+    id: number;
+    name: string;
+    category: string;
+    phone: string;
+    website: string;
+    email: string;
+    verificationStatus: string;
+    source: string;
+    isSampleData: boolean;
+    address: string;
+    city: string;
+    region: string;
+    latitude: number;
+    longitude: number;
+    operatingHours: string;
+    is24Hours: boolean;
+    availabilityNote: string;
+    lastUpdatedAt: string;
+  };
+
+  let baseList = await cacheQueue.getCachedJson<SupportDirectoryRow[]>(cacheKey);
+
+  if (!baseList) {
+    const t0 = performance.now();
+    let rows: Record<string, unknown>[];
+    if (dialect === 'postgres') {
+      const res = await queryWithRetry(
         `SELECT o.*, l.address, l.city, l.region, l.latitude, l.longitude, l.operating_hours, l.is_24_hours, l.availability_note, l.last_updated_at
          FROM support_organizations o
          JOIN support_locations l ON l.organization_id = o.id
          ORDER BY o.id ASC`
-      )
-      .all() as Record<string, unknown>[];
-  }
+      );
+      rows = res.rows;
+    } else {
+      rows = sqlite
+        .prepare(
+          `SELECT o.*, l.address, l.city, l.region, l.latitude, l.longitude, l.operating_hours, l.is_24_hours, l.availability_note, l.last_updated_at
+           FROM support_organizations o
+           JOIN support_locations l ON l.organization_id = o.id
+           ORDER BY o.id ASC`
+        )
+        .all() as Record<string, unknown>[];
+      metrics.recordDbQuery(performance.now() - t0);
+    }
 
-  return rows
-    .filter((r) => {
-      if (category && category !== 'All' && String(r.category) !== category) return false;
-      if (query) {
-        const q = query.toLowerCase();
-        return (
-          String(r.name).toLowerCase().includes(q) ||
-          String(r.address).toLowerCase().includes(q) ||
-          String(r.category).toLowerCase().includes(q)
-        );
-      }
-      return true;
-    })
-    .map((r) => ({
+    baseList = rows.map((r) => ({
       id: Number(r.id),
       name: String(r.name),
       category: String(r.category),
@@ -2178,6 +2208,22 @@ export async function listSupportDirectory(category?: string, query?: string) {
       lastUpdatedAt:
         r.last_updated_at instanceof Date ? r.last_updated_at.toISOString() : String(r.last_updated_at),
     }));
+
+    await cacheQueue.setCachedJson(cacheKey, baseList, 60);
+  }
+
+  return baseList.filter((r) => {
+    if (category && category !== 'All' && r.category !== category) return false;
+    if (query) {
+      const q = query.toLowerCase();
+      return (
+        r.name.toLowerCase().includes(q) ||
+        r.address.toLowerCase().includes(q) ||
+        r.category.toLowerCase().includes(q)
+      );
+    }
+    return true;
+  });
 }
 
 // Notifications & Delivery Logs
@@ -2599,39 +2645,103 @@ export async function countAuditLogs(): Promise<number> {
   return Number(row?.cnt || 0);
 }
 
-// Analytics (explicitly separates real live incidents from simulated/demo incidents)
+// Analytics (SQL-aggregated O(1) memory queries + 10s cache; explicitly separates live vs simulated incidents)
 export async function getOperationalAnalytics() {
   const dialect = await ensureDialect();
+  const cacheKey = `analytics:operational:${dialect}`;
 
-  let allIncidents: Array<{
-    status: string;
-    category: string;
-    priority: string;
-    is_simulated: unknown;
-    acknowledged_at: unknown;
-    resolved_at: unknown;
-    created_at: unknown;
-  }>;
+  const cached = await cacheQueue.getCachedJson<{
+    liveStats: {
+      total: number;
+      active: number;
+      resolved: number;
+      avgAckSeconds: number | null;
+      avgResolutionSeconds: number | null;
+      byCategory: Array<{ name: string; count: number }>;
+    };
+    demoStats: {
+      total: number;
+      active: number;
+      resolved: number;
+      avgAckSeconds: number | null;
+      avgResolutionSeconds: number | null;
+      byCategory: Array<{ name: string; count: number }>;
+    };
+    resourceDistribution: Array<{ category: string; count: number }>;
+    responders: { available: number; responding: number; offDuty: number };
+  }>(cacheKey);
+  if (cached) return cached;
+
+  const t0 = performance.now();
+  type AggSummaryRow = {
+    is_sim: boolean | number;
+    total: number;
+    active: number;
+    resolved: number;
+    avg_ack_sec: number | null;
+    avg_res_sec: number | null;
+  };
+  type CatRow = { is_sim: boolean | number; category: string; count: number };
+
+  let summaryRows: AggSummaryRow[];
+  let catRows: CatRow[];
   let orgRows: Array<{ category: string; count: number }>;
   let responderRows: Array<{ responder_status: string; count: number }>;
 
   if (dialect === 'postgres') {
-    const incRes = await pool.query(
-      'SELECT status, category, priority, is_simulated, acknowledged_at, resolved_at, created_at FROM emergency_incidents'
-    );
-    allIncidents = incRes.rows;
-    const orgRes = await pool.query('SELECT category, COUNT(*)::int AS count FROM support_organizations GROUP BY category');
+    const [sumRes, catRes, orgRes, respRes] = await Promise.all([
+      queryWithRetry<AggSummaryRow>(`
+        SELECT
+          is_simulated AS is_sim,
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (WHERE status IN ('SOS Activated', 'Alert Sent', 'Acknowledged', 'Assistance in Progress'))::int AS active,
+          COUNT(*) FILTER (WHERE status = 'Resolved')::int AS resolved,
+          ROUND(AVG(EXTRACT(EPOCH FROM (acknowledged_at - created_at))) FILTER (WHERE acknowledged_at IS NOT NULL AND acknowledged_at >= created_at))::int AS avg_ack_sec,
+          ROUND(AVG(EXTRACT(EPOCH FROM (resolved_at - created_at))) FILTER (WHERE resolved_at IS NOT NULL AND resolved_at >= created_at))::int AS avg_res_sec
+        FROM emergency_incidents
+        GROUP BY is_simulated
+      `),
+      queryWithRetry<CatRow>(`
+        SELECT is_simulated AS is_sim, COALESCE(NULLIF(category, ''), 'Other') AS category, COUNT(*)::int AS count
+        FROM emergency_incidents
+        GROUP BY is_simulated, COALESCE(NULLIF(category, ''), 'Other')
+      `),
+      queryWithRetry<{ category: string; count: number }>(
+        'SELECT category, COUNT(*)::int AS count FROM support_organizations GROUP BY category'
+      ),
+      queryWithRetry<{ responder_status: string; count: number }>(
+        `SELECT responder_status, COUNT(*)::int AS count FROM users
+         WHERE role IN ('emergency_operator', 'support_organization', 'administrator')
+         GROUP BY responder_status`
+      ),
+    ]);
+    summaryRows = sumRes.rows;
+    catRows = catRes.rows;
     orgRows = orgRes.rows;
-    const respRes = await pool.query(
-      `SELECT responder_status, COUNT(*)::int AS count FROM users
-       WHERE role IN ('emergency_operator', 'support_organization', 'administrator')
-       GROUP BY responder_status`
-    );
     responderRows = respRes.rows;
   } else {
-    allIncidents = sqlite
-      .prepare('SELECT status, category, priority, is_simulated, acknowledged_at, resolved_at, created_at FROM emergency_incidents')
-      .all() as typeof allIncidents;
+    summaryRows = sqlite
+      .prepare(`
+        SELECT
+          is_simulated AS is_sim,
+          COUNT(*) AS total,
+          SUM(CASE WHEN status IN ('SOS Activated', 'Alert Sent', 'Acknowledged', 'Assistance in Progress') THEN 1 ELSE 0 END) AS active,
+          SUM(CASE WHEN status = 'Resolved' THEN 1 ELSE 0 END) AS resolved,
+          ROUND(AVG(CASE WHEN acknowledged_at IS NOT NULL AND julianday(acknowledged_at) >= julianday(created_at)
+            THEN (julianday(acknowledged_at) - julianday(created_at)) * 86400.0 ELSE NULL END)) AS avg_ack_sec,
+          ROUND(AVG(CASE WHEN resolved_at IS NOT NULL AND julianday(resolved_at) >= julianday(created_at)
+            THEN (julianday(resolved_at) - julianday(created_at)) * 86400.0 ELSE NULL END)) AS avg_res_sec
+        FROM emergency_incidents
+        GROUP BY is_simulated
+      `)
+      .all() as AggSummaryRow[];
+    catRows = sqlite
+      .prepare(`
+        SELECT is_simulated AS is_sim, COALESCE(NULLIF(category, ''), 'Other') AS category, COUNT(*) AS count
+        FROM emergency_incidents
+        GROUP BY is_simulated, COALESCE(NULLIF(category, ''), 'Other')
+      `)
+      .all() as CatRow[];
     orgRows = sqlite
       .prepare('SELECT category, COUNT(*) as count FROM support_organizations GROUP BY category')
       .all() as typeof orgRows;
@@ -2642,49 +2752,21 @@ export async function getOperationalAnalytics() {
          GROUP BY responder_status`
       )
       .all() as typeof responderRows;
+    metrics.recordDbQuery(performance.now() - t0);
   }
 
-  const liveIncidents = allIncidents.filter((i) => !i.is_simulated);
-  const simulatedIncidents = allIncidents.filter((i) => Boolean(i.is_simulated));
-
-  const summarize = (list: typeof allIncidents) => {
-    const activeStatuses = new Set(['SOS Activated', 'Alert Sent', 'Acknowledged', 'Assistance in Progress']);
-    const active = list.filter((i) => activeStatuses.has(String(i.status))).length;
-    const resolved = list.filter((i) => String(i.status) === 'Resolved').length;
-    const ackTimesSec: number[] = [];
-    const resolveTimesSec: number[] = [];
-    for (const item of list) {
-      if (item.acknowledged_at && item.created_at) {
-        const diff =
-          (new Date(String(item.acknowledged_at)).getTime() - new Date(String(item.created_at)).getTime()) / 1000;
-        if (!Number.isNaN(diff) && diff >= 0) ackTimesSec.push(diff);
-      }
-      if (item.resolved_at && item.created_at) {
-        const diff =
-          (new Date(String(item.resolved_at)).getTime() - new Date(String(item.created_at)).getTime()) / 1000;
-        if (!Number.isNaN(diff) && diff >= 0) resolveTimesSec.push(diff);
-      }
-    }
-    const avgAckSeconds = ackTimesSec.length
-      ? Math.round(ackTimesSec.reduce((a, b) => a + b, 0) / ackTimesSec.length)
-      : null;
-    const avgResolutionSeconds = resolveTimesSec.length
-      ? Math.round(resolveTimesSec.reduce((a, b) => a + b, 0) / resolveTimesSec.length)
-      : null;
-
-    const categoryMap: Record<string, number> = {};
-    for (const item of list) {
-      const cat = String(item.category || 'Other');
-      categoryMap[cat] = (categoryMap[cat] || 0) + 1;
-    }
-
+  const buildBucket = (simFlag: boolean) => {
+    const row = summaryRows.find((r) => Boolean(r.is_sim) === simFlag);
+    const cats = catRows
+      .filter((c) => Boolean(c.is_sim) === simFlag)
+      .map((c) => ({ name: String(c.category), count: Number(c.count) }));
     return {
-      total: list.length,
-      active,
-      resolved,
-      avgAckSeconds,
-      avgResolutionSeconds,
-      byCategory: Object.entries(categoryMap).map(([name, count]) => ({ name, count })),
+      total: Number(row?.total || 0),
+      active: Number(row?.active || 0),
+      resolved: Number(row?.resolved || 0),
+      avgAckSeconds: row?.avg_ack_sec != null ? Number(row.avg_ack_sec) : null,
+      avgResolutionSeconds: row?.avg_res_sec != null ? Number(row.avg_res_sec) : null,
+      byCategory: cats,
     };
   };
 
@@ -2694,9 +2776,9 @@ export async function getOperationalAnalytics() {
     responderMap[st] = (responderMap[st] || 0) + Number(r.count);
   }
 
-  return {
-    liveStats: summarize(liveIncidents),
-    demoStats: summarize(simulatedIncidents),
+  const payload = {
+    liveStats: buildBucket(false),
+    demoStats: buildBucket(true),
     resourceDistribution: orgRows.map((r) => ({ category: r.category, count: Number(r.count) })),
     responders: {
       available: responderMap['Available'] || 0,
@@ -2704,6 +2786,9 @@ export async function getOperationalAnalytics() {
       offDuty: responderMap['Off Duty'] || 0,
     },
   };
+
+  await cacheQueue.setCachedJson(cacheKey, payload, 10);
+  return payload;
 }
 
 // ========================
