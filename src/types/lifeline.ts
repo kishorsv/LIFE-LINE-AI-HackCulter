@@ -158,6 +158,7 @@ export interface AnalyticsSummary {
     active: number;
     resolved: number;
     avgAckSeconds: number | null;
+    avgResolutionSeconds?: number | null;
     byCategory: { name: string; count: number }[];
   };
   demoStats: {
@@ -165,9 +166,128 @@ export interface AnalyticsSummary {
     active: number;
     resolved: number;
     avgAckSeconds: number | null;
+    avgResolutionSeconds?: number | null;
     byCategory: { name: string; count: number }[];
   };
   resourceDistribution: { category: string; count: number }[];
+  responders?: {
+    available: number;
+    responding: number;
+    offDuty: number;
+  };
+}
+
+export interface ResponderInfo {
+  id: number;
+  displayName: string;
+  email: string;
+  role: UserRole;
+  responderStatus: 'Available' | 'Responding' | 'Off Duty';
+  responderUpdatedAt: string;
+  activeAssignedCount: number;
+}
+
+export interface PulseWeatherSnapshot {
+  available: boolean;
+  source: string;
+  retrievedAt: string;
+  temperatureC?: number | null;
+  precipitationMm?: number | null;
+  rainMm?: number | null;
+  windSpeedKmh?: number | null;
+  weatherCode?: number | null;
+  weatherLabel?: string;
+  isDay?: boolean | null;
+  visibilityMeters?: number | null;
+  precipitationProbability?: number | null;
+  reason?: string;
+}
+
+export interface PredictiveRiskAssessment {
+  riskLevel: 'LOW' | 'MODERATE' | 'ELEVATED' | 'INSUFFICIENT_DATA';
+  riskScore: number;
+  confidence: number;
+  locationLabel: string;
+  latitude: number;
+  longitude: number;
+  evaluatedAt: string;
+  summary: string;
+  evidence: Array<{
+    factor: string;
+    category: string;
+    impact: 'elevates_risk' | 'mitigates_risk' | 'neutral' | 'unavailable';
+    detail: string;
+    source: string;
+    timestamp: string;
+  }>;
+  counts: {
+    verifiedNearbyIncidents: number;
+    simulatedIncidentsExcluded: number;
+    communityReportsCount: number;
+    nearbySupportHubs: number;
+    open24hSupportHubs: number;
+  };
+  weather: PulseWeatherSnapshot;
+  mitigationGuidance: string[];
+}
+
+export interface SafeRouteCandidateItem {
+  routeIndex: number;
+  summary: string;
+  distanceMeters: number;
+  durationSeconds: number;
+  durationLabel: string;
+  encodedPolyline: string;
+  path: Array<{ lat: number; lng: number }>;
+  routeLabels: string[];
+  warnings: string[];
+  safetyScore: number;
+  riskLevel: 'LOW' | 'MODERATE' | 'ELEVATED';
+  nearbyIncidentsCount: number;
+  nearbyReportsCount: number;
+  nearbySupportHubsCount: number;
+  reasons: string[];
+  isRecommended: boolean;
+}
+
+export interface SafetyJourneyItem {
+  id: number;
+  userId: number;
+  originLabel: string;
+  originLat: number;
+  originLng: number;
+  destinationLabel: string;
+  destinationLat: number;
+  destinationLng: number;
+  travelMode: string;
+  selectedRouteSummary: string;
+  routeRiskLevel: string;
+  shareToken: string;
+  sharedWithContacts: Array<{ id?: number; name: string; email?: string }>;
+  checkInIntervalMinutes: number;
+  expectedArrivalAt: string;
+  nextCheckInDueAt: string;
+  lastCheckInAt: string | null;
+  arrivedAt: string | null;
+  status: 'Active' | 'Arrived Safe' | 'Escalated' | 'Cancelled';
+  isSimulated: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SafetyReportItem {
+  id: number;
+  category: string;
+  severity: 'LOW' | 'MODERATE' | 'HIGH';
+  description: string;
+  latitude: number;
+  longitude: number;
+  locationLabel: string;
+  isAnonymous: boolean;
+  verificationStatus: string;
+  isSimulated: boolean;
+  createdAt: string;
+  reporterLabel: string;
 }
 
 export interface AuditLogEntry {
@@ -181,7 +301,9 @@ export interface AuditLogEntry {
   createdAt: string;
 }
 
-export type ActiveView = 'landing' | 'dashboard' | 'map' | 'agents' | 'operator' | 'profile';
+export type AppLanguage = 'en' | 'kn';
+
+export type ActiveView = 'landing' | 'dashboard' | 'pulse' | 'map' | 'agents' | 'operator' | 'profile';
 
 export interface WorkspaceConfirmPayload {
   actionType: 'gmail_send' | 'calendar_checkin' | 'sheets_export' | 'docs_safety_plan' | 'drive_backup' | 'tasks_create';
@@ -190,3 +312,4 @@ export interface WorkspaceConfirmPayload {
   details: string[];
   onConfirm: () => Promise<void>;
 }
+

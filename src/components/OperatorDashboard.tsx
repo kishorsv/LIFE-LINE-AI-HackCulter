@@ -1,39 +1,86 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { APIProvider, AdvancedMarker, Map as GoogleMap, Pin } from '@vis.gl/react-google-maps';
 import { Bar, BarChart, CartesianGrid, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
-import { CheckCircle2, ClipboardList, Lock, ShieldCheck, Users } from 'lucide-react';
+import { CheckCircle2, ClipboardList, Lock, Radio, ShieldCheck, UserCheck, Users } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext.tsx';
-import { AnalyticsSummary, AppUser, AuditLogEntry, EmergencyIncident, UserRole } from '../types/lifeline.ts';
+import { LifeLineLogo } from './LifeLineLogo.tsx';
+import {
+  AnalyticsSummary,
+  AppUser,
+  AuditLogEntry,
+  EmergencyIncident,
+  ResponderInfo,
+  UserRole,
+} from '../types/lifeline.ts';
 
 export function OperatorDashboard() {
   const { user, operatorIncidents, demoMode, loginDemoRole, mapsApiKey, apiFetch, refreshAllData } = useAuth();
   const [tab, setTab] = useState<'queue' | 'analytics' | 'audit' | 'roles'>('queue');
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [noteText, setNoteText] = useState('');
+  const [isInternalNote, setIsInternalNote] = useState(false);
   const [priorityFilter, setPriorityFilter] = useState('ALL');
   const [analytics, setAnalytics] = useState<AnalyticsSummary | null>(null);
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
+  const [auditPage, setAuditPage] = useState(1);
+  const [auditTotalPages, setAuditTotalPages] = useState(1);
+  const [pagedQueue, setPagedQueue] = useState<EmergencyIncident[] | null>(null);
+  const [queuePage, setQueuePage] = useState(1);
+  const [queueTotalPages, setQueueTotalPages] = useState(1);
   const [adminUsers, setAdminUsers] = useState<AppUser[]>([]);
+  const [responders, setResponders] = useState<ResponderInfo[]>([]);
+  const [assignOperatorId, setAssignOperatorId] = useState<string>('');
+  const [myStatus, setMyStatus] = useState<'Available' | 'Responding' | 'Off Duty'>('Available');
   const [actionError, setActionError] = useState('');
+  const [actionMsg, setActionMsg] = useState('');
 
   const isAuthorized = Boolean(
     user && ['emergency_operator', 'support_organization', 'administrator'].includes(user.role)
   );
 
-  useEffect(() => {
-    if (!isAuthorized) return;
+  const loadOperatorResources = useCallback(async () => {
+    if (!isAuthorized || !user) return;
     apiFetch<AnalyticsSummary>('/api/analytics').then(setAnalytics).catch(() => {});
-    if (['administrator', 'emergency_operator'].includes(user!.role)) {
-      apiFetch<{ logs: AuditLogEntry[] }>('/api/admin/audit-logs')
-        .then((d) => setAuditLogs(d.logs))
+    apiFetch<{ responders: ResponderInfo[] }>('/api/operator/responders')
+      .then((d) => {
+        setResponders(d.responders);
+        const me = d.responders.find((r) => r.id === user.id);
+        if (me) setMyStatus(me.responderStatus);
+        if (!assignOperatorId && d.responders.length > 0) {
+          setAssignOperatorId(String(me?.id || d.responders[0].id));
+        }
+      })
+      .catch(() => {});
+
+    apiFetch<{ incidents: EmergencyIncident[]; pagination?: { totalPages: number } }>(
+      `/api/operator/incidents?page=${queuePage}&limit=25`
+    )
+      .then((d) => {
+        setPagedQueue(d.incidents);
+        if (d.pagination?.totalPages) setQueueTotalPages(d.pagination.totalPages);
+      })
+      .catch(() => {});
+
+    if (['administrator', 'emergency_operator'].includes(user.role)) {
+      apiFetch<{ logs: AuditLogEntry[]; pagination?: { totalPages: number } }>(
+        `/api/admin/audit-logs?page=${auditPage}&limit=25`
+      )
+        .then((d) => {
+          setAuditLogs(d.logs);
+          if (d.pagination?.totalPages) setAuditTotalPages(d.pagination.totalPages);
+        })
         .catch(() => {});
     }
-    if (user!.role === 'administrator') {
+    if (user.role === 'administrator') {
       apiFetch<{ users: AppUser[] }>('/api/admin/users')
         .then((d) => setAdminUsers(d.users))
         .catch(() => {});
     }
-  }, [isAuthorized, user, apiFetch, operatorIncidents.length]);
+  }, [isAuthorized, user, apiFetch, queuePage, auditPage, assignOperatorId]);
+
+  useEffect(() => {
+    void loadOperatorResources();
+  }, [loadOperatorResources, operatorIncidents.length]);
 
   if (!isAuthorized) {
     return (
@@ -59,24 +106,66 @@ export function OperatorDashboard() {
     );
   }
 
-  const filteredIncidents = operatorIncidents.filter((i) =>
+  const activeSourceIncidents = queuePage === 1 && operatorIncidents.length > 0 ? operatorIncidents : pagedQueue || operatorIncidents;
+  const filteredIncidents = activeSourceIncidents.filter((i) =>
     priorityFilter === 'ALL' ? true : i.priority === priorityFilter
   );
   const selectedIncident: EmergencyIncident | undefined =
     filteredIncidents.find((i) => i.id === selectedId) || filteredIncidents[0];
+  const mappableIncidents = filteredIncidents.filter(
+    (i): i is EmergencyIncident & { latitude: number; longitude: number } =>
+      typeof i.latitude === 'number' && typeof i.longitude === 'number'
+  );
+
+  const handleAvailabilityChange = async (status: 'Available' | 'Responding' | 'Off Duty') => {
+    setActionError('');
+    setActionMsg('');
+    try {
+      await apiFetch('/api/operator/availability', {
+        method: 'PATCH',
+        body: JSON.stringify({ status }),
+      });
+      setMyStatus(status);
+      setActionMsg(`Responder availability updated to ${status}.`);
+      await loadOperatorResources();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to update responder availability.');
+    }
+  };
+
+  const handleAssignResponder = async (incidentId: number) => {
+    if (!assignOperatorId) return;
+    setActionError('');
+    setActionMsg('');
+    try {
+      await apiFetch(`/api/operator/incidents/${incidentId}/assign`, {
+        method: 'POST',
+        body: JSON.stringify({ operatorUserId: Number(assignOperatorId) }),
+      });
+      setActionMsg(`Assigned Incident #${incidentId} to responder.`);
+      await refreshAllData();
+      await loadOperatorResources();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Responder assignment failed.');
+    }
+  };
 
   const handleStatusUpdate = async (incidentId: number, status: EmergencyIncident['status']) => {
     setActionError('');
+    setActionMsg('');
     try {
       await apiFetch(`/api/incidents/${incidentId}/status`, {
         method: 'PATCH',
         body: JSON.stringify({
           status,
           note: noteText.trim() || `Operator updated status to ${status}`,
+          isInternal: isInternalNote,
         }),
       });
       setNoteText('');
+      setIsInternalNote(false);
       await refreshAllData();
+      await loadOperatorResources();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Status update failed.');
     }
@@ -100,16 +189,40 @@ export function OperatorDashboard() {
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4">
-        <div>
-          <h1 className="font-display text-2xl font-bold text-slate-900 dark:text-white">
-            Emergency Operator & Governance Desk
-          </h1>
-          <p className="text-xs text-slate-500 dark:text-slate-400">
-            Signed in as <strong>{user?.displayName}</strong> ({user?.role}) · Real-time SOS feed active
-          </p>
+        <div className="flex items-center gap-3">
+          <LifeLineLogo variant="mark" size="md" />
+          <div>
+            <h1 className="font-display text-2xl font-bold text-slate-900 dark:text-white">
+              Live Emergency Command Center
+            </h1>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              Signed in as <strong>{user?.displayName}</strong> ({user?.role}) · Real-time SOS feed &amp; responder telemetry
+            </p>
+          </div>
         </div>
 
-        <div className="flex flex-wrap gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#0B1022] px-2.5 py-1.5 text-xs">
+            <Radio
+              className={`h-3.5 w-3.5 ${
+                myStatus === 'Available'
+                  ? 'text-emerald-500'
+                  : myStatus === 'Responding'
+                  ? 'text-amber-500'
+                  : 'text-slate-400'
+              }`}
+            />
+            <span className="text-slate-500 dark:text-slate-400">Duty:</span>
+            <select
+              value={myStatus}
+              onChange={(e) => handleAvailabilityChange(e.target.value as 'Available' | 'Responding' | 'Off Duty')}
+              className="bg-transparent font-semibold text-slate-900 dark:text-white focus:outline-none"
+            >
+              <option value="Available">Available</option>
+              <option value="Responding">Responding</option>
+              <option value="Off Duty">Off Duty</option>
+            </select>
+          </div>
           <button
             type="button"
             onClick={() => setTab('queue')}
@@ -158,6 +271,38 @@ export function OperatorDashboard() {
           {actionError}
         </div>
       )}
+      {actionMsg && (
+        <div className="rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-4 py-2 text-xs text-emerald-700 dark:text-emerald-300">
+          {actionMsg}
+        </div>
+      )}
+
+      {/* Active Responder Availability Roster */}
+      {responders.length > 0 && (
+        <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] px-4 py-3 flex flex-wrap items-center gap-2.5 text-xs">
+          <span className="font-semibold text-slate-600 dark:text-slate-300 mr-1">Active Responders:</span>
+          {responders.map((r) => (
+            <span
+              key={r.id}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-700 px-2.5 py-1"
+            >
+              <span
+                className={`h-2 w-2 rounded-full ${
+                  r.responderStatus === 'Available'
+                    ? 'bg-emerald-500'
+                    : r.responderStatus === 'Responding'
+                    ? 'bg-amber-500'
+                    : 'bg-slate-400'
+                }`}
+              />
+              <span className="font-medium text-slate-900 dark:text-white">{r.displayName}</span>
+              <span className="font-mono text-[10px] text-slate-500">
+                ({r.responderStatus} · {r.activeAssignedCount} active)
+              </span>
+            </span>
+          ))}
+        </div>
+      )}
 
       {tab === 'queue' && (
         <div className="grid gap-6 lg:grid-cols-12">
@@ -198,12 +343,35 @@ export function OperatorDashboard() {
                     </span>
                   </div>
                   <div className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
-                    {inc.reporterName} · {inc.status}
+                    {inc.reporterName} · {inc.status} {inc.operatorName ? `· Assigned: ${inc.operatorName}` : ''}
                   </div>
                   <div className="mt-1 text-[11px] text-slate-500 dark:text-slate-400 truncate">{inc.locationLabel}</div>
                 </button>
               ))}
             </div>
+            {queueTotalPages > 1 && (
+              <div className="flex items-center justify-between pt-2 border-t border-slate-200 dark:border-slate-800 text-[11px]">
+                <button
+                  type="button"
+                  disabled={queuePage <= 1}
+                  onClick={() => setQueuePage((p) => Math.max(1, p - 1))}
+                  className="rounded border border-slate-300 dark:border-slate-700 px-2 py-1 disabled:opacity-40"
+                >
+                  Previous
+                </button>
+                <span className="font-mono text-slate-500">
+                  Page {queuePage} of {queueTotalPages}
+                </span>
+                <button
+                  type="button"
+                  disabled={queuePage >= queueTotalPages}
+                  onClick={() => setQueuePage((p) => Math.min(queueTotalPages, p + 1))}
+                  className="rounded border border-slate-300 dark:border-slate-700 px-2 py-1 disabled:opacity-40"
+                >
+                  Next
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Incident Detail + Map + Operator Actions */}
@@ -233,6 +401,37 @@ export function OperatorDashboard() {
                     {selectedIncident.description}
                   </p>
 
+                  {/* Responder Assignment Bar */}
+                  {responders.length > 0 && (
+                    <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 px-3 py-2 text-xs">
+                      <div className="text-slate-600 dark:text-slate-300">
+                        <strong>Assigned Responder:</strong>{' '}
+                        {selectedIncident.operatorName || 'Unassigned'}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <select
+                          value={assignOperatorId}
+                          onChange={(e) => setAssignOperatorId(e.target.value)}
+                          className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-2 py-1 text-xs"
+                        >
+                          {responders.map((r) => (
+                            <option key={r.id} value={String(r.id)}>
+                              {r.displayName} ({r.responderStatus})
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          onClick={() => handleAssignResponder(selectedIncident.id)}
+                          className="inline-flex items-center gap-1 rounded-lg bg-slate-900 dark:bg-violet-600 px-2.5 py-1 text-xs font-semibold text-white"
+                        >
+                          <UserCheck className="h-3.5 w-3.5" />
+                          <span>Assign</span>
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
                   <div className="space-y-2 border-t border-slate-200 dark:border-slate-800 pt-4">
                     <textarea
                       rows={2}
@@ -241,6 +440,14 @@ export function OperatorDashboard() {
                       placeholder="Add operator coordination note..."
                       className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900/70 px-3 py-2 text-xs"
                     />
+                    <label className="inline-flex items-center gap-2 text-[11px] text-slate-600 dark:text-slate-400">
+                      <input
+                        type="checkbox"
+                        checked={isInternalNote}
+                        onChange={(e) => setIsInternalNote(e.target.checked)}
+                      />
+                      <span>Internal responder note (hidden from reporter timeline)</span>
+                    </label>
                     <div className="flex flex-wrap gap-2">
                       <button
                         type="button"
@@ -273,7 +480,8 @@ export function OperatorDashboard() {
                     {selectedIncident.updates.map((u) => (
                       <div key={u.id} className="text-xs text-slate-600 dark:text-slate-300 flex justify-between gap-2">
                         <span>
-                          <strong>{u.newStatus}</strong> — {u.note} ({u.authorName})
+                          <strong>{u.newStatus}</strong>
+                          {u.isInternal ? ' [INTERNAL]' : ''} — {u.note} ({u.authorName})
                         </span>
                         <span className="font-mono text-[10px] text-slate-400 shrink-0">
                           {new Date(u.createdAt).toLocaleTimeString()}
@@ -283,22 +491,36 @@ export function OperatorDashboard() {
                   </div>
                 </div>
 
-                {/* Live Operator Incident Map */}
+                {/* Live Multi-Incident Command Map */}
                 {mapsApiKey && selectedIncident.latitude != null && selectedIncident.longitude != null && (
-                  <div className="h-64 w-full overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-800">
+                  <div className="h-64 w-full overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-800 relative">
                     <APIProvider apiKey={mapsApiKey}>
                       <GoogleMap
                         center={{ lat: selectedIncident.latitude, lng: selectedIncident.longitude }}
-                        defaultZoom={14}
+                        defaultZoom={13}
                         mapId="DEMO_MAP_ID"
                         internalUsageAttributionIds={['gmp_mcp_codeassist_v1_aistudio']}
                         style={{ width: '100%', height: '100%' }}
                       >
-                        <AdvancedMarker
-                          position={{ lat: selectedIncident.latitude, lng: selectedIncident.longitude }}
-                        >
-                          <Pin background="#E11D48" borderColor="#FFFFFF" glyphColor="#FFFFFF" />
-                        </AdvancedMarker>
+                        {mappableIncidents.map((inc) => (
+                          <AdvancedMarker
+                            key={inc.id}
+                            position={{ lat: inc.latitude, lng: inc.longitude }}
+                            onClick={() => setSelectedId(inc.id)}
+                          >
+                            <Pin
+                              background={
+                                inc.id === selectedIncident.id
+                                  ? '#E11D48'
+                                  : inc.status === 'Resolved' || inc.status === 'Cancelled'
+                                  ? '#10B981'
+                                  : '#F59E0B'
+                              }
+                              borderColor={inc.id === selectedIncident.id ? '#FFFFFF' : '#0F172A'}
+                              glyphColor="#FFFFFF"
+                            />
+                          </AdvancedMarker>
+                        ))}
                       </GoogleMap>
                     </APIProvider>
                   </div>
@@ -327,7 +549,7 @@ export function OperatorDashboard() {
                   REAL DATABASE DATA
                 </span>
               </div>
-              <div className="grid grid-cols-3 gap-3 text-center">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-center">
                 <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
                   <div className="text-[11px] text-slate-500">Total Live</div>
                   <div className="font-display text-2xl font-extrabold tabular-nums">{analytics.liveStats.total}</div>
@@ -344,7 +566,19 @@ export function OperatorDashboard() {
                     {analytics.liveStats.avgAckSeconds ?? '—'}
                   </div>
                 </div>
+                <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
+                  <div className="text-[11px] text-slate-500">Avg Resolve (s)</div>
+                  <div className="font-display text-2xl font-extrabold tabular-nums text-emerald-500">
+                    {analytics.liveStats.avgResolutionSeconds ?? '—'}
+                  </div>
+                </div>
               </div>
+              {analytics.responders && (
+                <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                  Responder Fleet: {analytics.responders.available} Available · {analytics.responders.responding} Responding ·{' '}
+                  {analytics.responders.offDuty} Off Duty
+                </div>
+              )}
             </div>
 
             {/* Simulated Demo Metrics */}
@@ -430,10 +664,35 @@ export function OperatorDashboard() {
 
       {/* Audit Logs */}
       {tab === 'audit' && (
-        <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-6">
-          <div className="flex items-center gap-2 mb-4">
-            <ClipboardList className="h-5 w-5 text-violet-500" />
-            <h2 className="font-display text-base font-bold">Immutable Platform Audit Trail</h2>
+        <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-6 space-y-4">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <ClipboardList className="h-5 w-5 text-violet-500" />
+              <h2 className="font-display text-base font-bold">Immutable Platform Audit Trail</h2>
+            </div>
+            {auditTotalPages > 1 && (
+              <div className="flex items-center gap-2 text-xs">
+                <button
+                  type="button"
+                  disabled={auditPage <= 1}
+                  onClick={() => setAuditPage((p) => Math.max(1, p - 1))}
+                  className="rounded border border-slate-300 dark:border-slate-700 px-2.5 py-1 disabled:opacity-40"
+                >
+                  Prev
+                </button>
+                <span className="font-mono text-slate-500">
+                  Page {auditPage} of {auditTotalPages}
+                </span>
+                <button
+                  type="button"
+                  disabled={auditPage >= auditTotalPages}
+                  onClick={() => setAuditPage((p) => Math.min(auditTotalPages, p + 1))}
+                  className="rounded border border-slate-300 dark:border-slate-700 px-2.5 py-1 disabled:opacity-40"
+                >
+                  Next
+                </button>
+              </div>
+            )}
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">

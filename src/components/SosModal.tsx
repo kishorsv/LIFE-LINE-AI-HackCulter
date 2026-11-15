@@ -68,6 +68,10 @@ export function SosModal({ open, onClose }: SosModalProps) {
     if (!open) return;
     idempotencyKeyRef.current = createIdempotencyKey();
     submittingRef.current = false;
+    setStage('confirm');
+    setCreatedIncident(null);
+    setDeliveryResults([]);
+    setQueuedItem(null);
     setSimulateAlert(demoMode || Boolean(user?.isDemoAccount));
     setError('');
     setDeliveryReport(null);
@@ -238,15 +242,25 @@ export function SosModal({ open, onClose }: SosModalProps) {
   };
 
   const handleCancelActiveSos = async () => {
-    if (!createdIncident) return;
-    await apiFetch(`/api/incidents/${createdIncident.id}/status`, {
-      method: 'PATCH',
-      body: JSON.stringify({ status: 'Cancelled', note: 'User cancelled alert and confirmed safe.' }),
-    });
-    await refreshAllData();
-    setStage('confirm');
-    setCreatedIncident(null);
-    onClose();
+    if (!createdIncident || submittingRef.current) return;
+    submittingRef.current = true;
+    setSubmitting(true);
+    setError('');
+    try {
+      await apiFetch(`/api/incidents/${createdIncident.id}/status`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status: 'Cancelled', note: 'User cancelled alert and confirmed safe.' }),
+      });
+      await refreshAllData();
+      setStage('confirm');
+      setCreatedIncident(null);
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to cancel active SOS right now.');
+    } finally {
+      submittingRef.current = false;
+      setSubmitting(false);
+    }
   };
 
   if (!open) return null;

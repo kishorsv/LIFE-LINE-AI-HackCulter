@@ -4,7 +4,7 @@ import { useAuth } from '../contexts/AuthContext.tsx';
 import { useTheme } from '../contexts/ThemeContext.tsx';
 
 export function ProfileSettings({ onLoggedOut }: { onLoggedOut: () => void }) {
-  const { user, profile, preferences, apiFetch, refreshAllData, logout } = useAuth();
+  const { user, profile, preferences, apiFetch, refreshAllData, logout, setLanguage } = useAuth();
   const { theme, setTheme } = useTheme();
 
   const [fullName, setFullName] = useState('');
@@ -64,6 +64,7 @@ export function ProfileSettings({ onLoggedOut }: { onLoggedOut: () => void }) {
         }),
       });
       await refreshAllData();
+      setLanguage(preferredLanguage === 'kn' ? 'kn' : 'en');
       setMsg('Profile and privacy preferences saved.');
     } catch (error) {
       setErr(error instanceof Error ? error.message : 'Save failed.');
@@ -192,6 +193,7 @@ export function ProfileSettings({ onLoggedOut }: { onLoggedOut: () => void }) {
               className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900/70 px-3 py-2 text-sm"
             >
               <option value="en">English</option>
+              <option value="kn">ಕನ್ನಡ (Kannada)</option>
               <option value="es">Español</option>
               <option value="hi">हिन्दी</option>
               <option value="fr">Français</option>

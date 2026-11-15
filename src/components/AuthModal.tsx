@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Building2, FlaskConical, KeyRound, MailCheck, Shield, ShieldCheck, User, X } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext.tsx';
 import { FirebaseAuthBlockedAlert } from './FirebaseAuthBlockedAlert.tsx';
+import { LifeLineLogo } from './LifeLineLogo.tsx';
 import { UserRole } from '../types/lifeline.ts';
 
 interface AuthModalProps {
@@ -171,13 +172,13 @@ export function AuthModal({ open, onClose, onAuthenticated }: AuthModalProps) {
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 backdrop-blur-sm p-4 overflow-y-auto">
       <div className="w-full max-w-2xl rounded-2xl border border-slate-200 dark:border-violet-500/30 bg-white dark:bg-[#0B1022] p-6 shadow-2xl my-8">
         <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-4">
-          <div className="flex items-center gap-2.5">
-            <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-violet-600 text-white">
-              <Shield className="h-5 w-5" />
-            </span>
+          <div className="flex items-center gap-3">
+            <LifeLineLogo variant="mark" size="md" />
             <div>
-              <h2 className="font-display text-lg font-bold text-slate-900 dark:text-white">Access LIFE-LINE AI</h2>
-              <p className="text-xs text-slate-500 dark:text-slate-400">Role-protected safety platform & hackathon sandbox</p>
+              <h2 className="font-display text-lg font-extrabold tracking-tight text-[#0A1633] dark:text-white">
+                Access LIFE-LINE <span className="text-[#E11D48] dark:text-[#FB7185]">AI</span>
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">Role-protected safety platform &amp; hackathon sandbox</p>
             </div>
           </div>
           <button

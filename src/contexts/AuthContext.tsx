@@ -1,8 +1,10 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import {
+  AppLanguage,
   AppUser,
   EmergencyIncident,
   NotificationItem,
+  SafetyJourneyItem,
   TrustedContact,
   UserPreferencesData,
   UserProfileData,
@@ -37,6 +39,9 @@ interface AuthContextValue {
   incidents: EmergencyIncident[];
   operatorIncidents: EmergencyIncident[];
   notifications: NotificationItem[];
+  journeys: SafetyJourneyItem[];
+  language: AppLanguage;
+  setLanguage: (lang: AppLanguage) => void;
   mapsApiKey: string;
   developerContactEmail: string;
   authBlockedAlert: PersistedAuthBlockedAlert | null;
@@ -55,6 +60,8 @@ interface AuthContextValue {
   loginDemoRole: (role: UserRole) => Promise<void>;
   logout: () => Promise<void>;
   refreshAllData: () => Promise<void>;
+  refreshJourneys: () => Promise<void>;
+  markAllNotificationsRead: () => Promise<void>;
   setUser: React.Dispatch<React.SetStateAction<AppUser | null>>;
 }
 
@@ -94,6 +101,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [incidents, setIncidents] = useState<EmergencyIncident[]>([]);
   const [operatorIncidents, setOperatorIncidents] = useState<EmergencyIncident[]>([]);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
+  const [journeys, setJourneys] = useState<SafetyJourneyItem[]>([]);
+  const [language, setLanguageState] = useState<AppLanguage>(() =>
+    localStorage.getItem('lifeline_language') === 'kn' ? 'kn' : 'en'
+  );
   const [mapsApiKey, setMapsApiKey] = useState<string>(() => import.meta.env.VITE_GOOGLE_MAPS_API_KEY || '');
   const [developerContactEmail, setDeveloperContactEmail] = useState<string>(
     () => import.meta.env.VITE_DEVELOPER_CONTACT_EMAIL || ''
@@ -105,6 +116,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const wsRef = useRef<WebSocket | null>(null);
   const lastEventSeqRef = useRef<number>(0);
+
+  const setLanguage = useCallback((lang: AppLanguage) => {
+    setLanguageState(lang);
+    try {
+      localStorage.setItem('lifeline_language', lang);
+    } catch {
+      // ignore storage quota
+    }
+  }, []);
 
   useEffect(() => {
     localStorage.setItem('lifeline_demo_mode', String(demoMode));
@@ -167,14 +187,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setPreferences(me.preferences);
       if (me.user.isDemoAccount) setDemoMode(true);
 
-      const [cRes, iRes, nRes] = await Promise.all([
+      if (me.profile?.preferredLanguage === 'kn' || me.profile?.preferredLanguage === 'en') {
+        setLanguage(me.profile.preferredLanguage);
+      }
+
+      const [cRes, iRes, nRes, jRes] = await Promise.all([
         apiFetch<{ contacts: TrustedContact[] }>('/api/contacts'),
         apiFetch<{ incidents: EmergencyIncident[] }>('/api/incidents'),
         apiFetch<{ notifications: NotificationItem[] }>('/api/notifications'),
+        apiFetch<{ journeys: SafetyJourneyItem[] }>('/api/journeys').catch(() => ({ journeys: [] })),
       ]);
       setContacts(cRes.contacts);
       setIncidents(iRes.incidents);
       setNotifications(nRes.notifications);
+      setJourneys(jRes.journeys);
 
       // Save user-scoped offline contact snapshot strictly under the active user's UID
       try {
@@ -198,6 +224,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setToken(null);
       setUser(null);
     }
+  }, [token, apiFetch, setLanguage]);
+
+  const refreshJourneys = useCallback(async () => {
+    if (!token) return;
+    try {
+      const res = await apiFetch<{ journeys: SafetyJourneyItem[] }>('/api/journeys');
+      setJourneys(res.journeys);
+    } catch {
+      // ignore transient error
+    }
+  }, [token, apiFetch]);
+
+  const markAllNotificationsRead = useCallback(async () => {
+    if (!token) return;
+    await apiFetch('/api/notifications/read-all', { method: 'PATCH' });
+    setNotifications((prev) => prev.map((n) => ({ ...n, isRead: true })));
   }, [token, apiFetch]);
 
   useEffect(() => {
@@ -276,6 +318,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             seq?: number;
             latestSeq?: number;
             incident?: EmergencyIncident;
+            journey?: SafetyJourneyItem;
           };
           if (typeof msg.seq === 'number' && msg.seq > lastEventSeqRef.current) {
             lastEventSeqRef.current = msg.seq;
@@ -285,7 +328,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           }
           if (msg.type === 'pong') return;
 
-          if (msg.type === 'incident:created' || msg.type === 'incident:updated') {
+          if (msg.type === 'incident:created' || msg.type === 'incident:updated' || msg.type === 'incident:assigned') {
             if (msg.incident) {
               const inc = msg.incident;
               setIncidents((prev) => {
@@ -302,6 +345,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             apiFetch<{ notifications: NotificationItem[] }>('/api/notifications')
               .then((res) => setNotifications(res.notifications))
               .catch(() => {});
+          } else if (msg.type === 'journey:updated' && msg.journey) {
+            const j = msg.journey;
+            setJourneys((prev) => {
+              if (j.userId !== user.id) return prev;
+              const exists = prev.some((x) => x.id === j.id);
+              return exists ? prev.map((x) => (x.id === j.id ? j : x)) : [j, ...prev];
+            });
           } else if (msg.type === 'notification:new') {
             apiFetch<{ notifications: NotificationItem[] }>('/api/notifications')
               .then((res) => setNotifications(res.notifications))
@@ -445,6 +495,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setIncidents([]);
     setOperatorIncidents([]);
     setNotifications([]);
+    setJourneys([]);
     await signOutFirebase().catch(() => {});
   };
 
@@ -464,6 +515,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         incidents,
         operatorIncidents,
         notifications,
+        journeys,
+        language,
+        setLanguage,
         mapsApiKey,
         developerContactEmail,
         authBlockedAlert,
@@ -478,6 +532,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         loginDemoRole,
         logout,
         refreshAllData,
+        refreshJourneys,
+        markAllNotificationsRead,
         setUser,
       }}
     >

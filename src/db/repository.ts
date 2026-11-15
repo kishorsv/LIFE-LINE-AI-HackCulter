@@ -10,6 +10,8 @@ import {
   incidentUpdates,
   notificationDeliveryLogs,
   notifications,
+  safetyJourneys,
+  safetyReports,
   supportLocations,
   supportOrganizations,
   trustedContacts,
@@ -72,6 +74,8 @@ const REQUIRED_TABLES = [
   'audit_logs',
   'support_organizations',
   'support_locations',
+  'safety_journeys',
+  'safety_reports',
 ];
 
 let activeDialect: DatabaseDialect | null = null;
@@ -342,6 +346,58 @@ async function runPostgresMigrations(): Promise<string> {
       CREATE UNIQUE INDEX IF NOT EXISTS incidents_user_idempotency_idx ON emergency_incidents(user_id, idempotency_key);
     `);
     await pool.query("INSERT INTO schema_migrations (version) VALUES ('v3_sos_idempotency_and_delivery') ON CONFLICT DO NOTHING");
+  }
+
+  if (!applied.has('v4_pulse_journeys_reports_responders')) {
+    await pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS responder_status TEXT NOT NULL DEFAULT 'Available';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS responder_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+      CREATE TABLE IF NOT EXISTS safety_journeys (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        origin_label TEXT NOT NULL,
+        origin_lat DOUBLE PRECISION NOT NULL,
+        origin_lng DOUBLE PRECISION NOT NULL,
+        destination_label TEXT NOT NULL,
+        destination_lat DOUBLE PRECISION NOT NULL,
+        destination_lng DOUBLE PRECISION NOT NULL,
+        travel_mode TEXT NOT NULL DEFAULT 'WALK',
+        selected_route_summary TEXT NOT NULL DEFAULT '',
+        route_risk_level TEXT NOT NULL DEFAULT 'LOW',
+        share_token TEXT NOT NULL,
+        shared_with_contacts JSONB NOT NULL DEFAULT '[]'::jsonb,
+        check_in_interval_minutes INTEGER NOT NULL DEFAULT 15,
+        expected_arrival_at TIMESTAMPTZ NOT NULL,
+        next_check_in_due_at TIMESTAMPTZ NOT NULL,
+        last_check_in_at TIMESTAMPTZ,
+        arrived_at TIMESTAMPTZ,
+        status TEXT NOT NULL DEFAULT 'Active',
+        is_simulated BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS safety_journeys_user_idx ON safety_journeys(user_id);
+      CREATE INDEX IF NOT EXISTS safety_journeys_status_idx ON safety_journeys(status);
+
+      CREATE TABLE IF NOT EXISTS safety_reports (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        category TEXT NOT NULL,
+        severity TEXT NOT NULL DEFAULT 'MODERATE',
+        description TEXT NOT NULL,
+        latitude DOUBLE PRECISION NOT NULL,
+        longitude DOUBLE PRECISION NOT NULL,
+        location_label TEXT NOT NULL,
+        is_anonymous BOOLEAN NOT NULL DEFAULT TRUE,
+        verification_status TEXT NOT NULL DEFAULT 'User Submitted',
+        is_simulated BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS safety_reports_created_idx ON safety_reports(created_at);
+      CREATE INDEX IF NOT EXISTS safety_reports_coords_idx ON safety_reports(latitude, longitude);
+    `);
+    await pool.query("INSERT INTO schema_migrations (version) VALUES ('v4_pulse_journeys_reports_responders') ON CONFLICT DO NOTHING");
   }
 
   // Seed directory & demo accounts if PG database is newly provisioned
@@ -1836,7 +1892,13 @@ export async function getIncidentById(incidentId: number): Promise<IncidentRecor
   };
 }
 
-export async function listIncidentsForUser(userId: number, viewerRole: UserRole = 'regular_user') {
+export async function listIncidentsForUser(
+  userId: number,
+  viewerRole: UserRole = 'regular_user',
+  options: { limit?: number; offset?: number } = {}
+) {
+  const limit = options.limit ?? 50;
+  const offset = options.offset ?? 0;
   const dialect = await ensureDialect();
   if (dialect === 'postgres') {
     const rows = await db
@@ -1844,7 +1906,8 @@ export async function listIncidentsForUser(userId: number, viewerRole: UserRole 
       .from(emergencyIncidents)
       .where(eq(emergencyIncidents.userId, userId))
       .orderBy(desc(emergencyIncidents.createdAt), desc(emergencyIncidents.id))
-      .limit(50);
+      .limit(limit)
+      .offset(offset);
     const results: IncidentRecord[] = [];
     for (const row of rows) {
       const full = await getIncidentById(row.id);
@@ -1854,8 +1917,8 @@ export async function listIncidentsForUser(userId: number, viewerRole: UserRole 
   }
 
   const rows = sqlite
-    .prepare('SELECT id FROM emergency_incidents WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 50')
-    .all(userId) as { id: number }[];
+    .prepare('SELECT id FROM emergency_incidents WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?')
+    .all(userId, limit, offset) as { id: number }[];
   const results: IncidentRecord[] = [];
   for (const row of rows) {
     const full = await getIncidentById(row.id);
@@ -1864,14 +1927,32 @@ export async function listIncidentsForUser(userId: number, viewerRole: UserRole 
   return results;
 }
 
-export async function listAllIncidentsForOperator() {
+export async function countIncidentsForUser(userId: number): Promise<number> {
+  const dialect = await ensureDialect();
+  if (dialect === 'postgres') {
+    const res = await db
+      .select({ cnt: sql<number>`count(*)::int` })
+      .from(emergencyIncidents)
+      .where(eq(emergencyIncidents.userId, userId));
+    return res[0]?.cnt ?? 0;
+  }
+  const row = sqlite
+    .prepare('SELECT COUNT(*) as cnt FROM emergency_incidents WHERE user_id = ?')
+    .get(userId) as { cnt: number };
+  return Number(row?.cnt || 0);
+}
+
+export async function listAllIncidentsForOperator(options: { limit?: number; offset?: number } = {}) {
+  const limit = options.limit ?? 100;
+  const offset = options.offset ?? 0;
   const dialect = await ensureDialect();
   if (dialect === 'postgres') {
     const rows = await db
       .select({ id: emergencyIncidents.id })
       .from(emergencyIncidents)
       .orderBy(desc(emergencyIncidents.createdAt), desc(emergencyIncidents.id))
-      .limit(100);
+      .limit(limit)
+      .offset(offset);
     const results: IncidentRecord[] = [];
     for (const row of rows) {
       const full = await getIncidentById(row.id);
@@ -1881,14 +1962,24 @@ export async function listAllIncidentsForOperator() {
   }
 
   const rows = sqlite
-    .prepare('SELECT id FROM emergency_incidents ORDER BY created_at DESC, id DESC LIMIT 100')
-    .all() as { id: number }[];
+    .prepare('SELECT id FROM emergency_incidents ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?')
+    .all(limit, offset) as { id: number }[];
   const results: IncidentRecord[] = [];
   for (const row of rows) {
     const full = await getIncidentById(row.id);
     if (full) results.push(full);
   }
   return results;
+}
+
+export async function countAllIncidentsForOperator(): Promise<number> {
+  const dialect = await ensureDialect();
+  if (dialect === 'postgres') {
+    const res = await db.select({ cnt: sql<number>`count(*)::int` }).from(emergencyIncidents);
+    return res[0]?.cnt ?? 0;
+  }
+  const row = sqlite.prepare('SELECT COUNT(*) as cnt FROM emergency_incidents').get() as { cnt: number };
+  return Number(row?.cnt || 0);
 }
 
 export async function updateIncidentStatus(input: {
@@ -2133,7 +2224,12 @@ export async function createNotification(input: {
   return Number(res.lastInsertRowid);
 }
 
-export async function listNotificationsForUser(userId: number) {
+export async function listNotificationsForUser(
+  userId: number,
+  options: { limit?: number; offset?: number } = {}
+) {
+  const limit = options.limit ?? 40;
+  const offset = options.offset ?? 0;
   const dialect = await ensureDialect();
   if (dialect === 'postgres') {
     const rows = await db
@@ -2141,7 +2237,8 @@ export async function listNotificationsForUser(userId: number) {
       .from(notifications)
       .where(eq(notifications.userId, userId))
       .orderBy(desc(notifications.createdAt), desc(notifications.id))
-      .limit(40);
+      .limit(limit)
+      .offset(offset);
     return rows.map((r) => ({
       id: r.id,
       incidentId: r.incidentId ?? null,
@@ -2156,8 +2253,8 @@ export async function listNotificationsForUser(userId: number) {
   }
 
   const rows = sqlite
-    .prepare('SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 40')
-    .all(userId) as Record<string, unknown>[];
+    .prepare('SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?')
+    .all(userId, limit, offset) as Record<string, unknown>[];
   return rows.map((r) => ({
     id: Number(r.id),
     incidentId: r.incident_id != null ? Number(r.incident_id) : null,
@@ -2169,6 +2266,21 @@ export async function listNotificationsForUser(userId: number) {
     isSimulated: Boolean(r.is_simulated),
     createdAt: String(r.created_at),
   }));
+}
+
+export async function countNotificationsForUser(userId: number): Promise<number> {
+  const dialect = await ensureDialect();
+  if (dialect === 'postgres') {
+    const res = await db
+      .select({ cnt: sql<number>`count(*)::int` })
+      .from(notifications)
+      .where(eq(notifications.userId, userId));
+    return res[0]?.cnt ?? 0;
+  }
+  const row = sqlite
+    .prepare('SELECT COUNT(*) as cnt FROM notifications WHERE user_id = ?')
+    .get(userId) as { cnt: number };
+  return Number(row?.cnt || 0);
 }
 
 export async function markNotificationRead(userId: number, notificationId: number): Promise<boolean> {
@@ -2185,6 +2297,22 @@ export async function markNotificationRead(userId: number, notificationId: numbe
     .prepare('UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?')
     .run(notificationId, userId);
   return Number(res.changes || 0) > 0;
+}
+
+export async function markAllNotificationsRead(userId: number): Promise<number> {
+  const dialect = await ensureDialect();
+  if (dialect === 'postgres') {
+    const res = await db
+      .update(notifications)
+      .set({ isRead: true })
+      .where(and(eq(notifications.userId, userId), eq(notifications.isRead, false)))
+      .returning({ id: notifications.id });
+    return res.length;
+  }
+  const res = sqlite
+    .prepare('UPDATE notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0')
+    .run(userId);
+  return Number(res.changes || 0);
 }
 
 export async function logDeliveryAttempt(input: {
@@ -2425,14 +2553,15 @@ export async function writeAuditLog(input: {
     );
 }
 
-export async function listAuditLogs(limit = 50) {
+export async function listAuditLogs(limit = 50, offset = 0) {
   const dialect = await ensureDialect();
   if (dialect === 'postgres') {
     const rows = await db
       .select()
       .from(auditLogs)
       .orderBy(desc(auditLogs.createdAt), desc(auditLogs.id))
-      .limit(limit);
+      .limit(limit)
+      .offset(offset);
     return rows.map((r) => ({
       id: r.id,
       actorEmail: r.actorEmail,
@@ -2446,8 +2575,8 @@ export async function listAuditLogs(limit = 50) {
   }
 
   const rows = sqlite
-    .prepare('SELECT * FROM audit_logs ORDER BY created_at DESC, id DESC LIMIT ?')
-    .all(limit) as Record<string, unknown>[];
+    .prepare('SELECT * FROM audit_logs ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?')
+    .all(limit, offset) as Record<string, unknown>[];
   return rows.map((r) => ({
     id: Number(r.id),
     actorEmail: String(r.actor_email),
@@ -2460,6 +2589,16 @@ export async function listAuditLogs(limit = 50) {
   }));
 }
 
+export async function countAuditLogs(): Promise<number> {
+  const dialect = await ensureDialect();
+  if (dialect === 'postgres') {
+    const res = await db.select({ cnt: sql<number>`count(*)::int` }).from(auditLogs);
+    return res[0]?.cnt ?? 0;
+  }
+  const row = sqlite.prepare('SELECT COUNT(*) as cnt FROM audit_logs').get() as { cnt: number };
+  return Number(row?.cnt || 0);
+}
+
 // Analytics (explicitly separates real live incidents from simulated/demo incidents)
 export async function getOperationalAnalytics() {
   const dialect = await ensureDialect();
@@ -2470,24 +2609,39 @@ export async function getOperationalAnalytics() {
     priority: string;
     is_simulated: unknown;
     acknowledged_at: unknown;
+    resolved_at: unknown;
     created_at: unknown;
   }>;
   let orgRows: Array<{ category: string; count: number }>;
+  let responderRows: Array<{ responder_status: string; count: number }>;
 
   if (dialect === 'postgres') {
     const incRes = await pool.query(
-      'SELECT status, category, priority, is_simulated, acknowledged_at, created_at FROM emergency_incidents'
+      'SELECT status, category, priority, is_simulated, acknowledged_at, resolved_at, created_at FROM emergency_incidents'
     );
     allIncidents = incRes.rows;
     const orgRes = await pool.query('SELECT category, COUNT(*)::int AS count FROM support_organizations GROUP BY category');
     orgRows = orgRes.rows;
+    const respRes = await pool.query(
+      `SELECT responder_status, COUNT(*)::int AS count FROM users
+       WHERE role IN ('emergency_operator', 'support_organization', 'administrator')
+       GROUP BY responder_status`
+    );
+    responderRows = respRes.rows;
   } else {
     allIncidents = sqlite
-      .prepare('SELECT status, category, priority, is_simulated, acknowledged_at, created_at FROM emergency_incidents')
+      .prepare('SELECT status, category, priority, is_simulated, acknowledged_at, resolved_at, created_at FROM emergency_incidents')
       .all() as typeof allIncidents;
     orgRows = sqlite
       .prepare('SELECT category, COUNT(*) as count FROM support_organizations GROUP BY category')
       .all() as typeof orgRows;
+    responderRows = sqlite
+      .prepare(
+        `SELECT responder_status, COUNT(*) as count FROM users
+         WHERE role IN ('emergency_operator', 'support_organization', 'administrator')
+         GROUP BY responder_status`
+      )
+      .all() as typeof responderRows;
   }
 
   const liveIncidents = allIncidents.filter((i) => !i.is_simulated);
@@ -2498,15 +2652,24 @@ export async function getOperationalAnalytics() {
     const active = list.filter((i) => activeStatuses.has(String(i.status))).length;
     const resolved = list.filter((i) => String(i.status) === 'Resolved').length;
     const ackTimesSec: number[] = [];
+    const resolveTimesSec: number[] = [];
     for (const item of list) {
       if (item.acknowledged_at && item.created_at) {
         const diff =
           (new Date(String(item.acknowledged_at)).getTime() - new Date(String(item.created_at)).getTime()) / 1000;
         if (!Number.isNaN(diff) && diff >= 0) ackTimesSec.push(diff);
       }
+      if (item.resolved_at && item.created_at) {
+        const diff =
+          (new Date(String(item.resolved_at)).getTime() - new Date(String(item.created_at)).getTime()) / 1000;
+        if (!Number.isNaN(diff) && diff >= 0) resolveTimesSec.push(diff);
+      }
     }
     const avgAckSeconds = ackTimesSec.length
       ? Math.round(ackTimesSec.reduce((a, b) => a + b, 0) / ackTimesSec.length)
+      : null;
+    const avgResolutionSeconds = resolveTimesSec.length
+      ? Math.round(resolveTimesSec.reduce((a, b) => a + b, 0) / resolveTimesSec.length)
       : null;
 
     const categoryMap: Record<string, number> = {};
@@ -2520,13 +2683,618 @@ export async function getOperationalAnalytics() {
       active,
       resolved,
       avgAckSeconds,
+      avgResolutionSeconds,
       byCategory: Object.entries(categoryMap).map(([name, count]) => ({ name, count })),
     };
   };
+
+  const responderMap: Record<string, number> = { Available: 0, Responding: 0, 'Off Duty': 0 };
+  for (const r of responderRows) {
+    const st = String(r.responder_status || 'Available');
+    responderMap[st] = (responderMap[st] || 0) + Number(r.count);
+  }
 
   return {
     liveStats: summarize(liveIncidents),
     demoStats: summarize(simulatedIncidents),
     resourceDistribution: orgRows.map((r) => ({ category: r.category, count: Number(r.count) })),
+    responders: {
+      available: responderMap['Available'] || 0,
+      responding: responderMap['Responding'] || 0,
+      offDuty: responderMap['Off Duty'] || 0,
+    },
   };
 }
+
+// ========================
+// RESPONDER AVAILABILITY & ASSIGNMENT
+// ========================
+export type ResponderAvailabilityStatus = 'Available' | 'Responding' | 'Off Duty';
+
+export interface ResponderRecord {
+  id: number;
+  displayName: string;
+  email: string;
+  role: UserRole;
+  responderStatus: ResponderAvailabilityStatus;
+  responderUpdatedAt: string;
+  activeAssignedCount: number;
+}
+
+export async function updateResponderAvailability(
+  userId: number,
+  status: ResponderAvailabilityStatus
+): Promise<ResponderRecord | null> {
+  const dialect = await ensureDialect();
+  if (dialect === 'postgres') {
+    await db
+      .update(users)
+      .set({ responderStatus: status, responderUpdatedAt: new Date(), updatedAt: new Date() })
+      .where(eq(users.id, userId));
+  } else {
+    sqlite
+      .prepare("UPDATE users SET responder_status = ?, responder_updated_at = datetime('now'), updated_at = datetime('now') WHERE id = ?")
+      .run(status, userId);
+  }
+  const responders = await listRespondersWithAvailability();
+  return responders.find((r) => r.id === userId) || null;
+}
+
+export async function listRespondersWithAvailability(): Promise<ResponderRecord[]> {
+  const dialect = await ensureDialect();
+  if (dialect === 'postgres') {
+    const res = await pool.query(`
+      SELECT u.id, u.display_name, u.email, u.role, u.responder_status, u.responder_updated_at,
+             COALESCE(a.cnt, 0)::int AS active_assigned_count
+      FROM users u
+      LEFT JOIN (
+        SELECT operator_user_id, COUNT(*)::int AS cnt
+        FROM incident_assignments
+        WHERE status = 'active'
+        GROUP BY operator_user_id
+      ) a ON a.operator_user_id = u.id
+      WHERE u.role IN ('emergency_operator', 'support_organization', 'administrator')
+      ORDER BY u.id ASC
+    `);
+    return res.rows.map((r: Record<string, unknown>) => ({
+      id: Number(r.id),
+      displayName: String(r.display_name || r.email),
+      email: String(r.email),
+      role: r.role as UserRole,
+      responderStatus: (String(r.responder_status || 'Available') as ResponderAvailabilityStatus),
+      responderUpdatedAt: r.responder_updated_at ? new Date(String(r.responder_updated_at)).toISOString() : new Date().toISOString(),
+      activeAssignedCount: Number(r.active_assigned_count || 0),
+    }));
+  }
+
+  const rows = sqlite
+    .prepare(
+      `SELECT u.id, u.display_name, u.email, u.role, u.responder_status, u.responder_updated_at,
+              COALESCE((SELECT COUNT(*) FROM incident_assignments ia WHERE ia.operator_user_id = u.id AND ia.status = 'active'), 0) AS active_assigned_count
+       FROM users u
+       WHERE u.role IN ('emergency_operator', 'support_organization', 'administrator')
+       ORDER BY u.id ASC`
+    )
+    .all() as Record<string, unknown>[];
+
+  return rows.map((r) => ({
+    id: Number(r.id),
+    displayName: String(r.display_name || r.email),
+    email: String(r.email),
+    role: r.role as UserRole,
+    responderStatus: String(r.responder_status || 'Available') as ResponderAvailabilityStatus,
+    responderUpdatedAt: String(r.responder_updated_at || new Date().toISOString()),
+    activeAssignedCount: Number(r.active_assigned_count || 0),
+  }));
+}
+
+export async function assignIncidentToOperator(input: {
+  incidentId: number;
+  operatorUserId: number;
+  assignedByUserId: number;
+  assignedByRole: UserRole;
+}): Promise<IncidentRecord | null> {
+  const targetOp = await getUserById(input.operatorUserId);
+  if (!targetOp || !['emergency_operator', 'support_organization', 'administrator'].includes(targetOp.role)) {
+    throw new Error('Target responder must be an operator, support organization, or administrator.');
+  }
+
+  const dialect = await ensureDialect();
+  if (dialect === 'postgres') {
+    await db.transaction(async (tx) => {
+      const existingRows = await tx
+        .select()
+        .from(emergencyIncidents)
+        .where(eq(emergencyIncidents.id, input.incidentId))
+        .limit(1);
+      const existing = existingRows[0];
+      if (!existing) throw new Error('Incident not found.');
+
+      await tx
+        .update(incidentAssignments)
+        .set({ status: 'reassigned', completedAt: new Date() })
+        .where(and(eq(incidentAssignments.incidentId, input.incidentId), eq(incidentAssignments.status, 'active')));
+
+      await tx.insert(incidentAssignments).values({
+        incidentId: input.incidentId,
+        operatorUserId: input.operatorUserId,
+        assignedByUserId: input.assignedByUserId,
+        status: 'active',
+      });
+
+      const nextStatus = ['SOS Activated', 'Alert Sent'].includes(existing.status) ? 'Acknowledged' : existing.status;
+      await tx
+        .update(emergencyIncidents)
+        .set({
+          acknowledgedByUserId: input.operatorUserId,
+          acknowledgedAt: existing.acknowledgedAt || new Date(),
+          status: nextStatus,
+          updatedAt: new Date(),
+        })
+        .where(eq(emergencyIncidents.id, input.incidentId));
+
+      await tx.insert(incidentUpdates).values({
+        incidentId: input.incidentId,
+        authorUserId: input.assignedByUserId,
+        authorRole: input.assignedByRole,
+        previousStatus: existing.status,
+        newStatus: nextStatus,
+        note: `Incident assigned to responder ${targetOp.displayName || targetOp.email}.`,
+        isInternal: false,
+      });
+
+      await tx
+        .update(users)
+        .set({ responderStatus: 'Responding', responderUpdatedAt: new Date() })
+        .where(eq(users.id, input.operatorUserId));
+    });
+    return getIncidentById(input.incidentId);
+  }
+
+  runSqliteTransaction(() => {
+    const existing = sqlite
+      .prepare('SELECT * FROM emergency_incidents WHERE id = ?')
+      .get(input.incidentId) as Record<string, unknown> | undefined;
+    if (!existing) throw new Error('Incident not found.');
+
+    sqlite
+      .prepare("UPDATE incident_assignments SET status = 'reassigned', completed_at = datetime('now') WHERE incident_id = ? AND status = 'active'")
+      .run(input.incidentId);
+
+    sqlite
+      .prepare("INSERT INTO incident_assignments (incident_id, operator_user_id, assigned_by_user_id, status) VALUES (?, ?, ?, 'active')")
+      .run(input.incidentId, input.operatorUserId, input.assignedByUserId);
+
+    const prevStatus = String(existing.status);
+    const nextStatus = ['SOS Activated', 'Alert Sent'].includes(prevStatus) ? 'Acknowledged' : prevStatus;
+    const ackAt = existing.acknowledged_at ? String(existing.acknowledged_at) : new Date().toISOString();
+
+    sqlite
+      .prepare("UPDATE emergency_incidents SET acknowledged_by_user_id = ?, acknowledged_at = ?, status = ?, updated_at = datetime('now') WHERE id = ?")
+      .run(input.operatorUserId, ackAt, nextStatus, input.incidentId);
+
+    sqlite
+      .prepare(
+        `INSERT INTO incident_updates (incident_id, author_user_id, author_role, previous_status, new_status, note, is_internal)
+         VALUES (?, ?, ?, ?, ?, ?, 0)`
+      )
+      .run(
+        input.incidentId,
+        input.assignedByUserId,
+        input.assignedByRole,
+        prevStatus,
+        nextStatus,
+        `Incident assigned to responder ${targetOp.displayName || targetOp.email}.`
+      );
+
+    sqlite
+      .prepare("UPDATE users SET responder_status = 'Responding', responder_updated_at = datetime('now') WHERE id = ?")
+      .run(input.operatorUserId);
+  });
+
+  return getIncidentById(input.incidentId);
+}
+
+// ========================
+// LIFE-LINE PULSE: SAFETY JOURNEYS & REPORTS
+// ========================
+export interface SafetyJourneyRecord {
+  id: number;
+  userId: number;
+  originLabel: string;
+  originLat: number;
+  originLng: number;
+  destinationLabel: string;
+  destinationLat: number;
+  destinationLng: number;
+  travelMode: string;
+  selectedRouteSummary: string;
+  routeRiskLevel: string;
+  shareToken: string;
+  sharedWithContacts: Array<{ id?: number; name: string; email?: string }>;
+  checkInIntervalMinutes: number;
+  expectedArrivalAt: string;
+  nextCheckInDueAt: string;
+  lastCheckInAt: string | null;
+  arrivedAt: string | null;
+  status: 'Active' | 'Arrived Safe' | 'Escalated' | 'Cancelled';
+  isSimulated: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+function mapJourneyRow(r: Record<string, unknown>): SafetyJourneyRecord {
+  const toIso = (val: unknown): string => (val instanceof Date ? val.toISOString() : String(val));
+  const rawContacts = r.shared_with_contacts ?? r.sharedWithContacts;
+  let parsedContacts: Array<{ id?: number; name: string; email?: string }> = [];
+  if (Array.isArray(rawContacts)) {
+    parsedContacts = rawContacts as Array<{ id?: number; name: string; email?: string }>;
+  } else if (typeof rawContacts === 'string') {
+    try {
+      parsedContacts = JSON.parse(rawContacts);
+    } catch {
+      parsedContacts = [];
+    }
+  }
+  return {
+    id: Number(r.id),
+    userId: Number(r.user_id ?? r.userId),
+    originLabel: String(r.origin_label ?? r.originLabel),
+    originLat: Number(r.origin_lat ?? r.originLat),
+    originLng: Number(r.origin_lng ?? r.originLng),
+    destinationLabel: String(r.destination_label ?? r.destinationLabel),
+    destinationLat: Number(r.destination_lat ?? r.destinationLat),
+    destinationLng: Number(r.destination_lng ?? r.destinationLng),
+    travelMode: String(r.travel_mode ?? r.travelMode ?? 'WALK'),
+    selectedRouteSummary: String(r.selected_route_summary ?? r.selectedRouteSummary ?? ''),
+    routeRiskLevel: String(r.route_risk_level ?? r.routeRiskLevel ?? 'LOW'),
+    shareToken: String(r.share_token ?? r.shareToken),
+    sharedWithContacts: parsedContacts,
+    checkInIntervalMinutes: Number(r.check_in_interval_minutes ?? r.checkInIntervalMinutes ?? 15),
+    expectedArrivalAt: toIso(r.expected_arrival_at ?? r.expectedArrivalAt),
+    nextCheckInDueAt: toIso(r.next_check_in_due_at ?? r.nextCheckInDueAt),
+    lastCheckInAt: r.last_check_in_at ?? r.lastCheckInAt ? toIso(r.last_check_in_at ?? r.lastCheckInAt) : null,
+    arrivedAt: r.arrived_at ?? r.arrivedAt ? toIso(r.arrived_at ?? r.arrivedAt) : null,
+    status: String(r.status) as SafetyJourneyRecord['status'],
+    isSimulated: Boolean(r.is_simulated ?? r.isSimulated),
+    createdAt: toIso(r.created_at ?? r.createdAt),
+    updatedAt: toIso(r.updated_at ?? r.updatedAt),
+  };
+}
+
+export async function createSafetyJourney(input: {
+  userId: number;
+  originLabel: string;
+  originLat: number;
+  originLng: number;
+  destinationLabel: string;
+  destinationLat: number;
+  destinationLng: number;
+  travelMode: string;
+  selectedRouteSummary: string;
+  routeRiskLevel: string;
+  sharedWithContacts: Array<{ id?: number; name: string; email?: string }>;
+  checkInIntervalMinutes: number;
+  expectedDurationMinutes?: number;
+  isSimulated?: boolean;
+}): Promise<SafetyJourneyRecord> {
+  const dialect = await ensureDialect();
+  const now = Date.now();
+  const checkInMs = Math.max(5, Math.min(120, input.checkInIntervalMinutes)) * 60 * 1000;
+  const arrivalMs = Math.max(10, Math.min(480, input.expectedDurationMinutes ?? input.checkInIntervalMinutes * 2)) * 60 * 1000;
+  const expectedArrival = new Date(now + arrivalMs);
+  const nextCheckInDue = new Date(now + checkInMs);
+  const shareToken = crypto.randomBytes(12).toString('hex');
+
+  if (dialect === 'postgres') {
+    const inserted = await db
+      .insert(safetyJourneys)
+      .values({
+        userId: input.userId,
+        originLabel: input.originLabel,
+        originLat: input.originLat,
+        originLng: input.originLng,
+        destinationLabel: input.destinationLabel,
+        destinationLat: input.destinationLat,
+        destinationLng: input.destinationLng,
+        travelMode: input.travelMode,
+        selectedRouteSummary: input.selectedRouteSummary,
+        routeRiskLevel: input.routeRiskLevel,
+        shareToken,
+        sharedWithContacts: input.sharedWithContacts,
+        checkInIntervalMinutes: Math.max(5, Math.min(120, input.checkInIntervalMinutes)),
+        expectedArrivalAt: expectedArrival,
+        nextCheckInDueAt: nextCheckInDue,
+        lastCheckInAt: new Date(now),
+        status: 'Active',
+        isSimulated: Boolean(input.isSimulated),
+      })
+      .returning();
+    return mapJourneyRow(inserted[0] as unknown as Record<string, unknown>);
+  }
+
+  const res = sqlite
+    .prepare(
+      `INSERT INTO safety_journeys (
+         user_id, origin_label, origin_lat, origin_lng, destination_label, destination_lat, destination_lng,
+         travel_mode, selected_route_summary, route_risk_level, share_token, shared_with_contacts,
+         check_in_interval_minutes, expected_arrival_at, next_check_in_due_at, last_check_in_at, status, is_simulated
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?)`
+    )
+    .run(
+      input.userId,
+      input.originLabel,
+      input.originLat,
+      input.originLng,
+      input.destinationLabel,
+      input.destinationLat,
+      input.destinationLng,
+      input.travelMode,
+      input.selectedRouteSummary,
+      input.routeRiskLevel,
+      shareToken,
+      JSON.stringify(input.sharedWithContacts),
+      Math.max(5, Math.min(120, input.checkInIntervalMinutes)),
+      expectedArrival.toISOString(),
+      nextCheckInDue.toISOString(),
+      new Date(now).toISOString(),
+      input.isSimulated ? 1 : 0
+    );
+
+  const created = sqlite
+    .prepare('SELECT * FROM safety_journeys WHERE id = ?')
+    .get(Number(res.lastInsertRowid)) as Record<string, unknown>;
+  return mapJourneyRow(created);
+}
+
+export async function getSafetyJourneyById(journeyId: number): Promise<SafetyJourneyRecord | null> {
+  const dialect = await ensureDialect();
+  if (dialect === 'postgres') {
+    const rows = await db.select().from(safetyJourneys).where(eq(safetyJourneys.id, journeyId)).limit(1);
+    return rows[0] ? mapJourneyRow(rows[0] as unknown as Record<string, unknown>) : null;
+  }
+  const row = sqlite.prepare('SELECT * FROM safety_journeys WHERE id = ?').get(journeyId) as
+    | Record<string, unknown>
+    | undefined;
+  return row ? mapJourneyRow(row) : null;
+}
+
+export async function listSafetyJourneysForUser(userId: number, limit = 25): Promise<SafetyJourneyRecord[]> {
+  const dialect = await ensureDialect();
+  if (dialect === 'postgres') {
+    const rows = await db
+      .select()
+      .from(safetyJourneys)
+      .where(eq(safetyJourneys.userId, userId))
+      .orderBy(desc(safetyJourneys.createdAt), desc(safetyJourneys.id))
+      .limit(limit);
+    return rows.map((r) => mapJourneyRow(r as unknown as Record<string, unknown>));
+  }
+  const rows = sqlite
+    .prepare('SELECT * FROM safety_journeys WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ?')
+    .all(userId, limit) as Record<string, unknown>[];
+  return rows.map(mapJourneyRow);
+}
+
+export async function checkInSafetyJourney(userId: number, journeyId: number): Promise<SafetyJourneyRecord | null> {
+  const existing = await getSafetyJourneyById(journeyId);
+  if (!existing || existing.userId !== userId) return null;
+  const now = new Date();
+  const nextDue = new Date(now.getTime() + existing.checkInIntervalMinutes * 60 * 1000);
+  const dialect = await ensureDialect();
+
+  if (dialect === 'postgres') {
+    const updated = await db
+      .update(safetyJourneys)
+      .set({ lastCheckInAt: now, nextCheckInDueAt: nextDue, updatedAt: now })
+      .where(and(eq(safetyJourneys.id, journeyId), eq(safetyJourneys.userId, userId)))
+      .returning();
+    return updated[0] ? mapJourneyRow(updated[0] as unknown as Record<string, unknown>) : null;
+  }
+
+  sqlite
+    .prepare("UPDATE safety_journeys SET last_check_in_at = ?, next_check_in_due_at = ?, updated_at = datetime('now') WHERE id = ? AND user_id = ?")
+    .run(now.toISOString(), nextDue.toISOString(), journeyId, userId);
+  return getSafetyJourneyById(journeyId);
+}
+
+export async function updateSafetyJourneyState(
+  userId: number,
+  journeyId: number,
+  status: 'Arrived Safe' | 'Escalated' | 'Cancelled'
+): Promise<SafetyJourneyRecord | null> {
+  const existing = await getSafetyJourneyById(journeyId);
+  if (!existing || existing.userId !== userId) return null;
+  const now = new Date();
+  const arrivedAt = status === 'Arrived Safe' ? now : existing.arrivedAt ? new Date(existing.arrivedAt) : null;
+  const dialect = await ensureDialect();
+
+  if (dialect === 'postgres') {
+    const updated = await db
+      .update(safetyJourneys)
+      .set({ status, arrivedAt, updatedAt: now })
+      .where(and(eq(safetyJourneys.id, journeyId), eq(safetyJourneys.userId, userId)))
+      .returning();
+    return updated[0] ? mapJourneyRow(updated[0] as unknown as Record<string, unknown>) : null;
+  }
+
+  sqlite
+    .prepare("UPDATE safety_journeys SET status = ?, arrived_at = ?, updated_at = datetime('now') WHERE id = ? AND user_id = ?")
+    .run(status, arrivedAt ? arrivedAt.toISOString() : null, journeyId, userId);
+  return getSafetyJourneyById(journeyId);
+}
+
+export async function refreshSafetyJourneyRisk(
+  userId: number,
+  journeyId: number,
+  routeSummary: string,
+  riskLevel: string
+): Promise<SafetyJourneyRecord | null> {
+  const existing = await getSafetyJourneyById(journeyId);
+  if (!existing || existing.userId !== userId) return null;
+  const dialect = await ensureDialect();
+
+  if (dialect === 'postgres') {
+    const updated = await db
+      .update(safetyJourneys)
+      .set({ selectedRouteSummary: routeSummary, routeRiskLevel: riskLevel, updatedAt: new Date() })
+      .where(and(eq(safetyJourneys.id, journeyId), eq(safetyJourneys.userId, userId)))
+      .returning();
+    return updated[0] ? mapJourneyRow(updated[0] as unknown as Record<string, unknown>) : null;
+  }
+
+  sqlite
+    .prepare("UPDATE safety_journeys SET selected_route_summary = ?, route_risk_level = ?, updated_at = datetime('now') WHERE id = ? AND user_id = ?")
+    .run(routeSummary, riskLevel, journeyId, userId);
+  return getSafetyJourneyById(journeyId);
+}
+
+export interface SafetyReportRecord {
+  id: number;
+  category: string;
+  severity: 'LOW' | 'MODERATE' | 'HIGH';
+  description: string;
+  latitude: number;
+  longitude: number;
+  locationLabel: string;
+  isAnonymous: boolean;
+  verificationStatus: string;
+  isSimulated: boolean;
+  createdAt: string;
+  reporterLabel: string;
+}
+
+function mapReportRow(r: Record<string, unknown>): SafetyReportRecord {
+  const isAnon = Boolean(r.is_anonymous ?? r.isAnonymous ?? true);
+  return {
+    id: Number(r.id),
+    category: String(r.category),
+    severity: String(r.severity || 'MODERATE') as SafetyReportRecord['severity'],
+    description: String(r.description),
+    latitude: Number(r.latitude),
+    longitude: Number(r.longitude),
+    locationLabel: String(r.location_label ?? r.locationLabel),
+    isAnonymous: isAnon,
+    verificationStatus: String(r.verification_status ?? r.verificationStatus ?? 'User Submitted'),
+    isSimulated: Boolean(r.is_simulated ?? r.isSimulated),
+    createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at ?? r.createdAt),
+    reporterLabel: isAnon ? 'Anonymous Community Member' : 'Verified Member Report',
+  };
+}
+
+export async function createSafetyReport(input: {
+  userId: number | null;
+  category: string;
+  severity: 'LOW' | 'MODERATE' | 'HIGH';
+  description: string;
+  latitude: number;
+  longitude: number;
+  locationLabel: string;
+  isAnonymous: boolean;
+  isSimulated?: boolean;
+}): Promise<SafetyReportRecord> {
+  const dialect = await ensureDialect();
+  if (dialect === 'postgres') {
+    const inserted = await db
+      .insert(safetyReports)
+      .values({
+        userId: input.isAnonymous ? null : input.userId,
+        category: input.category,
+        severity: input.severity,
+        description: input.description,
+        latitude: input.latitude,
+        longitude: input.longitude,
+        locationLabel: input.locationLabel,
+        isAnonymous: input.isAnonymous,
+        verificationStatus: 'User Submitted',
+        isSimulated: Boolean(input.isSimulated),
+      })
+      .returning();
+    return mapReportRow(inserted[0] as unknown as Record<string, unknown>);
+  }
+
+  const res = sqlite
+    .prepare(
+      `INSERT INTO safety_reports (user_id, category, severity, description, latitude, longitude, location_label, is_anonymous, verification_status, is_simulated)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'User Submitted', ?)`
+    )
+    .run(
+      input.isAnonymous ? null : input.userId,
+      input.category,
+      input.severity,
+      input.description,
+      input.latitude,
+      input.longitude,
+      input.locationLabel,
+      input.isAnonymous ? 1 : 0,
+      input.isSimulated ? 1 : 0
+    );
+
+  const created = sqlite
+    .prepare('SELECT * FROM safety_reports WHERE id = ?')
+    .get(Number(res.lastInsertRowid)) as Record<string, unknown>;
+  return mapReportRow(created);
+}
+
+export async function listSafetyReportsForPulse(limit = 100): Promise<SafetyReportRecord[]> {
+  const dialect = await ensureDialect();
+  if (dialect === 'postgres') {
+    const rows = await db
+      .select()
+      .from(safetyReports)
+      .orderBy(desc(safetyReports.createdAt), desc(safetyReports.id))
+      .limit(limit);
+    return rows.map((r) => mapReportRow(r as unknown as Record<string, unknown>));
+  }
+  const rows = sqlite
+    .prepare('SELECT * FROM safety_reports ORDER BY created_at DESC, id DESC LIMIT ?')
+    .all(limit) as Record<string, unknown>[];
+  return rows.map(mapReportRow);
+}
+
+export async function listIncidentsForPulse(limit = 150) {
+  const dialect = await ensureDialect();
+  if (dialect === 'postgres') {
+    const rows = await db
+      .select({
+        id: emergencyIncidents.id,
+        category: emergencyIncidents.category,
+        priority: emergencyIncidents.priority,
+        status: emergencyIncidents.status,
+        latitude: emergencyIncidents.latitude,
+        longitude: emergencyIncidents.longitude,
+        isSimulated: emergencyIncidents.isSimulated,
+        createdAt: emergencyIncidents.createdAt,
+      })
+      .from(emergencyIncidents)
+      .orderBy(desc(emergencyIncidents.createdAt))
+      .limit(limit);
+    return rows.map((r) => ({
+      id: r.id,
+      category: r.category,
+      priority: r.priority,
+      status: r.status,
+      latitude: r.latitude ?? null,
+      longitude: r.longitude ?? null,
+      isSimulated: r.isSimulated,
+      createdAt: r.createdAt.toISOString(),
+    }));
+  }
+
+  const rows = sqlite
+    .prepare(
+      'SELECT id, category, priority, status, latitude, longitude, is_simulated, created_at FROM emergency_incidents ORDER BY created_at DESC LIMIT ?'
+    )
+    .all(limit) as Record<string, unknown>[];
+  return rows.map((r) => ({
+    id: Number(r.id),
+    category: String(r.category),
+    priority: String(r.priority),
+    status: String(r.status),
+    latitude: r.latitude != null ? Number(r.latitude) : null,
+    longitude: r.longitude != null ? Number(r.longitude) : null,
+    isSimulated: Boolean(r.is_simulated),
+    createdAt: String(r.created_at),
+  }));
+}
+

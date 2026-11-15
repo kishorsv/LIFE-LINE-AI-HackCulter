@@ -4,7 +4,6 @@ import {
   FlaskConical,
   Menu,
   Moon,
-  Shield,
   Siren,
   Sun,
   UserCircle2,
@@ -13,7 +12,9 @@ import {
 import { ActiveView } from '../types/lifeline.ts';
 import { useTheme } from '../contexts/ThemeContext.tsx';
 import { useAuth } from '../contexts/AuthContext.tsx';
+import { t } from '../i18n/translations.ts';
 import { PWAInstallButton } from './PWAInstallButton.tsx';
+import { LifeLineLogo } from './LifeLineLogo.tsx';
 
 interface NavbarProps {
   activeView: ActiveView;
@@ -25,22 +26,23 @@ interface NavbarProps {
 
 export function Navbar({ activeView, onNavigate, onOpenAuth, onOpenSos, onToggleNotifications }: NavbarProps) {
   const { theme, toggleTheme } = useTheme();
-  const { user, demoMode, setDemoMode, notifications } = useAuth();
+  const { user, demoMode, setDemoMode, notifications, language, setLanguage } = useAuth();
   const [mobileOpen, setMobileOpen] = useState(false);
 
   const unreadCount = notifications.filter((n) => !n.isRead).length;
 
   const navItems: Array<{ id: ActiveView; label: string }> = [
-    { id: 'landing', label: 'Overview' },
-    { id: 'dashboard', label: 'Dashboard' },
-    { id: 'map', label: 'Live Map' },
-    { id: 'agents', label: 'AI Agents' },
-    { id: 'operator', label: 'Operator Desk' },
+    { id: 'landing', label: t(language, 'nav_overview') },
+    { id: 'dashboard', label: t(language, 'nav_dashboard') },
+    { id: 'pulse', label: t(language, 'nav_pulse') },
+    { id: 'map', label: t(language, 'nav_map') },
+    { id: 'agents', label: t(language, 'nav_agents') },
+    { id: 'operator', label: t(language, 'nav_operator') },
   ];
 
   const handleNav = (id: ActiveView) => {
     setMobileOpen(false);
-    if (id !== 'landing' && id !== 'map' && !user) {
+    if (id !== 'landing' && id !== 'map' && id !== 'pulse' && !user) {
       onOpenAuth();
       return;
     }
@@ -55,22 +57,13 @@ export function Navbar({ activeView, onNavigate, onOpenAuth, onOpenSos, onToggle
         <button
           type="button"
           onClick={() => onNavigate('landing')}
-          className="flex shrink-0 items-center gap-2.5 text-left focus:outline-none"
+          className="flex shrink-0 items-center text-left focus:outline-none"
+          aria-label="LIFE-LINE AI Home"
         >
-          <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-violet-600 via-purple-600 to-indigo-700 text-white shadow-lg shadow-violet-600/30">
-            <Shield className="h-5 w-5" />
-          </span>
-          <span className="flex flex-col leading-none">
-            <span className="font-display text-base font-bold tracking-tight text-slate-900 dark:text-white">
-              LIFE-LINE <span className="text-violet-600 dark:text-violet-400">AI</span>
-            </span>
-            <span className="text-[10px] font-medium tracking-wider text-slate-500 dark:text-slate-400">
-              SAFETY INTELLIGENCE
-            </span>
-          </span>
+          <LifeLineLogo variant="full" size="sm" showSubtitle subtitle="SAFETY INTELLIGENCE" />
         </button>
 
-        {/* Center: 5 single-line navigation links */}
+        {/* Center: 6 single-line navigation links */}
         <nav className="hidden lg:flex items-center gap-1 whitespace-nowrap">
           {navItems.map((item) => {
             const active = activeView === item.id;
@@ -79,7 +72,7 @@ export function Navbar({ activeView, onNavigate, onOpenAuth, onOpenSos, onToggle
                 key={item.id}
                 type="button"
                 onClick={() => handleNav(item.id)}
-                className={`rounded-lg px-3.5 py-2 text-sm font-medium transition-colors whitespace-nowrap ${
+                className={`rounded-lg px-3 py-2 text-sm font-medium transition-colors whitespace-nowrap ${
                   active
                     ? 'bg-violet-600/12 text-violet-700 dark:bg-violet-500/20 dark:text-violet-300'
                     : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-300 dark:hover:bg-slate-800/70 dark:hover:text-white'
@@ -148,6 +141,14 @@ export function Navbar({ activeView, onNavigate, onOpenAuth, onOpenSos, onToggle
             <PWAInstallButton />
             <button
               type="button"
+              onClick={() => setLanguage(language === 'en' ? 'kn' : 'en')}
+              className="inline-flex items-center gap-1 rounded-md border border-slate-200 dark:border-slate-700 px-2.5 py-1 font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-200/60 dark:hover:bg-slate-800"
+              aria-label="Toggle language between English and Kannada"
+            >
+              <span>{language === 'en' ? 'EN / ಕನ್ನಡ' : 'ಕನ್ನಡ / EN'}</span>
+            </button>
+            <button
+              type="button"
               onClick={toggleTheme}
               className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 dark:border-slate-700 px-2.5 py-1 text-slate-700 dark:text-slate-300 hover:bg-slate-200/60 dark:hover:bg-slate-800"
               aria-label="Toggle color theme"
@@ -196,6 +197,10 @@ export function Navbar({ activeView, onNavigate, onOpenAuth, onOpenSos, onToggle
       {/* Mobile Drawer */}
       {mobileOpen && (
         <div className="lg:hidden border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-[#090E1E] px-4 py-3 space-y-1">
+          <div className="flex items-center justify-between border-b border-slate-200/80 dark:border-slate-800 pb-2.5 mb-2">
+            <LifeLineLogo variant="compact" size="xs" />
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Navigation</span>
+          </div>
           {navItems.map((item) => (
             <button
               key={item.id}

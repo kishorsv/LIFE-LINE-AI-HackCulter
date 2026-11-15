@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { ActiveView } from '../types/lifeline.ts';
 import { useAuth } from '../contexts/AuthContext.tsx';
+import { LifeLineLogo } from './LifeLineLogo.tsx';
 
 interface LandingPageProps {
   onNavigate: (view: ActiveView) => void;
@@ -49,17 +50,17 @@ export function LandingPage({ onNavigate, onOpenAuth, onOpenSos }: LandingPagePr
 
   const agents = [
     {
-      name: 'Emergency Assessment Agent',
+      name: 'SOS Classification Agent',
       role: 'Deep Priority Triage',
       desc: 'Analyzes text, location context, and photos to classify urgency, ask safe clarifying questions, and explain every priority rationale.',
     },
     {
-      name: 'Safety Intelligence Agent',
-      role: 'Grounded Context Guidance',
-      desc: 'Evaluates area and time context with Google Search advisories while explicitly disclosing uncertainty and never inventing risk scores.',
+      name: 'SafeRoute Intelligence Agent',
+      role: 'Predictive Corridor Scoring',
+      desc: 'Compares Google Maps Routes v2 options alongside verified incidents, Open-Meteo weather, and 24/7 support hub proximity.',
     },
     {
-      name: 'Resource Discovery Agent',
+      name: 'Hospital & Support Matching Agent',
       role: 'Verified Nearby Support',
       desc: 'Locates nearby hospitals, shelters, youth centers, and women’s helplines using live Google Maps grounding and source timestamps.',
     },
@@ -69,17 +70,22 @@ export function LandingPage({ onNavigate, onOpenAuth, onOpenSos }: LandingPagePr
       desc: 'Organizes trusted contact drafts and operator briefings via structured tool calls—always requiring human confirmation before dispatch.',
     },
     {
-      name: 'AI Support & Live Voice Companion',
-      role: 'Calm Multimodal Guidance',
-      desc: 'Provides real-time two-way voice guidance, audio note transcription, and steady TTS instructions when typing is difficult.',
+      name: 'Incident Follow-up Agent',
+      role: 'Trauma-Informed Post-SOS Care',
+      desc: 'Guides post-incident wellbeing steps, evidence preservation checklists, and optional Google Docs/Tasks documentation exports.',
+    },
+    {
+      name: 'Personal Safety Assistant & Live Voice',
+      role: 'Bilingual Guidance (EN / ಕನ್ನಡ)',
+      desc: 'Provides real-time two-way voice guidance, calm safety Q&A, audio transcription, and steady TTS instructions when typing is unsafe.',
     },
   ];
 
   const workflowSteps = [
-    { step: '01', title: 'Activate & Capture Context', desc: 'Tap SOS or enter safety mode. Geolocation, timestamp, and optional voice context are captured with a 5s cancel guard.' },
-    { step: '02', title: 'Alert Trusted Circle & Operators', desc: 'Real-time WebSocket dispatch notifies authorized operators and delivers multi-channel alerts with audit logs.' },
-    { step: '03', title: 'Agentic Triage & Routing', desc: 'Five specialized AI agents assess priority, surface verified nearby shelters/hospitals, and compute safe Google Maps routes.' },
-    { step: '04', title: 'Human Acknowledgment & Resolution', desc: 'Authorized responders acknowledge alerts, coordinate assistance in real time, and record a complete verified timeline.' },
+    { step: '01', title: 'Activate & Capture Context', desc: 'Tap SOS or launch LIFE-LINE PULSE. Geolocation, weather telemetry, and optional voice context are captured with a 5s cancel guard.' },
+    { step: '02', title: 'Alert Trusted Circle & Operators', desc: 'Real-time WebSocket dispatch notifies authorized operators and delivers multi-channel alerts with honest provider confirmation logs.' },
+    { step: '03', title: '6-Agent Triage & SafeRoute', desc: 'Six specialized AI agents assess priority, surface verified nearby shelters/hospitals, and compare safer Google Maps Routes v2 corridors.' },
+    { step: '04', title: 'Human Acknowledgment & Follow-Up', desc: 'Authorized responders acknowledge alerts, coordinate assistance in real time, and support safe arrival & post-incident recovery.' },
   ];
 
   return (
@@ -101,9 +107,9 @@ export function LandingPage({ onNavigate, onOpenAuth, onOpenSos }: LandingPagePr
                 </span>
               </h1>
               <p className="max-w-xl text-base text-slate-600 dark:text-slate-300 leading-relaxed">
-                LIFE-LINE AI combines instant SOS workflows, real-time operator synchronization, verified nearby
-                support discovery, and five transparent Gemini-powered safety agents built with strict human
-                oversight.
+                LIFE-LINE AI combines instant SOS workflows, <strong>LIFE-LINE PULSE</strong> predictive risk &amp;
+                SafeRoute intelligence, real-time operator synchronization, and six transparent Gemini-powered safety
+                agents built with strict human oversight.
               </p>
 
               <div className="flex flex-wrap items-center gap-3 pt-1">
@@ -122,6 +128,14 @@ export function LandingPage({ onNavigate, onOpenAuth, onOpenSos }: LandingPagePr
                 >
                   <ShieldAlert className="h-4 w-4" />
                   <span>Access Emergency Support</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onNavigate('pulse')}
+                  className="inline-flex items-center gap-2 rounded-xl border border-violet-500/40 bg-violet-500/10 px-4 py-3 text-sm font-semibold text-violet-700 dark:text-violet-300 hover:bg-violet-500/20 transition-colors"
+                >
+                  <Activity className="h-4 w-4" />
+                  <span>Open PULSE</span>
                 </button>
                 <button
                   type="button"
@@ -239,7 +253,7 @@ export function LandingPage({ onNavigate, onOpenAuth, onOpenSos }: LandingPagePr
                   <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/70 p-3">
                     <div className="text-[11px] text-slate-500 dark:text-slate-400">AI Agents</div>
                     <div className="mt-0.5 font-display text-sm font-bold tabular-nums text-violet-600 dark:text-violet-400">
-                      5 Active Specialists
+                      6 Active Specialists
                     </div>
                   </div>
                   <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/70 p-3">
@@ -259,7 +273,7 @@ export function LandingPage({ onNavigate, onOpenAuth, onOpenSos }: LandingPagePr
       <section className="mx-auto max-w-7xl px-4 py-14 sm:px-6">
         <div className="grid gap-6 md:grid-cols-3">
           <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0C1226] p-6">
-            <Shield className="h-6 w-6 text-violet-500" />
+            <LifeLineLogo variant="mark" size="sm" />
             <h2 className="mt-4 font-display text-lg font-bold text-slate-900 dark:text-white">Why LIFE-LINE AI Exists</h2>
             <p className="mt-2 text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
               Women and young people commuting, studying, or navigating unfamiliar areas often face fragmented tools:
@@ -316,7 +330,7 @@ export function LandingPage({ onNavigate, onOpenAuth, onOpenSos }: LandingPagePr
         <div className="flex flex-wrap items-end justify-between gap-4">
           <div>
             <h2 className="font-display text-2xl font-bold text-slate-900 dark:text-white sm:text-3xl">
-              Five Specialized Safety AI Agents
+              Six Specialized Safety AI Agents
             </h2>
             <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
               Server-side Gemini orchestration with structured reasoning, Google Search/Maps grounding, and deterministic fallbacks.
@@ -406,7 +420,7 @@ export function LandingPage({ onNavigate, onOpenAuth, onOpenSos }: LandingPagePr
                 <span>Specialized Safety Agents</span>
               </div>
               <div className="mt-2 font-display text-2xl font-extrabold tabular-nums text-slate-900 dark:text-white">
-                5 Agents
+                6 Agents
               </div>
             </div>
             <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-4">
@@ -415,7 +429,7 @@ export function LandingPage({ onNavigate, onOpenAuth, onOpenSos }: LandingPagePr
                 <span>Relational Persistence Schema</span>
               </div>
               <div className="mt-2 font-display text-2xl font-extrabold tabular-nums text-slate-900 dark:text-white">
-                14 Tables
+                16 Tables
               </div>
             </div>
           </div>
@@ -425,9 +439,11 @@ export function LandingPage({ onNavigate, onOpenAuth, onOpenSos }: LandingPagePr
       {/* Quiet Footer */}
       <footer className="border-t border-slate-200 dark:border-slate-800 bg-slate-100/70 dark:bg-[#050814]">
         <div className="mx-auto flex max-w-7xl flex-col gap-3 px-4 py-8 sm:flex-row sm:items-center sm:justify-between sm:px-6 text-xs text-slate-500 dark:text-slate-400">
-          <div>
-            <strong className="text-slate-800 dark:text-slate-200">LIFE-LINE AI</strong> — Agentic Safety & Emergency Response
-            Intelligence Platform (Youth & Women Safety).
+          <div className="flex flex-wrap items-center gap-3">
+            <LifeLineLogo variant="compact" size="xs" />
+            <span>
+              Agentic Safety &amp; Emergency Response Intelligence Platform (Youth &amp; Women Safety).
+            </span>
           </div>
           <div className="flex flex-wrap items-center gap-4">
             <a

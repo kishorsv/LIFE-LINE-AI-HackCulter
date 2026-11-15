@@ -1,6 +1,9 @@
 import React, { useRef, useState } from 'react';
 import {
+  Activity,
   Bot,
+  CheckCircle2,
+  ClipboardCheck,
   Compass,
   ExternalLink,
   ImagePlus,
@@ -8,6 +11,7 @@ import {
   Mic,
   PhoneOff,
   Radio,
+  Route,
   Send,
   ShieldAlert,
   Sparkles,
@@ -15,8 +19,10 @@ import {
   Workflow,
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext.tsx';
+import { ActiveView } from '../types/lifeline.ts';
+import { t } from '../i18n/translations.ts';
 
-type AgentTab = 'assessment' | 'safety' | 'resources' | 'coordination' | 'assistant';
+type AgentTab = 'assessment' | 'saferoute' | 'resources' | 'coordination' | 'followup' | 'safety' | 'assistant';
 
 // PCM helpers for Gemini Live 16kHz input & 24kHz playback
 function floatTo16BitPcmBase64(float32: Float32Array): string {
@@ -43,8 +49,8 @@ function base64PcmToAudioBuffer(ctx: AudioContext, base64: string): AudioBuffer 
   return buffer;
 }
 
-export function AiAgentsHub() {
-  const { apiFetch, profile, token } = useAuth();
+export function AiAgentsHub({ onNavigate }: { onNavigate?: (view: ActiveView) => void }) {
+  const { apiFetch, profile, token, incidents, language } = useAuth();
   const [activeTab, setActiveTab] = useState<AgentTab>('assessment');
   const [agentError, setAgentError] = useState('');
 
@@ -118,6 +124,41 @@ export function AiAgentsHub() {
   const [fastMode, setFastMode] = useState(false);
   const [chatBusy, setChatBusy] = useState(false);
   const [ttsBusy, setTtsBusy] = useState(false);
+
+  // 6. Incident Follow-up Agent State
+  const [followUpIncidentId, setFollowUpIncidentId] = useState<string>('');
+  const [followUpTitle, setFollowUpTitle] = useState('Post-SOS Evening Transit Check-In');
+  const [followUpStatus, setFollowUpStatus] = useState('Resolved');
+  const [followUpCategory, setFollowUpCategory] = useState('Personal Safety');
+  const [followUpLocation, setFollowUpLocation] = useState(profile?.lastLocationLabel || 'Central Transit Hub');
+  const [followUpNotes, setFollowUpNotes] = useState('');
+  const [followUpBusy, setFollowUpBusy] = useState(false);
+  const [followUpAuthorizedMsg, setFollowUpAuthorizedMsg] = useState('');
+  const [followUpResult, setFollowUpResult] = useState<{
+    modelUsed: string;
+    isAiAdvisory?: boolean;
+    requiresHumanAuthorization?: boolean;
+    advisoryNotice?: string;
+    summary: string;
+    immediateWellbeingSteps: string[];
+    documentationChecklist: string[];
+    workspaceActionSuggestions: string[];
+    supportFollowUpWindow: string;
+  } | null>(null);
+
+  // SafeRoute Quick Agent State
+  const [safeRouteOrigin, setSafeRouteOrigin] = useState(profile?.lastLocationLabel || 'Campus Library');
+  const [safeRouteDest, setSafeRouteDest] = useState('City Central Station');
+  const [safeRouteMode, setSafeRouteMode] = useState<'WALK' | 'DRIVE' | 'TRANSIT' | 'BICYCLE'>('WALK');
+  const [safeRouteBusy, setSafeRouteBusy] = useState(false);
+  const [safeRouteResult, setSafeRouteResult] = useState<{
+    modelUsed: string;
+    recommendedRouteIndex: number;
+    safetyReasoning: string;
+    cautionNotes: string[];
+    confidenceScore: number;
+    uncertaintyNotes: string;
+  } | null>(null);
 
   // Live Voice Companion Refs
   const [liveActive, setLiveActive] = useState(false);
@@ -239,7 +280,7 @@ export function AiAgentsHub() {
     try {
       const res = await apiFetch<{ reply: string }>('/api/ai/assistant', {
         method: 'POST',
-        body: JSON.stringify({ history: chatHistory, message: msg, fastMode }),
+        body: JSON.stringify({ history: chatHistory, message: msg, fastMode, language }),
       });
       setChatHistory([...nextHistory, { role: 'model', text: res.reply }]);
     } catch (err) {
@@ -249,6 +290,77 @@ export function AiAgentsHub() {
       ]);
     } finally {
       setChatBusy(false);
+    }
+  };
+
+  const runFollowUpAgent = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setFollowUpBusy(true);
+    setFollowUpAuthorizedMsg('');
+    setAgentError('');
+    try {
+      const res = await apiFetch<{ followUp: typeof followUpResult }>('/api/ai/follow-up', {
+        method: 'POST',
+        body: JSON.stringify({
+          incidentTitle: followUpTitle,
+          incidentStatus: followUpStatus,
+          incidentCategory: followUpCategory,
+          locationLabel: followUpLocation,
+          resolutionNotes: followUpNotes,
+          language,
+        }),
+      });
+      setFollowUpResult(res.followUp);
+    } catch (err) {
+      setAgentError(err instanceof Error ? err.message : 'Incident Follow-up Agent failed.');
+    } finally {
+      setFollowUpBusy(false);
+    }
+  };
+
+  const runQuickSafeRouteAgent = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSafeRouteBusy(true);
+    setAgentError('');
+    try {
+      const res = await apiFetch<{ saferoute: typeof safeRouteResult }>('/api/ai/saferoute', {
+        method: 'POST',
+        body: JSON.stringify({
+          originLabel: safeRouteOrigin,
+          destinationLabel: safeRouteDest,
+          travelMode: safeRouteMode,
+          weatherSummary: 'Use LIFE-LINE PULSE for live Open-Meteo & Google Routes telemetry',
+          routes: [
+            {
+              routeIndex: 0,
+              summary: 'Main Illuminated Arterial Corridor',
+              durationLabel: '16 mins',
+              distanceMeters: 1350,
+              safetyScore: 86,
+              riskLevel: 'LOW',
+              nearbyIncidentsCount: 0,
+              nearbySupportHubsCount: 2,
+              reasons: ['Follows main thoroughfare with 2 verified 24/7 support hubs nearby'],
+            },
+            {
+              routeIndex: 1,
+              summary: 'Park Shortcut Path',
+              durationLabel: '12 mins',
+              distanceMeters: 1020,
+              safetyScore: 68,
+              riskLevel: 'MODERATE',
+              nearbyIncidentsCount: 0,
+              nearbySupportHubsCount: 0,
+              reasons: ['Faster shortcut with fewer nearby 24/7 support hubs'],
+            },
+          ],
+        }),
+      });
+      setSafeRouteResult(res.saferoute);
+    } catch (err) {
+      setAgentError(err instanceof Error ? err.message : 'SafeRoute Agent analysis failed.');
+    } finally {
+      setSafeRouteBusy(false);
     }
   };
 
@@ -348,22 +460,36 @@ export function AiAgentsHub() {
   };
 
   const tabs: Array<{ id: AgentTab; label: string; icon: React.ReactNode }> = [
-    { id: 'assessment', label: '1. Emergency Assessment', icon: <ShieldAlert className="h-4 w-4" /> },
-    { id: 'safety', label: '2. Safety Intelligence', icon: <Sparkles className="h-4 w-4" /> },
-    { id: 'resources', label: '3. Resource Discovery', icon: <Compass className="h-4 w-4" /> },
-    { id: 'coordination', label: '4. Coordination Agent', icon: <Workflow className="h-4 w-4" /> },
-    { id: 'assistant', label: '5. Support & Live Voice', icon: <MessageSquare className="h-4 w-4" /> },
+    { id: 'assessment', label: '1. SOS Classification Agent', icon: <ShieldAlert className="h-4 w-4" /> },
+    { id: 'assistant', label: '2. Personal Safety Assistant', icon: <MessageSquare className="h-4 w-4" /> },
+    { id: 'saferoute', label: '3. SafeRoute Agent', icon: <Route className="h-4 w-4" /> },
+    { id: 'resources', label: '4. Hospital & Support Agent', icon: <Compass className="h-4 w-4" /> },
+    { id: 'coordination', label: '5. Emergency Coordination', icon: <Workflow className="h-4 w-4" /> },
+    { id: 'followup', label: '6. Incident Follow-up Agent', icon: <ClipboardCheck className="h-4 w-4" /> },
+    { id: 'safety', label: 'Context Intelligence', icon: <Sparkles className="h-4 w-4" /> },
   ];
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 space-y-6">
-      <div>
-        <h1 className="font-display text-2xl font-bold text-slate-900 dark:text-white">
-          Agentic AI Intelligence Engine
-        </h1>
-        <p className="text-xs text-slate-500 dark:text-slate-400">
-          Five transparent safety agents with structured triage, grounded search/maps, and human-authorized coordination.
-        </p>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h1 className="font-display text-2xl font-bold text-slate-900 dark:text-white">
+            {t(language, 'agents_title')}
+          </h1>
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            {t(language, 'agents_subtitle')}
+          </p>
+        </div>
+        {onNavigate && (
+          <button
+            type="button"
+            onClick={() => onNavigate('pulse')}
+            className="inline-flex items-center gap-1.5 rounded-xl border border-violet-500/40 bg-violet-500/10 px-3.5 py-2 text-xs font-semibold text-violet-700 dark:text-violet-300 hover:bg-violet-500/20"
+          >
+            <Activity className="h-4 w-4" />
+            <span>Open LIFE-LINE PULSE</span>
+          </button>
+        )}
       </div>
 
       <div className="rounded-xl border border-amber-500/35 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-800 dark:text-amber-200">
@@ -830,6 +956,279 @@ export function AiAgentsHub() {
                 <PhoneOff className="h-4 w-4" />
                 <span>End Voice Session</span>
               </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 3. SafeRoute Intelligence Agent */}
+      {activeTab === 'saferoute' && (
+        <div className="grid gap-6 lg:grid-cols-12">
+          <form
+            onSubmit={runQuickSafeRouteAgent}
+            className="lg:col-span-5 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-6 space-y-4"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="font-display text-base font-bold">SafeRoute Intelligence Agent</h2>
+              {onNavigate && (
+                <button
+                  type="button"
+                  onClick={() => onNavigate('pulse')}
+                  className="text-xs font-semibold text-violet-600 dark:text-violet-400 hover:underline"
+                >
+                  Full Map in PULSE →
+                </button>
+              )}
+            </div>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              Compares route trade-offs using safety corridor scoring, nearby support hubs, and uncertainty disclosures.
+              Use LIFE-LINE PULSE for live Google Routes API v2 polylines &amp; Open-Meteo weather.
+            </p>
+            <input
+              type="text"
+              required
+              value={safeRouteOrigin}
+              onChange={(e) => setSafeRouteOrigin(e.target.value)}
+              placeholder="Origin label"
+              className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900/70 px-3 py-2 text-sm"
+            />
+            <input
+              type="text"
+              required
+              value={safeRouteDest}
+              onChange={(e) => setSafeRouteDest(e.target.value)}
+              placeholder="Destination label"
+              className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900/70 px-3 py-2 text-sm"
+            />
+            <select
+              value={safeRouteMode}
+              onChange={(e) => setSafeRouteMode(e.target.value as 'WALK' | 'DRIVE' | 'TRANSIT' | 'BICYCLE')}
+              className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900/70 px-3 py-2 text-sm"
+            >
+              <option value="WALK">Walking</option>
+              <option value="TRANSIT">Public Transit</option>
+              <option value="DRIVE">Driving</option>
+              <option value="BICYCLE">Bicycle</option>
+            </select>
+            <button
+              type="submit"
+              disabled={safeRouteBusy}
+              className="w-full rounded-xl bg-violet-600 py-2.5 text-sm font-semibold text-white hover:bg-violet-500 disabled:opacity-60"
+            >
+              {safeRouteBusy ? 'Evaluating Route Trade-Offs...' : 'Run SafeRoute Agent Explanation'}
+            </button>
+          </form>
+
+          <div className="lg:col-span-7 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-6 space-y-4">
+            {!safeRouteResult ? (
+              <div className="py-10 text-center text-xs text-slate-500 space-y-3">
+                <p>Run a corridor safety comparison or switch to LIFE-LINE PULSE for live Google Maps Routes v2 polylines.</p>
+                {onNavigate && (
+                  <button
+                    type="button"
+                    onClick={() => onNavigate('pulse')}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-violet-600 px-4 py-2 text-xs font-semibold text-white"
+                  >
+                    <Activity className="h-4 w-4" />
+                    <span>Open PULSE SafeRoute Map</span>
+                  </button>
+                )}
+              </div>
+            ) : (
+              <>
+                <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-3">
+                  <div>
+                    <div className="text-xs font-mono text-violet-500">{safeRouteResult.modelUsed}</div>
+                    <div className="font-display text-base font-bold">
+                      Recommended Option #{safeRouteResult.recommendedRouteIndex + 1}
+                    </div>
+                  </div>
+                  <span className="rounded-md border border-emerald-500/35 bg-emerald-500/10 px-2.5 py-1 font-mono text-xs tabular-nums">
+                    Confidence: {Math.round(safeRouteResult.confidenceScore * 100)}%
+                  </span>
+                </div>
+                <p className="text-xs text-slate-700 dark:text-slate-200 leading-relaxed">
+                  {safeRouteResult.safetyReasoning}
+                </p>
+                {safeRouteResult.cautionNotes.length > 0 && (
+                  <ul className="space-y-1 text-xs text-slate-600 dark:text-slate-300 list-disc pl-4">
+                    {safeRouteResult.cautionNotes.map((c, idx) => (
+                      <li key={idx}>{c}</li>
+                    ))}
+                  </ul>
+                )}
+                <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-800 dark:text-amber-200">
+                  <strong>Uncertainty:</strong> {safeRouteResult.uncertaintyNotes}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 6. Incident Follow-up Agent */}
+      {activeTab === 'followup' && (
+        <div className="grid gap-6 lg:grid-cols-12">
+          <form
+            onSubmit={runFollowUpAgent}
+            className="lg:col-span-5 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-6 space-y-4"
+          >
+            <h2 className="font-display text-base font-bold">Incident Follow-up Agent</h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              Trauma-informed post-SOS recovery steps, evidence checklist, and optional Google Workspace export drafts
+              (human authorization required).
+            </p>
+            {incidents.length > 0 && (
+              <div>
+                <label className="block text-xs font-medium mb-1">Load From Recorded SOS Incident</label>
+                <select
+                  value={followUpIncidentId}
+                  onChange={(e) => {
+                    const idStr = e.target.value;
+                    setFollowUpIncidentId(idStr);
+                    const found = incidents.find((i) => String(i.id) === idStr);
+                    if (found) {
+                      setFollowUpTitle(found.title);
+                      setFollowUpStatus(found.status);
+                      setFollowUpCategory(found.category);
+                      setFollowUpLocation(found.locationLabel);
+                      setFollowUpNotes(found.description);
+                    }
+                  }}
+                  className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900/70 px-3 py-2 text-xs"
+                >
+                  <option value="">-- Custom / Manual Entry --</option>
+                  {incidents.slice(0, 10).map((inc) => (
+                    <option key={inc.id} value={String(inc.id)}>
+                      #{inc.id} · {inc.title} ({inc.status})
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            <input
+              type="text"
+              required
+              value={followUpTitle}
+              onChange={(e) => setFollowUpTitle(e.target.value)}
+              placeholder="Incident title"
+              className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900/70 px-3 py-2 text-sm"
+            />
+            <div className="grid grid-cols-2 gap-2">
+              <input
+                type="text"
+                value={followUpStatus}
+                onChange={(e) => setFollowUpStatus(e.target.value)}
+                placeholder="Status"
+                className="rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900/70 px-3 py-2 text-xs"
+              />
+              <input
+                type="text"
+                value={followUpCategory}
+                onChange={(e) => setFollowUpCategory(e.target.value)}
+                placeholder="Category"
+                className="rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900/70 px-3 py-2 text-xs"
+              />
+            </div>
+            <input
+              type="text"
+              value={followUpLocation}
+              onChange={(e) => setFollowUpLocation(e.target.value)}
+              placeholder="Location"
+              className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900/70 px-3 py-2 text-sm"
+            />
+            <textarea
+              rows={3}
+              value={followUpNotes}
+              onChange={(e) => setFollowUpNotes(e.target.value)}
+              placeholder="Resolution notes or context..."
+              className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900/70 px-3 py-2 text-xs"
+            />
+            <button
+              type="submit"
+              disabled={followUpBusy}
+              className="w-full rounded-xl bg-violet-600 py-2.5 text-sm font-semibold text-white hover:bg-violet-500 disabled:opacity-60"
+            >
+              {followUpBusy ? 'Preparing Recovery & Checklist...' : 'Generate Post-Incident Follow-up Plan'}
+            </button>
+          </form>
+
+          <div className="lg:col-span-7 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-6 space-y-4">
+            {!followUpResult ? (
+              <div className="py-12 text-center text-xs text-slate-500">
+                Select a recent SOS incident or describe the resolved situation to generate structured wellbeing and
+                documentation guidance.
+              </div>
+            ) : (
+              <>
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 dark:border-slate-800 pb-3">
+                  <div>
+                    <div className="text-xs font-mono text-violet-500">{followUpResult.modelUsed}</div>
+                    <h3 className="font-display text-base font-bold">Post-Incident Recovery Plan</h3>
+                  </div>
+                  <span className="rounded bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-700 dark:text-amber-300">
+                    Human Authorization Gate Active
+                  </span>
+                </div>
+                <p className="text-xs text-slate-700 dark:text-slate-200 leading-relaxed">{followUpResult.summary}</p>
+                <div>
+                  <div className="text-xs font-semibold mb-1">Immediate Wellbeing Steps</div>
+                  <ul className="space-y-1 text-xs text-slate-600 dark:text-slate-300 list-disc pl-4">
+                    {followUpResult.immediateWellbeingSteps.map((s, idx) => (
+                      <li key={idx}>{s}</li>
+                    ))}
+                  </ul>
+                </div>
+                <div>
+                  <div className="text-xs font-semibold mb-1">Documentation &amp; Evidence Checklist</div>
+                  <ul className="space-y-1 text-xs text-slate-600 dark:text-slate-300 list-disc pl-4">
+                    {followUpResult.documentationChecklist.map((d, idx) => (
+                      <li key={idx}>{d}</li>
+                    ))}
+                  </ul>
+                </div>
+                {followUpResult.workspaceActionSuggestions.length > 0 && (
+                  <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/60 p-3 space-y-1.5">
+                    <div className="text-xs font-semibold">Suggested Human-Authorized Actions</div>
+                    <ul className="space-y-1 text-xs text-slate-600 dark:text-slate-300">
+                      {followUpResult.workspaceActionSuggestions.map((w, idx) => (
+                        <li key={idx}>• {w}</li>
+                      ))}
+                    </ul>
+                    <div className="pt-2 flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setFollowUpAuthorizedMsg(
+                            'Confirmed: Follow-up checklist reviewed. Use Dashboard Google Workspace buttons to explicitly save to Docs/Tasks.'
+                          )
+                        }
+                        className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500"
+                      >
+                        <CheckCircle2 className="h-3.5 w-3.5" />
+                        <span>Approve Follow-up Plan</span>
+                      </button>
+                      {onNavigate && (
+                        <button
+                          type="button"
+                          onClick={() => onNavigate('dashboard')}
+                          className="rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-1.5 text-xs font-medium"
+                        >
+                          Open Dashboard Workspace Exports
+                        </button>
+                      )}
+                    </div>
+                    {followUpAuthorizedMsg && (
+                      <div className="text-xs text-emerald-600 dark:text-emerald-400 font-medium">
+                        {followUpAuthorizedMsg}
+                      </div>
+                    )}
+                  </div>
+                )}
+                <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                  <strong>Recommended Follow-up Window:</strong> {followUpResult.supportFollowUpWindow}
+                </div>
+              </>
             )}
           </div>
         </div>

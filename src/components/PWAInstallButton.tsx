@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Download, X } from 'lucide-react';
 import { usePWAInstall } from '../hooks/usePWAInstall.ts';
+import { LifeLineLogo } from './LifeLineLogo.tsx';
 
 export function PWAInstallButton() {
   const { isInstallable, isInstalled, isIOS, install } = usePWAInstall();
@@ -39,9 +40,12 @@ export function PWAInstallButton() {
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 backdrop-blur-sm p-4">
             <div className="w-full max-w-sm rounded-2xl border border-violet-500/30 bg-white dark:bg-[#0B1022] p-6 shadow-2xl">
               <div className="flex items-center justify-between">
-                <h3 className="font-display text-base font-bold text-slate-900 dark:text-white">
-                  Install LIFE-LINE AI on iOS
-                </h3>
+                <div className="flex items-center gap-2">
+                  <LifeLineLogo variant="mark" size="xs" />
+                  <h3 className="font-display text-base font-bold text-slate-900 dark:text-white">
+                    Install LIFE-LINE AI on iOS
+                  </h3>
+                </div>
                 <button
                   type="button"
                   onClick={() => setShowIOSGuide(false)}

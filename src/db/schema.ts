@@ -36,6 +36,8 @@ export const users = pgTable(
     resetCodeExpiresAt: timestamp('reset_code_expires_at'),
     resetAttempts: integer('reset_attempts').notNull().default(0),
     isDemoAccount: boolean('is_demo_account').notNull().default(false),
+    responderStatus: text('responder_status').notNull().default('Available'),
+    responderUpdatedAt: timestamp('responder_updated_at').defaultNow().notNull(),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at').defaultNow().notNull(),
   },
@@ -340,6 +342,67 @@ export const userPreferences = pgTable('user_preferences', {
   demoModeEnabled: boolean('demo_mode_enabled').notNull().default(false),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
+
+// 15. safety_journeys (LIFE-LINE PULSE SafeRoute & Journey Sharing)
+export const safetyJourneys = pgTable(
+  'safety_journeys',
+  {
+    id: serial('id').primaryKey(),
+    userId: integer('user_id')
+      .references(() => users.id, { onDelete: 'cascade' })
+      .notNull(),
+    originLabel: text('origin_label').notNull(),
+    originLat: doublePrecision('origin_lat').notNull(),
+    originLng: doublePrecision('origin_lng').notNull(),
+    destinationLabel: text('destination_label').notNull(),
+    destinationLat: doublePrecision('destination_lat').notNull(),
+    destinationLng: doublePrecision('destination_lng').notNull(),
+    travelMode: text('travel_mode').notNull().default('WALK'),
+    selectedRouteSummary: text('selected_route_summary').notNull().default(''),
+    routeRiskLevel: text('route_risk_level').notNull().default('LOW'),
+    shareToken: text('share_token').notNull(),
+    sharedWithContacts: jsonb('shared_with_contacts')
+      .$type<Array<{ id?: number; name: string; email?: string }>>()
+      .notNull()
+      .default([]),
+    checkInIntervalMinutes: integer('check_in_interval_minutes').notNull().default(15),
+    expectedArrivalAt: timestamp('expected_arrival_at').notNull(),
+    nextCheckInDueAt: timestamp('next_check_in_due_at').notNull(),
+    lastCheckInAt: timestamp('last_check_in_at'),
+    arrivedAt: timestamp('arrived_at'),
+    status: text('status').notNull().default('Active'),
+    isSimulated: boolean('is_simulated').notNull().default(false),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at').defaultNow().notNull(),
+  },
+  (table) => [
+    index('safety_journeys_user_idx').on(table.userId),
+    index('safety_journeys_status_idx').on(table.status),
+  ]
+);
+
+// 16. safety_reports (Privacy-conscious safety observations for Predictive Risk Intelligence)
+export const safetyReports = pgTable(
+  'safety_reports',
+  {
+    id: serial('id').primaryKey(),
+    userId: integer('user_id').references(() => users.id, { onDelete: 'set null' }),
+    category: text('category').notNull(),
+    severity: text('severity').notNull().default('MODERATE'),
+    description: text('description').notNull(),
+    latitude: doublePrecision('latitude').notNull(),
+    longitude: doublePrecision('longitude').notNull(),
+    locationLabel: text('location_label').notNull(),
+    isAnonymous: boolean('is_anonymous').notNull().default(true),
+    verificationStatus: text('verification_status').notNull().default('User Submitted'),
+    isSimulated: boolean('is_simulated').notNull().default(false),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => [
+    index('safety_reports_created_idx').on(table.createdAt),
+    index('safety_reports_coords_idx').on(table.latitude, table.longitude),
+  ]
+);
 
 // Drizzle Relations
 export const usersRelations = relations(users, ({ one, many }) => ({

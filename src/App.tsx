@@ -15,6 +15,8 @@ import { SosModal } from './components/SosModal.tsx';
 import { WorkspaceConfirmModal } from './components/WorkspaceConfirmModal.tsx';
 import { OfflineIndicator } from './components/OfflineIndicator.tsx';
 import { FirebaseAuthBlockedAlert } from './components/FirebaseAuthBlockedAlert.tsx';
+import { PulseHub } from './components/PulseHub.tsx';
+import { LifeLineLogo } from './components/LifeLineLogo.tsx';
 import {
   clearLegacySharedSosQueue,
   getQueuedSosAlerts,
@@ -129,8 +131,17 @@ function AppShell() {
   const renderMainContent = () => {
     if (loading) {
       return (
-        <div className="mx-auto max-w-7xl px-4 py-20 text-center text-sm text-slate-500 dark:text-slate-400">
-          Initializing LIFE-LINE AI Safety Session...
+        <div className="mx-auto flex min-h-[60vh] max-w-7xl flex-col items-center justify-center gap-4 px-4 py-20 text-center">
+          <LifeLineLogo
+            variant="full"
+            size="lg"
+            showSubtitle
+            subtitle="INITIALIZING SAFETY SESSION"
+            animated
+          />
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Verifying encrypted session &amp; offline emergency cache...
+          </p>
         </div>
       );
     }
@@ -160,9 +171,11 @@ function AppShell() {
             onOpenSos={() => setSosOpen(true)}
           />
         );
+      case 'pulse':
+        return <PulseHub onOpenAuth={() => setAuthOpen(true)} onOpenSos={() => setSosOpen(true)} />;
       case 'agents':
         return user ? (
-          <AiAgentsHub />
+          <AiAgentsHub onNavigate={setActiveView} />
         ) : (
           <LandingPage
             onNavigate={setActiveView}

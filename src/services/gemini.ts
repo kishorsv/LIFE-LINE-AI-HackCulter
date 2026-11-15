@@ -687,15 +687,17 @@ Call both tools to prepare the trusted contact alert draft and the operator brie
   }
 }
 
-// 5. AI Support Assistant (multi-turn chat + gemini-3.1-flash-lite quick check)
+// 5. Personal Safety Assistant Agent (multi-turn chat + gemini-3.1-flash-lite quick check + en/kn support)
 export async function runSupportAssistantChat(
   input: {
     history: Array<{ role: 'user' | 'model'; text: string }>;
     message: string;
     fastMode?: boolean;
+    language?: 'en' | 'kn';
   },
   options?: { client?: GoogleGenAI | null; timeoutMs?: number }
 ) {
+  const lang = input.language === 'kn' ? 'kn' : 'en';
   const ai = getAiClient(options?.client);
   if (!ai) {
     return {
@@ -705,14 +707,22 @@ export async function runSupportAssistantChat(
       advisoryNotice: AI_ADVISORY_NOTICE,
       fallbackReason: 'not_configured' as AiFallbackReason,
       reply:
-        'The AI Assistant is currently offline. If you are in danger, press the Emergency SOS button on your dashboard or dial your local emergency number (911 / 112 / 999).',
+        lang === 'kn'
+          ? 'AI ಸಹಾಯಕರು ಪ್ರಸ್ತುತ ಆಫ್‌ಲೈನ್‌ನಲ್ಲಿದ್ದಾರೆ. ನೀವು ಅಪಾಯದಲ್ಲಿದ್ದರೆ, ದಯವಿಟ್ಟು ನಿಮ್ಮ ಡ್ಯಾಶ್‌ಬೋರ್ಡ್‌ನಲ್ಲಿರುವ ತುರ್ತು SOS ಬಟನ್ ಒತ್ತಿರಿ ಅಥವಾ ಸ್ಥಳೀಯ ತುರ್ತು ಸಂಖ್ಯೆಗೆ (112 / 911 / 999) ಕರೆ ಮಾಡಿ.'
+          : 'The AI Assistant is currently offline. If you are in danger, press the Emergency SOS button on your dashboard or dial your local emergency number (911 / 112 / 999).',
     };
   }
 
   const model = input.fastMode ? GEMINI_MODELS.fast : GEMINI_MODELS.reasoning;
-  const systemInstruction = `You are the LIFE-LINE AI Support Assistant — a calm, supportive safety guide for women and young people.
+  const languageDirective =
+    lang === 'kn'
+      ? '- Respond in natural, clear Kannada (ಕನ್ನಡ) using simple, reassuring phrasing while keeping official emergency numbers (112 / 911 / 999) unmistakable.'
+      : '- Respond in clear, calm English.';
+
+  const systemInstruction = `You are the LIFE-LINE AI Personal Safety Assistant — a calm, supportive safety guide for women and young people.
 - Answer safety questions clearly and empathetically.
-- Guide users through LIFE-LINE AI features (SOS activation, Trusted Contacts, Live Google Maps routing, Nearby Support Directory, Operator Desk).
+- Guide users through LIFE-LINE AI features (SOS activation, LIFE-LINE PULSE risk & SafeRoute, Trusted Contacts, Live Google Maps routing, Nearby Support Directory, Operator Desk).
+${languageDirective}
 - NEVER claim to be a doctor, police officer, or emergency dispatcher, and never replace emergency professionals.
 - Keep answers concise, scannable, and practical.`;
 
@@ -768,7 +778,10 @@ export async function runSupportAssistantChat(
       isAiAdvisory: true,
       advisoryNotice: AI_ADVISORY_NOTICE,
       fallbackReason: classified.reason,
-      reply: `${classified.publicMessage} If you are in immediate danger, trigger Emergency SOS or dial local emergency services (911 / 112 / 999).`,
+      reply:
+        lang === 'kn'
+          ? `${classified.publicMessage} ನೀವು ತಕ್ಷಣದ ಅಪಾಯದಲ್ಲಿದ್ದರೆ, ತುರ್ತು SOS ಬಳಸಿ ಅಥವಾ 112 / 911 ಗೆ ಕರೆ ಮಾಡಿ.`
+          : `${classified.publicMessage} If you are in immediate danger, trigger Emergency SOS or dial local emergency services (911 / 112 / 999).`,
     };
   }
 }
@@ -866,3 +879,241 @@ export async function synthesizeSafetyGuidanceSpeech(
     throw new GeminiServiceError(classified.publicMessage, classified.statusCode, classified.reason);
   }
 }
+
+// 6. SafeRoute Agent (gemini-4-hydrogen + structured schema)
+export async function runSafeRouteAgent(
+  input: {
+    originLabel: string;
+    destinationLabel: string;
+    travelMode: string;
+    weatherSummary: string;
+    routes: Array<{
+      routeIndex: number;
+      summary: string;
+      durationLabel: string;
+      distanceMeters: number;
+      safetyScore: number;
+      riskLevel: string;
+      nearbyIncidentsCount: number;
+      nearbySupportHubsCount: number;
+      reasons: string[];
+    }>;
+  },
+  options?: { client?: GoogleGenAI | null; timeoutMs?: number }
+) {
+  const bestFallback = [...input.routes].sort(
+    (a, b) => b.safetyScore - a.safetyScore || a.distanceMeters - b.distanceMeters
+  )[0];
+
+  const buildFallback = (reason: AiFallbackReason, notice: string) => ({
+    modelUsed: 'fallback-saferoute-ranker',
+    aiAvailable: false,
+    isAiAdvisory: true,
+    advisoryNotice: AI_ADVISORY_NOTICE,
+    fallbackReason: reason,
+    recommendedRouteIndex: bestFallback?.routeIndex ?? 0,
+    safetyReasoning: bestFallback
+      ? `Option ${bestFallback.routeIndex + 1} (${bestFallback.summary}) scored ${bestFallback.safetyScore}/100 based on ${bestFallback.nearbyIncidentsCount} nearby verified incident(s) and ${bestFallback.nearbySupportHubsCount} accessible support hub(s). ${notice}`
+      : notice,
+    cautionNotes: [
+      'Share your active journey with trusted contacts and confirm arrival once indoors.',
+      'Street lighting and foot traffic change quickly; choose main roads if visibility drops.',
+    ],
+    confidenceScore: 0.62,
+    uncertaintyNotes: `${notice} Real-time street lighting and pedestrian crowding cannot be directly observed.`,
+  });
+
+  const ai = getAiClient(options?.client);
+  if (!ai) {
+    return buildFallback('not_configured', 'AI SafeRoute reasoning is offline; ranking reflects deterministic corridor metrics.');
+  }
+
+  try {
+    const resp = await withRetryAndTimeout(
+      () =>
+        ai.models.generateContent({
+          model: GEMINI_MODELS.reasoning,
+          contents: `Compare these route alternatives and explain clearly which option is safest and why:
+Origin: ${input.originLabel}
+Destination: ${input.destinationLabel}
+Travel Mode: ${input.travelMode}
+Live Weather Context: ${input.weatherSummary}
+Candidate Routes JSON:
+${JSON.stringify(input.routes, null, 2)}`,
+          config: {
+            systemInstruction: `You are the LIFE-LINE PULSE SafeRoute Agent.
+Rules:
+- Compare only the route metrics, verified incident counts, support hubs, and weather context supplied in the prompt.
+- Never invent crime data, dangerous neighborhoods, or fake road closures.
+- Clearly explain trade-offs between travel duration and safety metrics.
+- Recommend human check-ins and official emergency lines when needed.`,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                recommendedRouteIndex: { type: Type.INTEGER },
+                safetyReasoning: { type: Type.STRING },
+                cautionNotes: { type: Type.ARRAY, items: { type: Type.STRING } },
+                confidenceScore: { type: Type.NUMBER },
+                uncertaintyNotes: { type: Type.STRING },
+              },
+              required: ['recommendedRouteIndex', 'safetyReasoning', 'cautionNotes', 'confidenceScore', 'uncertaintyNotes'],
+            },
+          },
+        }),
+      options?.timeoutMs ?? 20000,
+      2,
+      'SafeRoute Agent'
+    );
+
+    const parsed = safeParseJsonObject(resp.text);
+    if (!parsed || typeof parsed.safetyReasoning !== 'string') {
+      return buildFallback('malformed_response', 'SafeRoute AI output could not be parsed cleanly; using corridor score ranking.');
+    }
+
+    const validIndices = new Set(input.routes.map((r) => r.routeIndex));
+    const recIdx = Number(parsed.recommendedRouteIndex);
+    const chosenIdx = validIndices.has(recIdx) ? recIdx : (bestFallback?.routeIndex ?? 0);
+    const confRaw = Number(parsed.confidenceScore);
+
+    return {
+      modelUsed: GEMINI_MODELS.reasoning,
+      aiAvailable: true,
+      isAiAdvisory: true,
+      advisoryNotice: AI_ADVISORY_NOTICE,
+      recommendedRouteIndex: chosenIdx,
+      safetyReasoning: parsed.safetyReasoning.trim(),
+      cautionNotes: Array.isArray(parsed.cautionNotes)
+        ? parsed.cautionNotes.filter((c): c is string => typeof c === 'string' && c.trim().length > 0).slice(0, 5)
+        : [],
+      confidenceScore: Number.isFinite(confRaw) ? Math.min(1, Math.max(0, confRaw)) : 0.78,
+      uncertaintyNotes:
+        typeof parsed.uncertaintyNotes === 'string' && parsed.uncertaintyNotes.trim()
+          ? parsed.uncertaintyNotes.trim()
+          : 'Street conditions change dynamically; continue sharing your journey until arrival.',
+    };
+  } catch (err) {
+    const classified = classifyGeminiError(err);
+    return buildFallback(classified.reason, classified.publicMessage);
+  }
+}
+
+// 7. Incident Follow-up Agent (gemini-4-hydrogen + structured schema + human authorization gate)
+export async function runIncidentFollowUpAgent(
+  input: {
+    incidentTitle: string;
+    incidentStatus: string;
+    incidentCategory: string;
+    locationLabel: string;
+    resolutionNotes?: string;
+    language?: 'en' | 'kn';
+  },
+  options?: { client?: GoogleGenAI | null; timeoutMs?: number }
+) {
+  const buildFallback = (reason: AiFallbackReason, notice: string) => ({
+    modelUsed: 'fallback-followup-coordinator',
+    aiAvailable: false,
+    isAiAdvisory: true,
+    requiresHumanAuthorization: true,
+    advisoryNotice: AI_ADVISORY_NOTICE,
+    fallbackReason: reason,
+    summary: `Post-incident follow-up plan prepared for "${input.incidentTitle}" (${input.incidentStatus}). ${notice}`,
+    immediateWellbeingSteps: [
+      'Confirm you are in a physically safe location with a trusted person or open support venue.',
+      'Drink water, take slow breaths, and notify your primary trusted contact that you are safe.',
+      'Reach out to verified trauma or crisis counselling support if feeling shaken.',
+    ],
+    documentationChecklist: [
+      'Record exact time, street location, and nearest landmark while details remain fresh.',
+      'Preserve screenshots of messages, ride-share trip IDs, or call timestamps.',
+      'Review incident logs inside LIFE-LINE AI before filing an external police or campus report.',
+    ],
+    workspaceActionSuggestions: [
+      'Draft an incident summary in Google Docs (only created when you explicitly click Export).',
+      'Set a follow-up safety check-in reminder in Google Tasks (requires your explicit action).',
+    ],
+    supportFollowUpWindow: 'Schedule a trusted-contact check-in within 2 hours and 24 hours.',
+  });
+
+  const ai = getAiClient(options?.client);
+  if (!ai) {
+    return buildFallback('not_configured', 'AI Follow-up planner is offline; showing standard trauma-informed checklist.');
+  }
+
+  try {
+    const langInstruction =
+      input.language === 'kn' ? 'Provide output strings clearly in Kannada (ಕನ್ನಡ).' : 'Provide output strings clearly in English.';
+    const resp = await withRetryAndTimeout(
+      () =>
+        ai.models.generateContent({
+          model: GEMINI_MODELS.reasoning,
+          contents: `Prepare a trauma-informed post-incident follow-up plan for a user after an SOS or safety event:
+Incident Title: ${input.incidentTitle}
+Category: ${input.incidentCategory}
+Status: ${input.incidentStatus}
+Location: ${input.locationLabel}
+Notes: ${input.resolutionNotes || 'None provided'}`,
+          config: {
+            systemInstruction: `You are the LIFE-LINE AI Incident Follow-up Agent.
+${langInstruction}
+Rules:
+- Never diagnose medical or psychological conditions.
+- Never submit legal reports or send emails/tasks automatically; every external documentation or Workspace action must state human authorization is required.
+- Focus on practical wellbeing, evidence preservation, and gentle support coordination.`,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                summary: { type: Type.STRING },
+                immediateWellbeingSteps: { type: Type.ARRAY, items: { type: Type.STRING } },
+                documentationChecklist: { type: Type.ARRAY, items: { type: Type.STRING } },
+                workspaceActionSuggestions: { type: Type.ARRAY, items: { type: Type.STRING } },
+                supportFollowUpWindow: { type: Type.STRING },
+              },
+              required: [
+                'summary',
+                'immediateWellbeingSteps',
+                'documentationChecklist',
+                'workspaceActionSuggestions',
+                'supportFollowUpWindow',
+              ],
+            },
+          },
+        }),
+      options?.timeoutMs ?? 20000,
+      2,
+      'Incident Follow-up Agent'
+    );
+
+    const parsed = safeParseJsonObject(resp.text);
+    if (!parsed || typeof parsed.summary !== 'string') {
+      return buildFallback('malformed_response', 'Follow-up AI response could not be parsed cleanly.');
+    }
+
+    return {
+      modelUsed: GEMINI_MODELS.reasoning,
+      aiAvailable: true,
+      isAiAdvisory: true,
+      requiresHumanAuthorization: true,
+      advisoryNotice: AI_ADVISORY_NOTICE,
+      summary: parsed.summary.trim(),
+      immediateWellbeingSteps: Array.isArray(parsed.immediateWellbeingSteps)
+        ? parsed.immediateWellbeingSteps.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).slice(0, 5)
+        : buildFallback('malformed_response', '').immediateWellbeingSteps,
+      documentationChecklist: Array.isArray(parsed.documentationChecklist)
+        ? parsed.documentationChecklist.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).slice(0, 5)
+        : buildFallback('malformed_response', '').documentationChecklist,
+      workspaceActionSuggestions: Array.isArray(parsed.workspaceActionSuggestions)
+        ? parsed.workspaceActionSuggestions.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).slice(0, 4)
+        : buildFallback('malformed_response', '').workspaceActionSuggestions,
+      supportFollowUpWindow:
+        typeof parsed.supportFollowUpWindow === 'string' && parsed.supportFollowUpWindow.trim()
+          ? parsed.supportFollowUpWindow.trim()
+          : 'Schedule a check-in within 2 hours and again within 24 hours.',
+    };
+  } catch (err) {
+    const classified = classifyGeminiError(err);
+    return buildFallback(classified.reason, classified.publicMessage);
+  }
+}
+

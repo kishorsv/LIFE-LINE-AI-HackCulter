@@ -18,6 +18,14 @@ export const VALID_PRIORITIES = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'] as const;
 
 export const VALID_SAFETY_STATUSES = ['Safe', 'Cautious', 'Check-In Needed'] as const;
 
+export const VALID_RESPONDER_STATUSES = ['Available', 'Responding', 'Off Duty'] as const;
+
+export const VALID_TRAVEL_MODES = ['WALK', 'DRIVE', 'TRANSIT', 'BICYCLE'] as const;
+
+export const VALID_REPORT_SEVERITIES = ['LOW', 'MODERATE', 'HIGH'] as const;
+
+export const VALID_LANGUAGES = ['en', 'kn'] as const;
+
 export const VALID_LOCATION_MODES = ['sos_only', 'live_escort', 'manual_only'] as const;
 
 export const VALID_THEMES = ['dark', 'light'] as const;
@@ -66,6 +74,22 @@ export function parsePositiveInt(value: unknown): number | null {
   return null;
 }
 
+export function parsePagination(
+  query: Record<string, unknown>,
+  defaults: { page?: number; limit?: number; maxLimit?: number } = {}
+): { page: number; limit: number; offset: number } {
+  const maxLimit = defaults.maxLimit ?? 100;
+  const rawPage = parsePositiveInt(query.page);
+  const rawLimit = parsePositiveInt(query.limit);
+  const page = rawPage ?? defaults.page ?? 1;
+  const limit = Math.min(rawLimit ?? defaults.limit ?? 25, maxLimit);
+  return {
+    page,
+    limit,
+    offset: (page - 1) * limit,
+  };
+}
+
 export function isValidLatitude(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= -90 && value <= 90;
 }
@@ -108,3 +132,4 @@ export function isValidPhone(value: unknown): boolean {
   const trimmed = value.trim();
   return trimmed.length <= 32 && /^[+\d\s().-]+$/.test(trimmed);
 }
+

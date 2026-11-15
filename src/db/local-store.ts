@@ -358,10 +358,67 @@ export function runSqliteMigrations(): string {
     });
   }
 
+  if (!applied.has('v4_pulse_journeys_reports_responders')) {
+    runSqliteTransaction(() => {
+      ensureColumn('users', 'responder_status', "responder_status TEXT NOT NULL DEFAULT 'Available'");
+      ensureColumn('users', 'responder_updated_at', "responder_updated_at TEXT NOT NULL DEFAULT ''");
+      sqlite.exec(`
+        UPDATE users
+        SET responder_updated_at = COALESCE(NULLIF(responder_updated_at, ''), updated_at, datetime('now'))
+        WHERE responder_updated_at = '';
+
+        CREATE TABLE IF NOT EXISTS safety_journeys (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          origin_label TEXT NOT NULL,
+          origin_lat REAL NOT NULL,
+          origin_lng REAL NOT NULL,
+          destination_label TEXT NOT NULL,
+          destination_lat REAL NOT NULL,
+          destination_lng REAL NOT NULL,
+          travel_mode TEXT NOT NULL DEFAULT 'WALK',
+          selected_route_summary TEXT NOT NULL DEFAULT '',
+          route_risk_level TEXT NOT NULL DEFAULT 'LOW',
+          share_token TEXT NOT NULL,
+          shared_with_contacts TEXT NOT NULL DEFAULT '[]',
+          check_in_interval_minutes INTEGER NOT NULL DEFAULT 15,
+          expected_arrival_at TEXT NOT NULL,
+          next_check_in_due_at TEXT NOT NULL,
+          last_check_in_at TEXT,
+          arrived_at TEXT,
+          status TEXT NOT NULL DEFAULT 'Active',
+          is_simulated INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS safety_journeys_user_idx ON safety_journeys(user_id);
+        CREATE INDEX IF NOT EXISTS safety_journeys_status_idx ON safety_journeys(status);
+
+        CREATE TABLE IF NOT EXISTS safety_reports (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+          category TEXT NOT NULL,
+          severity TEXT NOT NULL DEFAULT 'MODERATE',
+          description TEXT NOT NULL,
+          latitude REAL NOT NULL,
+          longitude REAL NOT NULL,
+          location_label TEXT NOT NULL,
+          is_anonymous INTEGER NOT NULL DEFAULT 1,
+          verification_status TEXT NOT NULL DEFAULT 'User Submitted',
+          is_simulated INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS safety_reports_created_idx ON safety_reports(created_at);
+        CREATE INDEX IF NOT EXISTS safety_reports_coords_idx ON safety_reports(latitude, longitude);
+      `);
+      sqlite.prepare("INSERT OR IGNORE INTO schema_migrations (version) VALUES ('v4_pulse_journeys_reports_responders')").run();
+    });
+  }
+
   const latest = sqlite
     .prepare('SELECT version FROM schema_migrations ORDER BY applied_at DESC, version DESC LIMIT 1')
     .get() as { version: string } | undefined;
-  return latest?.version || 'v3_sos_idempotency_and_delivery';
+  return latest?.version || 'v4_pulse_journeys_reports_responders';
 }
 
 export function seedSqliteInitialData() {

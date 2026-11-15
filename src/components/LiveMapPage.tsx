@@ -744,8 +744,8 @@ export function LiveMapPage() {
                 <button
                   type="button"
                   onClick={() => {
-                    setUserCoords({ lat: r.latitude, lng: r.longitude });
                     setRouteTarget({ lat: r.latitude, lng: r.longitude, title: r.name });
+                    window.scrollTo({ top: 0, behavior: 'smooth' });
                   }}
                   className="font-semibold text-violet-600 dark:text-violet-400 hover:underline"
                 >

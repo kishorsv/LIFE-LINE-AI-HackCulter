@@ -8,14 +8,24 @@ import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
 import {
   addTrustedContact,
+  assignIncidentToOperator,
   checkDatabaseHealth,
+  checkInSafetyJourney,
   completePasswordReset,
+  countAllIncidentsForOperator,
+  countAuditLogs,
+  countIncidentsForUser,
+  countNotificationsForUser,
   createIncident,
+  createNotification,
+  createSafetyJourney,
+  createSafetyReport,
   deleteTrustedContact,
   deleteUserAccount,
   getDemoAccounts,
   getIncidentById,
   getOperationalAnalytics,
+  getSafetyJourneyById,
   getUserProfile,
   IncidentRecord,
   initializeDatabase,
@@ -24,19 +34,28 @@ import {
   listAllUsersForAdmin,
   listAiRecommendationsForUser,
   listAuditLogs,
+  listIncidentsForPulse,
   listIncidentsForUser,
   listNotificationsForUser,
   listOperatorUserIds,
+  listRespondersWithAvailability,
+  listSafetyJourneysForUser,
+  listSafetyReportsForPulse,
   listSupportDirectory,
   listTrustedContacts,
   loginEmailUser,
+  markAllNotificationsRead,
   markNotificationRead,
+  refreshSafetyJourneyRisk,
   registerEmailUser,
   resendVerificationCode,
+  ResponderAvailabilityStatus,
   sanitizeIncidentForViewer,
   saveAiAssessment,
   updateIncidentDeliveryState,
   updateIncidentStatus,
+  updateResponderAvailability,
+  updateSafetyJourneyState,
   updateTrustedContact,
   updateUserProfile,
   updateUserRole,
@@ -66,13 +85,18 @@ import {
   isValidPhone,
   isValidVerificationCode,
   normalizeEmail,
+  parsePagination,
   parsePositiveInt,
   sanitizeBoundedString,
   VALID_INCIDENT_STATUSES,
+  VALID_LANGUAGES,
   VALID_LOCATION_MODES,
   VALID_PRIORITIES,
+  VALID_REPORT_SEVERITIES,
+  VALID_RESPONDER_STATUSES,
   VALID_SAFETY_STATUSES,
   VALID_THEMES,
+  VALID_TRAVEL_MODES,
   VALID_USER_ROLES,
   validateOptionalCoordinates,
 } from './src/lib/validation.ts';
@@ -82,13 +106,21 @@ import {
   isGeminiConfigured,
   runEmergencyAssessmentAgent,
   runEmergencyCoordinationAgent,
+  runIncidentFollowUpAgent,
   runResourceDiscoveryAgent,
+  runSafeRouteAgent,
   runSafetyIntelligenceAgent,
   runSupportAssistantChat,
   synthesizeSafetyGuidanceSpeech,
   transcribeAudioNote,
 } from './src/services/gemini.ts';
 import { dispatchEmergencyNotifications, DispatchSummary } from './src/services/notifications.ts';
+import {
+  computePredictiveRisk,
+  computeSafeRoutesWithGoogle,
+  fetchOpenMeteoWeather,
+} from './src/services/pulse.ts';
+import { errorHandlerMiddleware, requestLoggerMiddleware } from './src/services/logger.ts';
 
 const MAPS_ATTRIBUTION_ID = 'gmp_mcp_codeassist_v1_aistudio';
 const OPERATOR_ROLES: UserRole[] = ['emergency_operator', 'support_organization', 'administrator'];
@@ -146,6 +178,31 @@ export async function createAppServer(options?: {
 
   const app = express();
   app.use(express.json({ limit: '15mb' }));
+  app.use(requestLoggerMiddleware);
+
+  const allowedOrigins = new Set(
+    [
+      process.env.APP_URL || '',
+      ...(process.env.CORS_ALLOWED_ORIGINS || '').split(','),
+      ...(process.env.NODE_ENV !== 'production' ? ['http://localhost:3000', 'http://127.0.0.1:3000'] : []),
+    ]
+      .map((s) => s.trim().replace(/\/+$/, ''))
+      .filter(Boolean)
+  );
+
+  app.use((req, res, next) => {
+    const origin = typeof req.headers.origin === 'string' ? req.headers.origin.replace(/\/+$/, '') : '';
+    if (origin && (allowedOrigins.has(origin) || allowedOrigins.size === 0)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Google-Access-Token');
+    }
+    if (req.method === 'OPTIONS') {
+      return res.status(204).end();
+    }
+    next();
+  });
 
   interface RealtimeClient {
     ws: WebSocket;
@@ -264,6 +321,14 @@ export async function createAppServer(options?: {
     maxRequests: 25,
     keyGenerator: (req) => String((req as AuthRequest).appUser?.id || req.ip || 'anon'),
     message: 'AI agent rate limit reached. Please wait a moment before sending another request.',
+  });
+
+  const pulseReportLimiter = createRateLimiter({
+    name: 'pulse_reports',
+    windowMs: 15 * 60 * 1000,
+    maxRequests: 15,
+    keyGenerator: (req) => String((req as AuthRequest).appUser?.id || req.ip || 'anon'),
+    message: 'Too many community safety reports submitted. Please wait before submitting another.',
   });
 
   // ========================
@@ -623,6 +688,12 @@ export async function createAppServer(options?: {
           return res.status(400).json({ error: coordCheck.error });
         }
       }
+      if (
+        body.preferredLanguage !== undefined &&
+        !(VALID_LANGUAGES as readonly string[]).includes(String(body.preferredLanguage))
+      ) {
+        return res.status(400).json({ error: 'preferredLanguage must be "en" or "kn".' });
+      }
       if (body.dataRetentionDays !== undefined) {
         const days = Number(body.dataRetentionDays);
         if (!Number.isSafeInteger(days) || days < 1 || days > 3650) {
@@ -636,7 +707,7 @@ export async function createAppServer(options?: {
         emergencyNotes: body.emergencyNotes !== undefined ? sanitizeBoundedString(body.emergencyNotes, 1000) : undefined,
         medicalNotes: body.medicalNotes !== undefined ? sanitizeBoundedString(body.medicalNotes, 1000) : undefined,
         bloodType: body.bloodType !== undefined ? sanitizeBoundedString(body.bloodType, 16) : undefined,
-        preferredLanguage: body.preferredLanguage !== undefined ? sanitizeBoundedString(body.preferredLanguage, 16) : undefined,
+        preferredLanguage: body.preferredLanguage !== undefined ? String(body.preferredLanguage) : undefined,
         safetyStatus: body.safetyStatus !== undefined ? String(body.safetyStatus) : undefined,
         lastKnownLat: body.lastKnownLat === null ? null : typeof body.lastKnownLat === 'number' ? body.lastKnownLat : undefined,
         lastKnownLng: body.lastKnownLng === null ? null : typeof body.lastKnownLng === 'number' ? body.lastKnownLng : undefined,
@@ -1005,8 +1076,20 @@ export async function createAppServer(options?: {
 
   app.get('/api/incidents', requireAuth, async (req: AuthRequest, res) => {
     try {
-      const incidents = await listIncidentsForUser(req.appUser!.id, req.appUser!.role);
-      res.json({ incidents });
+      const { page, limit, offset } = parsePagination(req.query as Record<string, unknown>, { limit: 25, maxLimit: 100 });
+      const [incidents, total] = await Promise.all([
+        listIncidentsForUser(req.appUser!.id, req.appUser!.role, { limit, offset }),
+        countIncidentsForUser(req.appUser!.id),
+      ]);
+      res.json({
+        incidents,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.max(1, Math.ceil(total / limit)),
+        },
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load incidents.' });
     }
@@ -1016,15 +1099,106 @@ export async function createAppServer(options?: {
     '/api/operator/incidents',
     requireAuth,
     requireRole(OPERATOR_ROLES),
-    async (_req, res) => {
+    async (req, res) => {
       try {
-        const incidents = await listAllIncidentsForOperator();
-        res.json({ incidents });
+        const { page, limit, offset } = parsePagination(req.query as Record<string, unknown>, { limit: 50, maxLimit: 100 });
+        const [incidents, total] = await Promise.all([
+          listAllIncidentsForOperator({ limit, offset }),
+          countAllIncidentsForOperator(),
+        ]);
+        res.json({
+          incidents,
+          pagination: {
+            page,
+            limit,
+            total,
+            totalPages: Math.max(1, Math.ceil(total / limit)),
+          },
+        });
       } catch (err) {
         res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load operator queue.' });
       }
     }
   );
+
+  app.get('/api/operator/responders', requireAuth, requireRole(OPERATOR_ROLES), async (_req, res) => {
+    try {
+      const responders = await listRespondersWithAvailability();
+      res.json({ responders });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load responders.' });
+    }
+  });
+
+  app.patch('/api/operator/availability', requireAuth, requireRole(OPERATOR_ROLES), async (req: AuthRequest, res) => {
+    try {
+      const { status } = (req.body || {}) as { status?: unknown };
+      if (typeof status !== 'string' || !(VALID_RESPONDER_STATUSES as readonly string[]).includes(status)) {
+        return res.status(400).json({ error: 'Responder status must be Available, Responding, or Off Duty.' });
+      }
+      const updated = await updateResponderAvailability(req.appUser!.id, status as ResponderAvailabilityStatus);
+      await writeAuditLog({
+        actorUserId: req.appUser!.id,
+        actorEmail: req.appUser!.email,
+        actorRole: req.appUser!.role,
+        action: 'RESPONDER_AVAILABILITY_UPDATED',
+        resourceType: 'user',
+        resourceId: String(req.appUser!.id),
+        details: { status },
+        ipAddress: req.ip,
+      });
+      pushAndBroadcastRealtimeEvent({
+        includeOperators: true,
+        userPayload: { type: 'responder:updated', responder: updated },
+        operatorPayload: { type: 'responder:updated', responder: updated },
+      });
+      res.json({ responder: updated });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to update responder status.' });
+    }
+  });
+
+  app.post('/api/operator/incidents/:id/assign', requireAuth, requireRole(OPERATOR_ROLES), async (req: AuthRequest, res) => {
+    try {
+      const incidentId = parsePositiveInt(req.params.id);
+      const operatorUserId = parsePositiveInt((req.body as { operatorUserId?: unknown })?.operatorUserId);
+      if (!incidentId || !operatorUserId) {
+        return res.status(400).json({ error: 'Valid incident ID and operatorUserId are required.' });
+      }
+      const updated = await assignIncidentToOperator({
+        incidentId,
+        operatorUserId,
+        assignedByUserId: req.appUser!.id,
+        assignedByRole: req.appUser!.role,
+      });
+      if (!updated) {
+        return res.status(404).json({ error: 'Incident not found.' });
+      }
+
+      await writeAuditLog({
+        actorUserId: req.appUser!.id,
+        actorEmail: req.appUser!.email,
+        actorRole: req.appUser!.role,
+        action: 'INCIDENT_RESPONDER_ASSIGNED',
+        resourceType: 'emergency_incident',
+        resourceId: String(incidentId),
+        details: { operatorUserId },
+        ipAddress: req.ip,
+      });
+
+      const sanitized = sanitizeIncidentForViewer(updated, 'regular_user');
+      pushAndBroadcastRealtimeEvent({
+        targetUserId: updated.userId,
+        includeOperators: true,
+        userPayload: { type: 'incident:updated', incident: sanitized },
+        operatorPayload: { type: 'incident:assigned', incident: updated, operatorUserId },
+      });
+
+      res.json({ incident: updated });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to assign responder.' });
+    }
+  });
 
   app.patch('/api/incidents/:id/status', requireAuth, async (req: AuthRequest, res) => {
     try {
@@ -1309,7 +1483,375 @@ export async function createAppServer(options?: {
   });
 
   // ========================
-  // AGENTIC AI ENGINE (5 AGENTS + TRANSCRIBE + TTS)
+  // LIFE-LINE PULSE: PREDICTIVE RISK, SAFEROUTE & JOURNEYS
+  // ========================
+  const handlePredictiveRisk = async (lat: unknown, lng: unknown, label: unknown, radiusKm: unknown, res: express.Response) => {
+    if (!isValidLatitude(lat) || !isValidLongitude(lng)) {
+      return res.status(400).json({ error: 'Valid finite latitude (-90..90) and longitude (-180..180) are required.' });
+    }
+    const cleanRadius =
+      typeof radiusKm === 'number' && Number.isFinite(radiusKm)
+        ? Math.min(Math.max(radiusKm, 0.5), 25)
+        : 3.5;
+
+    const [weather, incidents, reports, supportHubs] = await Promise.all([
+      fetchOpenMeteoWeather(lat, lng),
+      listIncidentsForPulse(150),
+      listSafetyReportsForPulse(100),
+      listSupportDirectory(),
+    ]);
+
+    const assessment = computePredictiveRisk({
+      latitude: lat,
+      longitude: lng,
+      locationLabel: sanitizeBoundedString(label, 180) || undefined,
+      radiusKm: cleanRadius,
+      weather,
+      incidents,
+      reports,
+      supportHubs,
+    });
+    return res.json({ risk: assessment });
+  };
+
+  app.post('/api/pulse/risk', mapsLimiter, async (req, res) => {
+    try {
+      const { latitude, longitude, locationLabel, radiusKm } = (req.body || {}) as Record<string, unknown>;
+      await handlePredictiveRisk(latitude, longitude, locationLabel, radiusKm, res);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Predictive risk evaluation failed.' });
+    }
+  });
+
+  app.get('/api/pulse/risk', mapsLimiter, async (req, res) => {
+    try {
+      const lat = req.query.lat !== undefined ? Number(req.query.lat) : NaN;
+      const lng = req.query.lng !== undefined ? Number(req.query.lng) : NaN;
+      const radiusKm = req.query.radiusKm !== undefined ? Number(req.query.radiusKm) : 3.5;
+      await handlePredictiveRisk(lat, lng, req.query.label, radiusKm, res);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Predictive risk evaluation failed.' });
+    }
+  });
+
+  app.get('/api/pulse/reports', async (_req, res) => {
+    try {
+      const reports = await listSafetyReportsForPulse(60);
+      res.json({ reports });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load safety reports.' });
+    }
+  });
+
+  app.post('/api/pulse/reports', requireAuth, pulseReportLimiter, async (req: AuthRequest, res) => {
+    try {
+      const body = (req.body || {}) as Record<string, unknown>;
+      const category = sanitizeBoundedString(body.category, 64);
+      const description = sanitizeBoundedString(body.description, 1000);
+      const locationLabel = sanitizeBoundedString(body.locationLabel, 200);
+      const severity = typeof body.severity === 'string' ? body.severity : 'MODERATE';
+      const isAnonymous = body.isAnonymous !== undefined ? Boolean(body.isAnonymous) : true;
+
+      if (!category || !description || !locationLabel) {
+        return res.status(400).json({ error: 'category, description, and locationLabel are required.' });
+      }
+      if (!(VALID_REPORT_SEVERITIES as readonly string[]).includes(severity)) {
+        return res.status(400).json({ error: 'Severity must be LOW, MODERATE, or HIGH.' });
+      }
+      if (!isValidLatitude(body.latitude) || !isValidLongitude(body.longitude)) {
+        return res.status(400).json({ error: 'Valid finite latitude and longitude are required.' });
+      }
+
+      const report = await createSafetyReport({
+        userId: req.appUser!.id,
+        category,
+        severity: severity as 'LOW' | 'MODERATE' | 'HIGH',
+        description,
+        latitude: body.latitude,
+        longitude: body.longitude,
+        locationLabel,
+        isAnonymous,
+        isSimulated: req.appUser!.isDemoAccount,
+      });
+
+      await writeAuditLog({
+        actorUserId: req.appUser!.id,
+        actorEmail: isAnonymous ? 'anonymous-community-reporter' : req.appUser!.email,
+        actorRole: req.appUser!.role,
+        action: 'SAFETY_REPORT_SUBMITTED',
+        resourceType: 'safety_report',
+        resourceId: String(report.id),
+        details: { category, severity, isAnonymous },
+        ipAddress: req.ip,
+      });
+
+      pushAndBroadcastRealtimeEvent({
+        includeOperators: true,
+        userPayload: { type: 'pulse:report_created', report },
+        operatorPayload: { type: 'pulse:report_created', report },
+      });
+
+      res.status(201).json({ report });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to submit safety report.' });
+    }
+  });
+
+  app.post('/api/maps/saferoute', mapsLimiter, async (req, res) => {
+    try {
+      const body = (req.body || {}) as Record<string, unknown>;
+      const { originLat, originLng, destinationLat, destinationLng } = body;
+      if (
+        !isValidLatitude(originLat) ||
+        !isValidLongitude(originLng) ||
+        !isValidLatitude(destinationLat) ||
+        !isValidLongitude(destinationLng)
+      ) {
+        return res.status(400).json({ error: 'Valid originLat/originLng and destinationLat/destinationLng are required.' });
+      }
+
+      const travelMode = typeof body.travelMode === 'string' ? body.travelMode.toUpperCase() : 'WALK';
+      if (!(VALID_TRAVEL_MODES as readonly string[]).includes(travelMode)) {
+        return res.status(400).json({ error: 'travelMode must be WALK, DRIVE, TRANSIT, or BICYCLE.' });
+      }
+
+      const mapsKey = getServerMapsApiKey();
+      const [weather, incidents, reports, supportHubs] = await Promise.all([
+        fetchOpenMeteoWeather(originLat, originLng),
+        listIncidentsForPulse(150),
+        listSafetyReportsForPulse(100),
+        listSupportDirectory(),
+      ]);
+
+      const routePlan = await computeSafeRoutesWithGoogle(
+        {
+          origin: { lat: originLat, lng: originLng },
+          destination: { lat: destinationLat, lng: destinationLng },
+          travelMode: travelMode as 'WALK' | 'DRIVE' | 'TRANSIT' | 'BICYCLE',
+        },
+        mapsKey,
+        { weather, incidents, reports, supportHubs }
+      );
+
+      if (!mapsKey) {
+        return res.status(503).json(routePlan);
+      }
+      res.json(routePlan);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'SafeRoute evaluation failed.' });
+    }
+  });
+
+  app.get('/api/journeys', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const journeys = await listSafetyJourneysForUser(req.appUser!.id, 25);
+      res.json({ journeys });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load shared journeys.' });
+    }
+  });
+
+  app.post('/api/journeys', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const body = (req.body || {}) as Record<string, unknown>;
+      const originLabel = sanitizeBoundedString(body.originLabel, 200) || 'Current Location';
+      const destinationLabel = sanitizeBoundedString(body.destinationLabel, 200);
+      if (!destinationLabel) {
+        return res.status(400).json({ error: 'Destination label is required.' });
+      }
+      if (
+        !isValidLatitude(body.originLat) ||
+        !isValidLongitude(body.originLng) ||
+        !isValidLatitude(body.destinationLat) ||
+        !isValidLongitude(body.destinationLng)
+      ) {
+        return res.status(400).json({ error: 'Valid origin and destination coordinates are required.' });
+      }
+      const travelMode = typeof body.travelMode === 'string' ? body.travelMode.toUpperCase() : 'WALK';
+      if (!(VALID_TRAVEL_MODES as readonly string[]).includes(travelMode)) {
+        return res.status(400).json({ error: 'Invalid travel mode.' });
+      }
+      const intervalMin = parsePositiveInt(body.checkInIntervalMinutes) ?? 15;
+      const expectedMin = parsePositiveInt(body.expectedDurationMinutes) ?? Math.max(20, intervalMin * 2);
+
+      const contacts = await listTrustedContacts(req.appUser!.id);
+      const selectedIds = Array.isArray(body.contactIds)
+        ? new Set(body.contactIds.map((id) => Number(id)).filter((n) => Number.isSafeInteger(n)))
+        : null;
+      const chosenContacts = (selectedIds && selectedIds.size > 0
+        ? contacts.filter((c) => selectedIds.has(c.id))
+        : contacts
+      ).map((c) => ({ id: c.id, name: c.name, email: c.email }));
+
+      const journey = await createSafetyJourney({
+        userId: req.appUser!.id,
+        originLabel,
+        originLat: body.originLat,
+        originLng: body.originLng,
+        destinationLabel,
+        destinationLat: body.destinationLat,
+        destinationLng: body.destinationLng,
+        travelMode,
+        selectedRouteSummary: sanitizeBoundedString(body.selectedRouteSummary, 300) || `${travelMode} SafeRoute`,
+        routeRiskLevel: sanitizeBoundedString(body.routeRiskLevel, 32) || 'LOW',
+        sharedWithContacts: chosenContacts,
+        checkInIntervalMinutes: intervalMin,
+        expectedDurationMinutes: expectedMin,
+        isSimulated: req.appUser!.isDemoAccount,
+      });
+
+      await createNotification({
+        userId: req.appUser!.id,
+        channel: 'in_app',
+        category: 'journey',
+        title: 'PULSE SafeRoute Journey Active',
+        message: `Sharing ${travelMode} journey to ${destinationLabel} (${chosenContacts.length} trusted contact(s) listed). Next check-in every ${journey.checkInIntervalMinutes} min.`,
+        isSimulated: req.appUser!.isDemoAccount,
+      });
+
+      await writeAuditLog({
+        actorUserId: req.appUser!.id,
+        actorEmail: req.appUser!.email,
+        actorRole: req.appUser!.role,
+        action: 'SAFETY_JOURNEY_STARTED',
+        resourceType: 'safety_journey',
+        resourceId: String(journey.id),
+        details: { destinationLabel, travelMode, checkInIntervalMinutes: journey.checkInIntervalMinutes },
+        ipAddress: req.ip,
+      });
+
+      sendRealtimeToUser(req.appUser!.id, { type: 'journey:updated', journey });
+      res.status(201).json({ journey });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to start shared journey.' });
+    }
+  });
+
+  app.post('/api/journeys/:id/checkin', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const journeyId = parsePositiveInt(req.params.id);
+      if (!journeyId) return res.status(400).json({ error: 'Valid journey ID is required.' });
+      const existing = await getSafetyJourneyById(journeyId);
+      if (!existing) return res.status(404).json({ error: 'Journey not found.' });
+      if (existing.userId !== req.appUser!.id) return res.status(403).json({ error: 'Forbidden.' });
+
+      const updated = await checkInSafetyJourney(req.appUser!.id, journeyId);
+      if (updated) {
+        sendRealtimeToUser(req.appUser!.id, { type: 'journey:updated', journey: updated });
+      }
+      res.json({ journey: updated });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Journey check-in failed.' });
+    }
+  });
+
+  app.post('/api/journeys/:id/arrive', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const journeyId = parsePositiveInt(req.params.id);
+      if (!journeyId) return res.status(400).json({ error: 'Valid journey ID is required.' });
+      const existing = await getSafetyJourneyById(journeyId);
+      if (!existing) return res.status(404).json({ error: 'Journey not found.' });
+      if (existing.userId !== req.appUser!.id) return res.status(403).json({ error: 'Forbidden.' });
+
+      const updated = await updateSafetyJourneyState(req.appUser!.id, journeyId, 'Arrived Safe');
+      await createNotification({
+        userId: req.appUser!.id,
+        channel: 'in_app',
+        category: 'journey',
+        title: 'Safe Arrival Confirmed',
+        message: `You marked safe arrival at ${existing.destinationLabel}. Journey tracking closed cleanly.`,
+        isSimulated: req.appUser!.isDemoAccount,
+      });
+      await writeAuditLog({
+        actorUserId: req.appUser!.id,
+        actorEmail: req.appUser!.email,
+        actorRole: req.appUser!.role,
+        action: 'SAFETY_JOURNEY_ARRIVED_SAFE',
+        resourceType: 'safety_journey',
+        resourceId: String(journeyId),
+        ipAddress: req.ip,
+      });
+      if (updated) {
+        sendRealtimeToUser(req.appUser!.id, { type: 'journey:updated', journey: updated });
+      }
+      res.json({ journey: updated });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Could not confirm safe arrival.' });
+    }
+  });
+
+  app.post('/api/journeys/:id/escalate', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const journeyId = parsePositiveInt(req.params.id);
+      if (!journeyId) return res.status(400).json({ error: 'Valid journey ID is required.' });
+      const existing = await getSafetyJourneyById(journeyId);
+      if (!existing) return res.status(404).json({ error: 'Journey not found.' });
+      if (existing.userId !== req.appUser!.id) return res.status(403).json({ error: 'Forbidden.' });
+
+      const updated = await updateSafetyJourneyState(req.appUser!.id, journeyId, 'Escalated');
+      await writeAuditLog({
+        actorUserId: req.appUser!.id,
+        actorEmail: req.appUser!.email,
+        actorRole: req.appUser!.role,
+        action: 'SAFETY_JOURNEY_ESCALATED',
+        resourceType: 'safety_journey',
+        resourceId: String(journeyId),
+        ipAddress: req.ip,
+      });
+      if (updated) {
+        pushAndBroadcastRealtimeEvent({
+          targetUserId: req.appUser!.id,
+          includeOperators: true,
+          userPayload: { type: 'journey:updated', journey: updated },
+          operatorPayload: { type: 'journey:updated', journey: updated },
+        });
+      }
+      res.json({ journey: updated });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Could not escalate journey.' });
+    }
+  });
+
+  app.post('/api/journeys/:id/refresh', requireAuth, mapsLimiter, async (req: AuthRequest, res) => {
+    try {
+      const journeyId = parsePositiveInt(req.params.id);
+      if (!journeyId) return res.status(400).json({ error: 'Valid journey ID is required.' });
+      const existing = await getSafetyJourneyById(journeyId);
+      if (!existing) return res.status(404).json({ error: 'Journey not found.' });
+      if (existing.userId !== req.appUser!.id) return res.status(403).json({ error: 'Forbidden.' });
+
+      const [weather, incidents, reports, supportHubs] = await Promise.all([
+        fetchOpenMeteoWeather(existing.destinationLat, existing.destinationLng),
+        listIncidentsForPulse(150),
+        listSafetyReportsForPulse(100),
+        listSupportDirectory(),
+      ]);
+      const risk = computePredictiveRisk({
+        latitude: existing.destinationLat,
+        longitude: existing.destinationLng,
+        locationLabel: existing.destinationLabel,
+        weather,
+        incidents,
+        reports,
+        supportHubs,
+      });
+      const updated = await refreshSafetyJourneyRisk(
+        req.appUser!.id,
+        journeyId,
+        `${existing.selectedRouteSummary.split(' · Refreshed')[0]} · Refreshed (${risk.riskLevel})`,
+        risk.riskLevel
+      );
+      if (updated) {
+        sendRealtimeToUser(req.appUser!.id, { type: 'journey:updated', journey: updated });
+      }
+      res.json({ journey: updated, risk });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to refresh route conditions.' });
+    }
+  });
+
+  // ========================
+  // AGENTIC AI ENGINE (6 AGENTS + SUPPORT CHAT + TRANSCRIBE + TTS)
   // ========================
   app.post('/api/ai/assess-emergency', requireAuth, aiLimiter, async (req: AuthRequest, res) => {
     try {
@@ -1487,10 +2029,11 @@ export async function createAppServer(options?: {
 
   app.post('/api/ai/assistant', requireAuth, aiLimiter, async (req: AuthRequest, res) => {
     try {
-      const { history, message, fastMode } = req.body as {
+      const { history, message, fastMode, language } = req.body as {
         history?: unknown;
         message?: unknown;
         fastMode?: unknown;
+        language?: unknown;
       };
       const cleanMessage = sanitizeBoundedString(message, 2000);
       if (!cleanMessage) {
@@ -1512,6 +2055,7 @@ export async function createAppServer(options?: {
         history: cleanHistory,
         message: cleanMessage,
         fastMode: Boolean(fastMode),
+        language: language === 'kn' ? 'kn' : 'en',
       });
       res.json(reply);
     } catch (err) {
@@ -1519,6 +2063,117 @@ export async function createAppServer(options?: {
         return res.status(err.statusCode).json({ error: err.message, reason: err.reason });
       }
       res.status(500).json({ error: err instanceof Error ? err.message : 'Assistant request failed.' });
+    }
+  });
+
+  app.post('/api/ai/saferoute', requireAuth, aiLimiter, async (req: AuthRequest, res) => {
+    try {
+      const body = (req.body || {}) as Record<string, unknown>;
+      const routesRaw = Array.isArray(body.routes) ? body.routes : [];
+      if (routesRaw.length === 0) {
+        return res.status(400).json({ error: 'At least one candidate route is required for SafeRoute Agent analysis.' });
+      }
+      const routes = routesRaw.slice(0, 6).map((r: unknown, idx: number) => {
+        const obj = (r && typeof r === 'object' ? r : {}) as Record<string, unknown>;
+        return {
+          routeIndex: typeof obj.routeIndex === 'number' ? obj.routeIndex : idx,
+          summary: sanitizeBoundedString(obj.summary, 160) || `Option ${idx + 1}`,
+          durationLabel: sanitizeBoundedString(obj.durationLabel, 40) || 'Unknown',
+          distanceMeters: Number.isFinite(Number(obj.distanceMeters)) ? Number(obj.distanceMeters) : 0,
+          safetyScore: Number.isFinite(Number(obj.safetyScore)) ? Number(obj.safetyScore) : 70,
+          riskLevel: sanitizeBoundedString(obj.riskLevel, 24) || 'MODERATE',
+          nearbyIncidentsCount: Number.isFinite(Number(obj.nearbyIncidentsCount)) ? Number(obj.nearbyIncidentsCount) : 0,
+          nearbySupportHubsCount: Number.isFinite(Number(obj.nearbySupportHubsCount)) ? Number(obj.nearbySupportHubsCount) : 0,
+          reasons: Array.isArray(obj.reasons)
+            ? obj.reasons.filter((x): x is string => typeof x === 'string').slice(0, 5)
+            : [],
+        };
+      });
+
+      const saferoute = await runSafeRouteAgent({
+        originLabel: sanitizeBoundedString(body.originLabel, 180) || 'Origin',
+        destinationLabel: sanitizeBoundedString(body.destinationLabel, 180) || 'Destination',
+        travelMode: sanitizeBoundedString(body.travelMode, 24) || 'WALK',
+        weatherSummary: sanitizeBoundedString(body.weatherSummary, 240) || 'Unavailable',
+        routes,
+      });
+
+      await saveAiAssessment({
+        userId: req.appUser!.id,
+        agentName: 'SafeRoute Agent',
+        modelUsed: saferoute.modelUsed,
+        inputSummary: `${sanitizeBoundedString(body.originLabel, 80)} -> ${sanitizeBoundedString(body.destinationLabel, 80)}`,
+        urgencyLevel: 'ADVISORY',
+        classification: 'SafeRoute Comparison',
+        assignedPriority: 'LOW',
+        confidenceScore: saferoute.confidenceScore,
+        rationale: saferoute.safetyReasoning,
+        missingInfoQuestions: [],
+        uncertaintyNotes: saferoute.uncertaintyNotes,
+        escalateToHuman: false,
+        rawStructuredOutput: saferoute as unknown as Record<string, unknown>,
+        recommendations: saferoute.cautionNotes.map((c: string, i: number) => ({
+          title: `Route Caution ${i + 1}`,
+          text: c,
+          category: 'SafeRoute Intelligence',
+          sourceCitation: saferoute.modelUsed,
+        })),
+      });
+
+      res.json({ saferoute });
+    } catch (err) {
+      if (err instanceof GeminiServiceError) {
+        return res.status(err.statusCode).json({ error: err.message, reason: err.reason });
+      }
+      res.status(500).json({ error: err instanceof Error ? err.message : 'SafeRoute Agent failed.' });
+    }
+  });
+
+  app.post('/api/ai/follow-up', requireAuth, aiLimiter, async (req: AuthRequest, res) => {
+    try {
+      const body = (req.body || {}) as Record<string, unknown>;
+      const incidentTitle = sanitizeBoundedString(body.incidentTitle, 160);
+      if (!incidentTitle) {
+        return res.status(400).json({ error: 'incidentTitle is required for post-incident follow-up.' });
+      }
+      const followUp = await runIncidentFollowUpAgent({
+        incidentTitle,
+        incidentStatus: sanitizeBoundedString(body.incidentStatus, 60) || 'Resolved',
+        incidentCategory: sanitizeBoundedString(body.incidentCategory, 60) || 'Personal Safety',
+        locationLabel: sanitizeBoundedString(body.locationLabel, 200) || 'Not specified',
+        resolutionNotes: sanitizeBoundedString(body.resolutionNotes, 1000) || undefined,
+        language: body.language === 'kn' ? 'kn' : 'en',
+      });
+
+      await saveAiAssessment({
+        userId: req.appUser!.id,
+        agentName: 'Incident Follow-up Agent',
+        modelUsed: followUp.modelUsed,
+        inputSummary: incidentTitle,
+        urgencyLevel: 'LOW',
+        classification: 'Post-Incident Follow-up',
+        assignedPriority: 'LOW',
+        confidenceScore: 0.85,
+        rationale: followUp.summary,
+        missingInfoQuestions: [],
+        uncertaintyNotes: followUp.supportFollowUpWindow,
+        escalateToHuman: false,
+        rawStructuredOutput: followUp as unknown as Record<string, unknown>,
+        recommendations: followUp.immediateWellbeingSteps.map((step: string, idx: number) => ({
+          title: `Wellbeing Follow-up ${idx + 1}`,
+          text: step,
+          category: 'Incident Follow-up',
+          sourceCitation: followUp.modelUsed,
+          actionRequiredAuth: true,
+        })),
+      });
+
+      res.json({ followUp });
+    } catch (err) {
+      if (err instanceof GeminiServiceError) {
+        return res.status(err.statusCode).json({ error: err.message, reason: err.reason });
+      }
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Incident Follow-up Agent failed.' });
     }
   });
 
@@ -1571,10 +2226,26 @@ export async function createAppServer(options?: {
   // ========================
   app.get('/api/notifications', requireAuth, async (req: AuthRequest, res) => {
     try {
-      const items = await listNotificationsForUser(req.appUser!.id);
-      res.json({ notifications: items });
+      const { page, limit, offset } = parsePagination(req.query as Record<string, unknown>, { limit: 30, maxLimit: 100 });
+      const [items, total] = await Promise.all([
+        listNotificationsForUser(req.appUser!.id, { limit, offset }),
+        countNotificationsForUser(req.appUser!.id),
+      ]);
+      res.json({
+        notifications: items,
+        pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load notifications.' });
+    }
+  });
+
+  app.patch('/api/notifications/read-all', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const count = await markAllNotificationsRead(req.appUser!.id);
+      res.json({ ok: true, updatedCount: count });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to mark notifications read.' });
     }
   });
 
@@ -1607,9 +2278,13 @@ export async function createAppServer(options?: {
     '/api/admin/audit-logs',
     requireAuth,
     requireRole(['administrator', 'emergency_operator']),
-    async (_req, res) => {
-      const logs = await listAuditLogs(80);
-      res.json({ logs });
+    async (req, res) => {
+      const { page, limit, offset } = parsePagination(req.query as Record<string, unknown>, { limit: 50, maxLimit: 100 });
+      const [logs, total] = await Promise.all([listAuditLogs(limit, offset), countAuditLogs()]);
+      res.json({
+        logs,
+        pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
+      });
     }
   );
 
@@ -1646,6 +2321,8 @@ export async function createAppServer(options?: {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to update user role.' });
     }
   });
+
+  app.use('/api', errorHandlerMiddleware);
 
   // ========================
   // HTTP SERVER + VITE / STATIC + HARDENED WEBSOCKETS

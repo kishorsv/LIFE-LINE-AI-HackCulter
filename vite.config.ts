@@ -13,6 +13,7 @@ export default defineConfig(() => {
         registerType: 'autoUpdate',
         includeAssets: [
           'icon.svg',
+          'favicon-32x32.png',
           'apple-touch-icon.png',
           'pwa-192x192.png',
           'pwa-512x512.png',
@@ -24,8 +25,8 @@ export default defineConfig(() => {
           short_name: 'LIFE-LINE',
           description:
             'Agentic Safety & Emergency Response Intelligence Platform with offline-ready SOS access.',
-          theme_color: '#070B18',
-          background_color: '#060916',
+          theme_color: '#081229',
+          background_color: '#050C1F',
           display: 'standalone',
           start_url: '/',
           scope: '/',

@@ -85,7 +85,12 @@ describe('Database Integrity, Safe Migrations & Authoritative Persistence', () =
     // Verify migrations recorded
     const migrations = localStore.sqlite.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as Array<{ version: string }>;
     const versions = migrations.map((m) => m.version);
-    assert.deepEqual(versions, ['v1_initial_schema', 'v2_auth_code_security_columns', 'v3_sos_idempotency_and_delivery']);
+    assert.deepEqual(versions, [
+      'v1_initial_schema',
+      'v2_auth_code_security_columns',
+      'v3_sos_idempotency_and_delivery',
+      'v4_pulse_journeys_reports_responders',
+    ]);
 
     // Verify legacy row preserved and legacy plaintext codes hashed into verification_code_hash
     const legacyRow = localStore.sqlite
@@ -105,8 +110,8 @@ describe('Database Integrity, Safe Migrations & Authoritative Persistence', () =
     assert.equal(healthBody.status, 'ok');
     assert.equal(healthBody.database.ok, true);
     assert.equal(healthBody.database.dialect, 'sqlite');
-    assert.equal(healthBody.database.migrationVersion, 'v3_sos_idempotency_and_delivery');
-    assert.ok(healthBody.database.tablesVerified >= 11);
+    assert.equal(healthBody.database.migrationVersion, 'v4_pulse_journeys_reports_responders');
+    assert.ok(healthBody.database.tablesVerified >= 13);
 
     // Verify full persistence roundtrip for user, profile, contact, SOS, notification, and audit log
     const regResp = await fetch(`${baseUrl}/api/auth/register`, {

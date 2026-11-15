@@ -1,0 +1,73 @@
+import { AppLanguage } from '../types/lifeline.ts';
+
+const TRANSLATIONS: Record<AppLanguage, Record<string, string>> = {
+  en: {
+    nav_overview: 'Overview',
+    nav_dashboard: 'Dashboard',
+    nav_pulse: 'PULSE',
+    nav_map: 'Live Map',
+    nav_agents: 'AI Agents',
+    nav_operator: 'Operator Desk',
+    nav_sos: 'SOS',
+    nav_sign_in: 'Sign In',
+    dash_title: 'Personal Safety Dashboard',
+    dash_trigger_sos: 'Trigger Emergency SOS',
+    dash_contacts_title: 'Trusted Contacts',
+    dash_incidents_title: 'My SOS Incident Log',
+    dash_notifications_title: 'Notification Center',
+    dash_mark_all_read: 'Mark All Read',
+    dash_mark_safe: 'Mark Safe / Cancel SOS',
+    pulse_title: 'LIFE-LINE PULSE — Predictive Safety & Response Intelligence',
+    pulse_subtitle:
+      'Transparent risk indicators from verified incidents, privacy-conscious community reports, Open-Meteo weather telemetry, and Google Maps SafeRoute v2 comparison.',
+    pulse_risk_tab: 'Predictive Risk',
+    pulse_saferoute_tab: 'AI SafeRoute & Journey Share',
+    pulse_reports_tab: 'Community Safety Reports',
+    pulse_start_journey: 'Share SafeRoute Journey',
+    pulse_checkin_safe: 'Check In Safe',
+    pulse_confirm_arrival: 'Confirm Safe Arrival',
+    pulse_refresh_route: 'Refresh Route Conditions',
+    sos_modal_title: 'Activate Emergency SOS',
+    sos_confirm_btn: 'Confirm & Send SOS Alert',
+    sos_cancel_btn: 'Mark Safe / Cancel SOS',
+    agents_title: 'Multi-Agent Emergency Intelligence',
+    agents_subtitle: 'Six specialized Gemini safety agents plus live bilingual voice & chat guidance — every AI recommendation stays separated from verified facts and requires human confirmation for dispatch.',
+  },
+  kn: {
+    nav_overview: 'ಅವಲೋಕನ',
+    nav_dashboard: 'ಡ್ಯಾಶ್‌ಬೋರ್ಡ್',
+    nav_pulse: 'ಪಲ್ಸ್ (PULSE)',
+    nav_map: 'ಲೈವ್ ನಕ್ಷೆ',
+    nav_agents: 'AI ಏಜೆಂಟ್‌ಗಳು',
+    nav_operator: 'ಆಪರೇಟರ್ ಕೇಂದ್ರ',
+    nav_sos: 'ತುರ್ತು SOS',
+    nav_sign_in: 'ಸೈನ್ ಇನ್',
+    dash_title: 'ವೈಯಕ್ತಿಕ ಸುರಕ್ಷತಾ ಡ್ಯಾಶ್‌ಬೋರ್ಡ್',
+    dash_trigger_sos: 'ತುರ್ತು SOS ಸಕ್ರಿಯಗೊಳಿಸಿ',
+    dash_contacts_title: 'ನಂಬಿಕಸ್ತ ಸಂಪರ್ಕಗಳು',
+    dash_incidents_title: 'ನನ್ನ SOS ಘಟನೆಗಳ ದಾಖಲೆ',
+    dash_notifications_title: 'ಅಧಿಸೂಚನೆ ಕೇಂದ್ರ',
+    dash_mark_all_read: 'ಎಲ್ಲವನ್ನೂ ಓದಿದಂತೆ ಗುರುತಿಸಿ',
+    dash_mark_safe: 'ಸುರಕ್ಷಿತ / SOS ರದ್ದುಗೊಳಿಸಿ',
+    pulse_title: 'LIFE-LINE PULSE — ಮುನ್ನೆಚ್ಚರಿಕೆ ಸುರಕ್ಷತೆ ಮತ್ತು ಪ್ರತಿಕ್ರಿಯೆ ಬುದ್ಧಿಮತ್ತೆ',
+    pulse_subtitle:
+      'ದೃಢೀಕೃತ ಘಟನೆಗಳು, ಗೌಪ್ಯತೆ-ಆಧಾರಿತ ಸಮುದಾಯ ವರದಿಗಳು, Open-Meteo ಹವಾಮಾನ ಮತ್ತು Google Maps SafeRoute v2 ಮೂಲಕ ಪಾರದರ್ಶಕ ಸುರಕ್ಷತಾ ವಿಶ್ಲೇಷಣೆ.',
+    pulse_risk_tab: 'ಮುನ್ನೆಚ್ಚರಿಕೆ ಅಪಾಯ',
+    pulse_saferoute_tab: 'AI SafeRoute ಮತ್ತು ಪ್ರಯಾಣ ಹಂಚಿಕೆ',
+    pulse_reports_tab: 'ಸಮುದಾಯ ಸುರಕ್ಷತಾ ವರದಿಗಳು',
+    pulse_start_journey: 'SafeRoute ಪ್ರಯಾಣ ಹಂಚಿಕೊಳ್ಳಿ',
+    pulse_checkin_safe: 'ಸುರಕ್ಷಿತ ಚೆಕ್-ಇನ್',
+    pulse_confirm_arrival: 'ಸುರಕ್ಷಿತ ತಲುಪುವಿಕೆ ದೃಢೀಕರಿಸಿ',
+    pulse_refresh_route: 'ಮಾರ್ಗದ ಸ್ಥಿತಿ ನವೀಕರಿಸಿ',
+    sos_modal_title: 'ತುರ್ತು SOS ಸಕ್ರಿಯಗೊಳಿಸಿ',
+    sos_confirm_btn: 'ದೃಢೀಕರಿಸಿ ಮತ್ತು SOS ಕಳುಹಿಸಿ',
+    sos_cancel_btn: 'ಸುರಕ್ಷಿತ / SOS ರದ್ದುಗೊಳಿಸಿ',
+    agents_title: 'ಮಲ್ಟಿ-ಏಜೆಂಟ್ ತುರ್ತು ಬುದ್ಧಿಮತ್ತೆ',
+    agents_subtitle:
+      'ಆರು ವಿಶೇಷ Gemini ಸುರಕ್ಷತಾ ಏಜೆಂಟ್‌ಗಳು ಮತ್ತು ದ್ವಿಭಾಷಾ ಧ್ವನಿ/ಚಾಟ್ ಮಾರ್ಗದರ್ಶನ — ಪ್ರತಿಯೊಂದು AI ಸಲಹೆಗೆ ಮಾನವ ದೃಢೀಕರಣ ಅಗತ್ಯವಿದೆ.',
+  },
+};
+
+export function t(language: AppLanguage, key: string): string {
+  return TRANSLATIONS[language]?.[key] || TRANSLATIONS.en[key] || key;
+}

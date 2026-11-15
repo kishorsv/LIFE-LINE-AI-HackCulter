@@ -1,7 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import {
+  Activity,
   AlertCircle,
   CalendarPlus,
+  Check,
   CheckCircle2,
   FileSpreadsheet,
   FileText,
@@ -20,6 +22,8 @@ import {
 import { useAuth } from '../contexts/AuthContext.tsx';
 import { formatGoogleAuthError } from '../lib/firebaseAuthErrors.ts';
 import { FirebaseAuthBlockedAlert } from './FirebaseAuthBlockedAlert.tsx';
+import { t } from '../i18n/translations.ts';
+import { LifeLineLogo } from './LifeLineLogo.tsx';
 import { ActiveView, AiRecommendationItem, SupportResource, WorkspaceConfirmPayload } from '../types/lifeline.ts';
 import {
   createSafetyActionTask,
@@ -45,6 +49,8 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
     contacts,
     incidents,
     notifications,
+    journeys,
+    language,
     googleAccessToken,
     connectWorkspaceOAuth,
     developerContactEmail,
@@ -52,6 +58,8 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
     dismissAuthBlockedAlert,
     apiFetch,
     refreshAllData,
+    refreshJourneys,
+    markAllNotificationsRead,
     realtimeConnected,
   } = useAuth();
 
@@ -68,6 +76,9 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
   const [cPhone, setCPhone] = useState('');
   const [workspaceStatusMsg, setWorkspaceStatusMsg] = useState('');
   const [workspaceError, setWorkspaceError] = useState('');
+  const [dashboardError, setDashboardError] = useState('');
+  const [cancellingId, setCancellingId] = useState<number | null>(null);
+  const [journeyBusy, setJourneyBusy] = useState(false);
 
   useEffect(() => {
     if (profile) {
@@ -89,16 +100,24 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
   }, [user, apiFetch]);
 
   const handleStatusChange = async (nextStatus: string) => {
+    const prev = safetyStatus;
+    setDashboardError('');
     setSafetyStatus(nextStatus);
-    await apiFetch('/api/profile', {
-      method: 'PUT',
-      body: JSON.stringify({ safetyStatus: nextStatus }),
-    });
-    await refreshAllData();
+    try {
+      await apiFetch('/api/profile', {
+        method: 'PUT',
+        body: JSON.stringify({ safetyStatus: nextStatus }),
+      });
+      await refreshAllData();
+    } catch (err) {
+      setSafetyStatus(prev);
+      setDashboardError(err instanceof Error ? err.message : 'Unable to update safety status.');
+    }
   };
 
   const handleCaptureGps = () => {
     if (!('geolocation' in navigator)) return;
+    setDashboardError('');
     navigator.geolocation.getCurrentPosition(
       async (pos) => {
         const { latitude, longitude } = pos.coords;
@@ -115,16 +134,20 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
         }
         const label = `GPS ${latitude.toFixed(4)}, ${longitude.toFixed(4)}`;
         setLiveLocText(label);
-        await apiFetch('/api/profile', {
-          method: 'PUT',
-          body: JSON.stringify({
-            lastKnownLat: latitude,
-            lastKnownLng: longitude,
-            lastLocationLabel: label,
-            locationSharingConsent: true,
-          }),
-        });
-        await refreshAllData();
+        try {
+          await apiFetch('/api/profile', {
+            method: 'PUT',
+            body: JSON.stringify({
+              lastKnownLat: latitude,
+              lastKnownLng: longitude,
+              lastLocationLabel: label,
+              locationSharingConsent: true,
+            }),
+          });
+          await refreshAllData();
+        } catch (err) {
+          setDashboardError(err instanceof Error ? err.message : 'Failed to save GPS coordinates.');
+        }
       },
       () => {
         setWorkspaceError('GPS location permission denied or unavailable.');
@@ -135,27 +158,69 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
 
   const handleAddContact = async (e: React.FormEvent) => {
     e.preventDefault();
-    await apiFetch('/api/contacts', {
-      method: 'POST',
-      body: JSON.stringify({
-        name: cName,
-        relationship: cRel,
-        email: cEmail,
-        phone: cPhone,
-        notifyEmail: Boolean(cEmail),
-        notifySms: Boolean(cPhone),
-      }),
-    });
-    setCName('');
-    setCEmail('');
-    setCPhone('');
-    setShowAddContact(false);
-    await refreshAllData();
+    setDashboardError('');
+    try {
+      await apiFetch('/api/contacts', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: cName,
+          relationship: cRel,
+          email: cEmail,
+          phone: cPhone,
+          notifyEmail: Boolean(cEmail),
+          notifySms: Boolean(cPhone),
+        }),
+      });
+      setCName('');
+      setCEmail('');
+      setCPhone('');
+      setShowAddContact(false);
+      await refreshAllData();
+    } catch (err) {
+      setDashboardError(err instanceof Error ? err.message : 'Failed to add trusted contact.');
+    }
   };
 
   const handleDeleteContact = async (id: number) => {
-    await apiFetch(`/api/contacts/${id}`, { method: 'DELETE' });
-    await refreshAllData();
+    setDashboardError('');
+    try {
+      await apiFetch(`/api/contacts/${id}`, { method: 'DELETE' });
+      await refreshAllData();
+    } catch (err) {
+      setDashboardError(err instanceof Error ? err.message : 'Failed to remove trusted contact.');
+    }
+  };
+
+  const handleMarkSafeIncident = async (incidentId: number) => {
+    setDashboardError('');
+    setCancellingId(incidentId);
+    try {
+      await apiFetch(`/api/incidents/${incidentId}/status`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          status: 'Cancelled',
+          note: 'User confirmed safe from dashboard.',
+        }),
+      });
+      await refreshAllData();
+    } catch (err) {
+      setDashboardError(err instanceof Error ? err.message : 'Could not update SOS status.');
+    } finally {
+      setCancellingId(null);
+    }
+  };
+
+  const handleJourneyQuickAction = async (journeyId: number, action: 'checkin' | 'arrive') => {
+    setJourneyBusy(true);
+    setDashboardError('');
+    try {
+      await apiFetch(`/api/journeys/${journeyId}/${action}`, { method: 'POST' });
+      await refreshJourneys();
+    } catch (err) {
+      setDashboardError(err instanceof Error ? err.message : 'Journey action failed.');
+    } finally {
+      setJourneyBusy(false);
+    }
   };
 
   const ensureWorkspaceToken = async (): Promise<string | null> => {
@@ -351,23 +416,41 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
     });
   };
 
+  const activeJourney = journeys.find((j) => j.status === 'Active');
+
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 space-y-8">
+      {dashboardError && (
+        <div className="rounded-xl border border-rose-500/35 bg-rose-500/10 px-4 py-2.5 text-xs text-rose-700 dark:text-rose-300 flex items-center justify-between gap-2">
+          <span>{dashboardError}</span>
+          <button
+            type="button"
+            onClick={() => setDashboardError('')}
+            className="underline text-[11px]"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
       {/* Welcome & Prominent SOS Banner */}
       <div className="grid gap-6 lg:grid-cols-12">
         <div className="lg:col-span-8 rounded-2xl border border-slate-200 dark:border-violet-500/25 bg-white dark:bg-[#0B1022] p-6 flex flex-col justify-between gap-4">
           <div className="flex flex-wrap items-start justify-between gap-4">
-            <div>
-              <div className="text-xs font-semibold uppercase tracking-wider text-violet-600 dark:text-violet-400">
-                Personal Safety Hub · {user?.role.replace('_', ' ')}
+            <div className="flex items-start gap-3">
+              <LifeLineLogo variant="mark" size="md" className="mt-0.5 hidden sm:inline-flex" />
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-wider text-violet-600 dark:text-violet-400">
+                  {t(language, 'dash_title')} · {user?.role.replace('_', ' ')}
+                </div>
+                <h1 className="mt-1 font-display text-2xl font-bold text-slate-900 dark:text-white">
+                  Welcome back, {user?.displayName}
+                </h1>
+                <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                  Real-time WebSocket link: {realtimeConnected ? 'Connected' : 'Reconnecting...'} ·{' '}
+                  {user?.isDemoAccount ? 'Hackathon Demo Sandbox Account [SIMULATED]' : 'Verified Standard Session'}
+                </p>
               </div>
-              <h1 className="mt-1 font-display text-2xl font-bold text-slate-900 dark:text-white">
-                Welcome back, {user?.displayName}
-              </h1>
-              <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                Real-time WebSocket link: {realtimeConnected ? 'Connected' : 'Reconnecting...'} ·{' '}
-                {user?.isDemoAccount ? 'Hackathon Demo Sandbox Account [SIMULATED]' : 'Verified Standard Session'}
-              </p>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
@@ -427,10 +510,65 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
           >
             <ShieldAlert className="h-10 w-10" />
           </button>
-          <h2 className="mt-4 font-display text-lg font-bold text-slate-900 dark:text-white">Emergency SOS</h2>
+          <h2 className="mt-4 font-display text-lg font-bold text-slate-900 dark:text-white">
+            {t(language, 'dash_trigger_sos')}
+          </h2>
           <p className="mt-1 text-xs text-slate-600 dark:text-slate-300">
-            5-second cancellable alert to trusted contacts & active operators.
+            5-second cancellable alert to trusted contacts &amp; active operators.
           </p>
+        </div>
+      </div>
+
+      {/* LIFE-LINE PULSE Quick Journey & Risk Bar */}
+      <div className="rounded-2xl border border-violet-500/30 bg-gradient-to-r from-violet-500/10 via-white to-sky-500/10 dark:from-violet-950/40 dark:via-[#0B1022] dark:to-sky-950/30 p-5 flex flex-wrap items-center justify-between gap-4">
+        <div className="flex items-start gap-3">
+          <Activity className="h-5 w-5 text-violet-500 shrink-0 mt-0.5" />
+          <div>
+            <div className="font-display text-sm font-bold text-slate-900 dark:text-white">
+              LIFE-LINE PULSE · Predictive Safety &amp; SafeRoute
+            </div>
+            {activeJourney ? (
+              <p className="text-xs text-slate-600 dark:text-slate-300 mt-0.5">
+                Active Shared Journey to <strong>{activeJourney.destinationLabel}</strong> ({activeJourney.travelMode} ·{' '}
+                Risk: {activeJourney.routeRiskLevel}) · Next check-in due{' '}
+                {new Date(activeJourney.nextCheckInDueAt).toLocaleTimeString()}
+              </p>
+            ) : (
+              <p className="text-xs text-slate-600 dark:text-slate-300 mt-0.5">
+                Evaluate live predictive risk indicators, compare SafeRoutes with weather &amp; incident evidence, or
+                share a timed journey with trusted contacts.
+              </p>
+            )}
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          {activeJourney && (
+            <>
+              <button
+                type="button"
+                disabled={journeyBusy}
+                onClick={() => handleJourneyQuickAction(activeJourney.id, 'checkin')}
+                className="rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-700 dark:text-emerald-300"
+              >
+                {t(language, 'pulse_checkin_safe')}
+              </button>
+              <button
+                type="button"
+                disabled={journeyBusy}
+                onClick={() => handleJourneyQuickAction(activeJourney.id, 'arrive')}
+                className="rounded-xl bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500"
+              >
+                {t(language, 'pulse_confirm_arrival')}
+              </button>
+            </>
+          )}
+          <button
+            type="button"
+            onClick={() => onNavigate('pulse')}
+            className="rounded-xl bg-violet-600 px-4 py-2 text-xs font-semibold text-white hover:bg-violet-500"
+          >
+            Open PULSE
+          </button>
         </div>
       </div>
 
@@ -442,7 +580,7 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
             <div className="flex items-center gap-2">
               <Users className="h-5 w-5 text-violet-500" />
               <h2 className="font-display text-base font-bold text-slate-900 dark:text-white">
-                Trusted Contacts ({contacts.length})
+                {t(language, 'dash_contacts_title')} ({contacts.length})
               </h2>
             </div>
             <div className="flex items-center gap-2">
@@ -553,7 +691,7 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
             <div className="flex items-center gap-2">
               <AlertCircle className="h-5 w-5 text-rose-500" />
               <h2 className="font-display text-base font-bold text-slate-900 dark:text-white">
-                Recent Emergency Activity
+                {t(language, 'dash_incidents_title')}
               </h2>
             </div>
             <span className="tabular-nums text-xs text-slate-500 dark:text-slate-400">{incidents.length} recorded</span>
@@ -565,41 +703,58 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
                 No SOS incidents triggered yet. Use Emergency SOS or Hackathon Demo Mode to test the workflow.
               </p>
             ) : (
-              incidents.slice(0, 6).map((inc) => (
-                <div key={inc.id} className="rounded-xl border border-slate-200 dark:border-slate-800 p-3.5 space-y-1.5">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="text-sm font-semibold text-slate-900 dark:text-white">
-                      {inc.isSimulated ? '[SIMULATED] ' : ''}#{inc.id} · {inc.title}
-                    </span>
-                    <div className="flex items-center gap-1.5">
-                      {inc.deliveryStatus && (
-                        <span
-                          className={`rounded-md px-2 py-0.5 font-mono text-[10px] font-semibold uppercase ${
-                            inc.deliveryStatus === 'delivered'
-                              ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
-                              : inc.deliveryStatus === 'failed'
-                              ? 'bg-rose-500/15 text-rose-700 dark:text-rose-300'
-                              : 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
-                          }`}
-                        >
-                          {inc.deliveryStatus}
-                        </span>
-                      )}
-                      <span className="rounded-md border border-violet-500/35 bg-violet-500/10 px-2 py-0.5 text-[11px] font-semibold text-violet-700 dark:text-violet-300">
-                        {inc.status}
+              incidents.slice(0, 6).map((inc) => {
+                const isActive = !['Resolved', 'Cancelled'].includes(inc.status);
+                return (
+                  <div key={inc.id} className="rounded-xl border border-slate-200 dark:border-slate-800 p-3.5 space-y-1.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-sm font-semibold text-slate-900 dark:text-white">
+                        {inc.isSimulated ? '[SIMULATED] ' : ''}#{inc.id} · {inc.title}
                       </span>
+                      <div className="flex items-center gap-1.5">
+                        {inc.deliveryStatus && (
+                          <span
+                            className={`rounded-md px-2 py-0.5 font-mono text-[10px] font-semibold uppercase ${
+                              inc.deliveryStatus === 'delivered'
+                                ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                                : inc.deliveryStatus === 'failed'
+                                ? 'bg-rose-500/15 text-rose-700 dark:text-rose-300'
+                                : 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                            }`}
+                          >
+                            {inc.deliveryStatus}
+                          </span>
+                        )}
+                        <span className="rounded-md border border-violet-500/35 bg-violet-500/10 px-2 py-0.5 text-[11px] font-semibold text-violet-700 dark:text-violet-300">
+                          {inc.status}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="text-xs text-slate-500 dark:text-slate-400">
+                      {inc.locationLabel} · Priority: {inc.priority}
+                    </div>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      {inc.operatorName ? (
+                        <div className="text-[11px] text-emerald-600 dark:text-emerald-400">
+                          Responder: {inc.operatorName}
+                        </div>
+                      ) : (
+                        <span />
+                      )}
+                      {isActive && (
+                        <button
+                          type="button"
+                          disabled={cancellingId === inc.id}
+                          onClick={() => handleMarkSafeIncident(inc.id)}
+                          className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-60"
+                        >
+                          {cancellingId === inc.id ? 'Updating...' : t(language, 'dash_mark_safe')}
+                        </button>
+                      )}
                     </div>
                   </div>
-                  <div className="text-xs text-slate-500 dark:text-slate-400">
-                    {inc.locationLabel} · Priority: {inc.priority}
-                  </div>
-                  {inc.operatorName && (
-                    <div className="text-[11px] text-emerald-600 dark:text-emerald-400">
-                      Responder: {inc.operatorName}
-                    </div>
-                  )}
-                </div>
-              ))
+                );
+              })
             )}
           </div>
         </div>
@@ -802,16 +957,39 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
         </div>
 
         <div className="lg:col-span-4 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-6">
-          <div className="flex items-center gap-2 mb-4">
-            <ShieldCheck className="h-4 w-4 text-emerald-500" />
-            <h2 className="font-display text-base font-bold text-slate-900 dark:text-white">Notification Center</h2>
+          <div className="flex items-center justify-between gap-2 mb-4">
+            <div className="flex items-center gap-2">
+              <ShieldCheck className="h-4 w-4 text-emerald-500" />
+              <h2 className="font-display text-base font-bold text-slate-900 dark:text-white">
+                {t(language, 'dash_notifications_title')}
+              </h2>
+            </div>
+            {notifications.some((n) => !n.isRead) && (
+              <button
+                type="button"
+                onClick={() => {
+                  void markAllNotificationsRead();
+                }}
+                className="inline-flex items-center gap-1 text-[11px] font-semibold text-violet-600 dark:text-violet-400 hover:underline"
+              >
+                <Check className="h-3 w-3" />
+                <span>{t(language, 'dash_mark_all_read')}</span>
+              </button>
+            )}
           </div>
           <div className="space-y-2.5 max-h-60 overflow-y-auto">
             {notifications.length === 0 ? (
               <p className="text-xs text-slate-500 dark:text-slate-400">No recent alerts.</p>
             ) : (
               notifications.slice(0, 5).map((n) => (
-                <div key={n.id} className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
+                <div
+                  key={n.id}
+                  className={`rounded-xl border p-3 ${
+                    n.isRead
+                      ? 'border-slate-200 dark:border-slate-800 opacity-75'
+                      : 'border-violet-500/35 bg-violet-500/5'
+                  }`}
+                >
                   <div className="text-xs font-semibold text-slate-900 dark:text-white">{n.title}</div>
                   <div className="text-[11px] text-slate-600 dark:text-slate-300 mt-0.5">{n.message}</div>
                 </div>
