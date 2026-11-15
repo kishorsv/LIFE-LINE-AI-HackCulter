@@ -1147,15 +1147,16 @@ async function startServer() {
     });
 
     // Vite 8's /@vite/client unconditionally opens an HMR WebSocket (defaulting to port 24678
-    // in middlewareMode) even when hmr: false and ws: false. Strip that transport.connect call
-    // while keeping createHotContext, updateStyle, removeStyle, injectQuery, and ErrorOverlay intact.
+    // in middlewareMode) even when hmr: false and ws: false. Replace its WebSocket transport
+    // with a synchronous no-op transport so transport.connect() marks it connected without
+    // opening a socket and import.meta.hot.send() (e.g. vite-plugin-pwa) never throws.
     app.get('/@vite/client', async (_req, res, next) => {
       try {
         const result = await vite.transformRequest('/@vite/client');
         if (!result) return next();
         const patched = result.code.replace(
-          'transport.connect(createHMRHandler(handleMessage));',
-          '/* HMR disabled: WebSocket transport suppressed */'
+          /const transport = normalizeModuleRunnerTransport\(\(\(\) => \{[\s\S]*?\}\)\(\)\);/,
+          'const transport = normalizeModuleRunnerTransport({ connect() {}, disconnect() {}, send() {} });'
         );
         res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
         res.setHeader('Cache-Control', 'no-cache');
