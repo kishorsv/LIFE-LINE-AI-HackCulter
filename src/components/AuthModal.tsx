@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
-import { AlertTriangle, Building2, FlaskConical, KeyRound, MailCheck, Shield, ShieldCheck, User, X } from 'lucide-react';
+import { Building2, FlaskConical, KeyRound, MailCheck, Shield, ShieldCheck, User, X } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext.tsx';
-import { formatGoogleAuthError, FormattedGoogleAuthError } from '../lib/firebaseAuthErrors.ts';
+import { FirebaseAuthBlockedAlert } from './FirebaseAuthBlockedAlert.tsx';
 import { UserRole } from '../types/lifeline.ts';
 
 interface AuthModalProps {
@@ -17,6 +17,9 @@ export function AuthModal({ open, onClose, onAuthenticated }: AuthModalProps) {
     loginWithGoogle,
     loginDemoRole,
     demoSandboxEnabled,
+    developerContactEmail,
+    authBlockedAlert,
+    dismissAuthBlockedAlert,
     apiFetch,
     refreshAllData,
   } = useAuth();
@@ -30,7 +33,6 @@ export function AuthModal({ open, onClose, onAuthenticated }: AuthModalProps) {
   const [resetCode, setResetCode] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [error, setError] = useState('');
-  const [googleError, setGoogleError] = useState<FormattedGoogleAuthError | null>(null);
   const [info, setInfo] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -140,14 +142,12 @@ export function AuthModal({ open, onClose, onAuthenticated }: AuthModalProps) {
   const handleGoogleSignIn = async () => {
     setBusy(true);
     setError('');
-    setGoogleError(null);
     try {
       await loginWithGoogle();
       onAuthenticated();
       onClose();
-    } catch (err) {
-      const formatted = formatGoogleAuthError(err, { mode: 'login' });
-      setGoogleError(formatted);
+    } catch {
+      // AuthContext persists and surfaces the structured FirebaseAuthBlockedAlert
     } finally {
       setBusy(false);
     }
@@ -427,21 +427,21 @@ export function AuthModal({ open, onClose, onAuthenticated }: AuthModalProps) {
 
             {/* Official Google Sign-In Button (uses basic OpenID scopes; Workspace scopes are requested explicitly in Dashboard) */}
             <div className="mt-4 pt-4 border-t border-slate-200 dark:border-slate-800">
-              {googleError && (
-                <div
-                  role="alert"
-                  className="mb-3 rounded-xl border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-800 dark:text-amber-200"
-                >
-                  <div className="flex items-start gap-2">
-                    <AlertTriangle className="h-4 w-4 text-amber-500 shrink-0 mt-0.5" />
-                    <div className="space-y-1">
-                      <p className="font-semibold">{googleError.title}</p>
-                      <p className="leading-relaxed opacity-95">{googleError.message}</p>
-                      <p className="text-[11px] font-medium text-amber-700 dark:text-amber-300 leading-relaxed">
-                        {googleError.recoveryHint}
-                      </p>
-                    </div>
-                  </div>
+              {authBlockedAlert && (
+                <div className="mb-3">
+                  <FirebaseAuthBlockedAlert
+                    alert={authBlockedAlert}
+                    developerContactEmail={developerContactEmail}
+                    variant="inline"
+                    onUseEmailAuth={() => {
+                      setMode('login');
+                      setError('');
+                    }}
+                    onRetryGoogle={() => {
+                      void handleGoogleSignIn();
+                    }}
+                    onDismiss={dismissAuthBlockedAlert}
+                  />
                 </div>
               )}
               <button type="button" onClick={handleGoogleSignIn} disabled={busy} className="gsi-material-button">

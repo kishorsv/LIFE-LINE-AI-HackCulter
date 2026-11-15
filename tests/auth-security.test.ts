@@ -340,23 +340,26 @@ describe('Authentication, RBAC & Security Hardening', () => {
     assert.equal(badResp.status, 401);
   });
 
-  it('formats Google OAuth 403 access_denied and Firebase auth error codes clearly', async () => {
+  it('formats and persists Firebase auth/access-denied testing-mode alerts and developer contact helpers', async () => {
     const errMod = await import('../src/lib/firebaseAuthErrors.ts');
 
-    const accessDenied = errMod.formatGoogleAuthError(
-      new Error('Error 403: access_denied - Google verification incomplete for test users'),
+    const firebaseDenied = errMod.formatGoogleAuthError(
+      { code: 'auth/access-denied', message: 'Firebase: Error (auth/access-denied).' },
       { mode: 'login', currentHost: 'ais-dev-example.run.app' }
     );
-    assert.equal(accessDenied.code, 'google_access_denied');
-    assert.match(accessDenied.title, /403 access_denied/i);
-    assert.match(accessDenied.recoveryHint, /Email & Password|Demo Sandbox/i);
+    assert.equal(firebaseDenied.code, 'google_access_denied');
+    assert.equal(firebaseDenied.rawCode, 'auth/access-denied');
+    assert.equal(firebaseDenied.testingMode, true);
+    assert.match(firebaseDenied.title, /Testing Mode/i);
+    assert.match(firebaseDenied.recoveryHint, /Email & Password|Demo Sandbox/i);
 
     const workspaceDenied = errMod.formatGoogleAuthError(
       { code: 'auth/internal-error', customData: { _tokenResponse: { error: { message: 'access_denied' } } } },
       { mode: 'workspace' }
     );
     assert.equal(workspaceDenied.code, 'google_access_denied');
-    assert.match(workspaceDenied.message, /Workspace scopes/i);
+    assert.equal(workspaceDenied.testingMode, true);
+    assert.match(workspaceDenied.message, /Workspace/i);
 
     const badDomain = errMod.formatGoogleAuthError(
       { code: 'auth/unauthorized-domain', message: 'Firebase: Error (auth/unauthorized-domain).' },
@@ -371,5 +374,41 @@ describe('Authentication, RBAC & Security Hardening', () => {
     const popupClosed = errMod.formatGoogleAuthError({ code: 'auth/popup-closed-by-user' });
     assert.equal(popupClosed.code, 'popup_closed');
     assert.match(popupClosed.message, /403/);
+
+    // Persistence lifecycle: save -> load -> expire -> clear
+    const store = new Map<string, string>();
+    const mockStorage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => {
+        store.set(k, v);
+      },
+      removeItem: (k: string) => {
+        store.delete(k);
+      },
+    };
+
+    const persisted = errMod.createPersistedAuthBlockedAlert(
+      { code: 'auth/access-denied' },
+      { currentHost: 'ais-dev-example.run.app', mode: 'login', occurredAt: '2026-11-15T10:00:00.000Z' }
+    );
+    errMod.savePersistedAuthBlockedAlert(persisted, mockStorage);
+
+    const loaded = errMod.loadPersistedAuthBlockedAlert(mockStorage, Date.parse('2026-11-15T11:00:00.000Z'));
+    assert.ok(loaded);
+    assert.equal(loaded.rawCode, 'auth/access-denied');
+    assert.equal(loaded.host, 'ais-dev-example.run.app');
+
+    const mailto = errMod.buildDeveloperContactMailto('dev@example.com', loaded);
+    assert.ok(mailto.startsWith('mailto:dev%40example.com?subject='));
+    assert.match(decodeURIComponent(mailto), /auth\/access-denied/);
+    assert.match(decodeURIComponent(mailto), /ais-dev-example\.run\.app/);
+
+    errMod.clearPersistedAuthBlockedAlert(mockStorage);
+    assert.equal(errMod.loadPersistedAuthBlockedAlert(mockStorage), null);
+
+    // Expired alerts (>24h) auto-prune on load
+    errMod.savePersistedAuthBlockedAlert(persisted, mockStorage);
+    const expired = errMod.loadPersistedAuthBlockedAlert(mockStorage, Date.parse('2026-11-17T12:00:00.000Z'));
+    assert.equal(expired, null);
   });
 });

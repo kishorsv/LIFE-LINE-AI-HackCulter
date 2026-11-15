@@ -305,6 +305,7 @@ export async function createAppServer(options?: {
       mapsApiKey: getPublicClientMapsApiKey(),
       appUrl: process.env.APP_URL || '',
       demoSandboxEnabled: isDemoLoginAllowed(),
+      developerContactEmail: (process.env.DEVELOPER_CONTACT_EMAIL || '').trim(),
       googleAuth: {
         configured: Boolean(fb.projectId && fb.authDomain && fb.appId && fb.apiKey),
         authDomain: fb.authDomain || '',

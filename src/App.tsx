@@ -14,6 +14,7 @@ import { AuthModal } from './components/AuthModal.tsx';
 import { SosModal } from './components/SosModal.tsx';
 import { WorkspaceConfirmModal } from './components/WorkspaceConfirmModal.tsx';
 import { OfflineIndicator } from './components/OfflineIndicator.tsx';
+import { FirebaseAuthBlockedAlert } from './components/FirebaseAuthBlockedAlert.tsx';
 import {
   clearLegacySharedSosQueue,
   getQueuedSosAlerts,
@@ -23,7 +24,16 @@ import {
 } from './lib/offlineSosQueue.ts';
 
 function AppShell() {
-  const { user, loading, notifications, apiFetch, refreshAllData } = useAuth();
+  const {
+    user,
+    loading,
+    notifications,
+    apiFetch,
+    refreshAllData,
+    authBlockedAlert,
+    developerContactEmail,
+    dismissAuthBlockedAlert,
+  } = useAuth();
   const [activeView, setActiveView] = useState<ActiveView>('landing');
   const [authOpen, setAuthOpen] = useState(false);
   const [sosOpen, setSosOpen] = useState(false);
@@ -212,6 +222,17 @@ function AppShell() {
         onOpenSos={() => setSosOpen(true)}
         onToggleNotifications={() => setNotifDrawerOpen((v) => !v)}
       />
+
+      {authBlockedAlert && (
+        <FirebaseAuthBlockedAlert
+          alert={authBlockedAlert}
+          developerContactEmail={developerContactEmail}
+          variant="banner"
+          onUseEmailAuth={!user ? () => setAuthOpen(true) : undefined}
+          onRetryGoogle={() => setAuthOpen(true)}
+          onDismiss={dismissAuthBlockedAlert}
+        />
+      )}
 
       {/* Slide-out Notification Center Drawer */}
       {notifDrawerOpen && user && (

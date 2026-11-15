@@ -15,6 +15,13 @@ import {
   signInWithGoogleWorkspace,
   signOutFirebase,
 } from '../lib/firebase.ts';
+import {
+  clearPersistedAuthBlockedAlert,
+  createPersistedAuthBlockedAlert,
+  loadPersistedAuthBlockedAlert,
+  PersistedAuthBlockedAlert,
+  savePersistedAuthBlockedAlert,
+} from '../lib/firebaseAuthErrors.ts';
 
 interface AuthContextValue {
   user: AppUser | null;
@@ -31,6 +38,10 @@ interface AuthContextValue {
   operatorIncidents: EmergencyIncident[];
   notifications: NotificationItem[];
   mapsApiKey: string;
+  developerContactEmail: string;
+  authBlockedAlert: PersistedAuthBlockedAlert | null;
+  reportAuthBlockedAlert: (err: unknown, mode?: 'login' | 'workspace') => PersistedAuthBlockedAlert;
+  dismissAuthBlockedAlert: () => void;
   realtimeConnected: boolean;
   apiFetch: <T = unknown>(url: string, options?: RequestInit) => Promise<T>;
   loginWithEmail: (email: string, password: string) => Promise<void>;
@@ -84,6 +95,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [operatorIncidents, setOperatorIncidents] = useState<EmergencyIncident[]>([]);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [mapsApiKey, setMapsApiKey] = useState<string>(() => import.meta.env.VITE_GOOGLE_MAPS_API_KEY || '');
+  const [developerContactEmail, setDeveloperContactEmail] = useState<string>(
+    () => import.meta.env.VITE_DEVELOPER_CONTACT_EMAIL || ''
+  );
+  const [authBlockedAlert, setAuthBlockedAlert] = useState<PersistedAuthBlockedAlert | null>(() =>
+    loadPersistedAuthBlockedAlert()
+  );
   const [realtimeConnected, setRealtimeConnected] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -93,14 +110,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     localStorage.setItem('lifeline_demo_mode', String(demoMode));
   }, [demoMode]);
 
-  // Load public non-secret configuration (Maps client key fallback & demo sandbox availability)
+  // Load public non-secret configuration (Maps client key fallback, developer contact & demo sandbox availability)
   useEffect(() => {
     fetch('/api/config/public')
       .then((r) => r.json())
-      .then((data: { mapsApiKey?: string; demoSandboxEnabled?: boolean }) => {
+      .then((data: { mapsApiKey?: string; demoSandboxEnabled?: boolean; developerContactEmail?: string }) => {
         if (!mapsApiKey && data.mapsApiKey) setMapsApiKey(data.mapsApiKey);
         if (typeof data.demoSandboxEnabled === 'boolean') {
           setDemoSandboxEnabled(data.demoSandboxEnabled);
+        }
+        if (data.developerContactEmail) {
+          setDeveloperContactEmail(data.developerContactEmail);
         }
       })
       .catch(() => {});
@@ -303,6 +323,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
   }, [token, user, apiFetch, refreshAllData]);
 
+  const reportAuthBlockedAlert = useCallback(
+    (err: unknown, mode: 'login' | 'workspace' = 'login'): PersistedAuthBlockedAlert => {
+      const alert = createPersistedAuthBlockedAlert(err, { mode });
+      savePersistedAuthBlockedAlert(alert);
+      setAuthBlockedAlert(alert);
+      return alert;
+    },
+    []
+  );
+
+  const dismissAuthBlockedAlert = useCallback(() => {
+    clearPersistedAuthBlockedAlert();
+    setAuthBlockedAlert(null);
+  }, []);
+
   const persistToken = (newToken: string) => {
     lastEventSeqRef.current = 0;
     localStorage.setItem(TOKEN_STORAGE_KEY, newToken);
@@ -317,6 +352,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Login failed');
+    dismissAuthBlockedAlert();
     persistToken(data.token);
     setUser(data.user);
   };
@@ -338,35 +374,48 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Registration failed');
+    dismissAuthBlockedAlert();
     persistToken(data.token);
     setUser(data.user);
     return { verificationCodePreview: data.verificationCodePreview };
   };
 
   const loginWithGoogle = async () => {
-    const result = await signInWithGoogleBasic();
-    const res = await fetch('/api/auth/firebase', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ idToken: result.idToken }),
-    });
-    const data = (await res.json().catch(() => ({}))) as {
-      token?: string;
-      user?: AppUser;
-      error?: string;
-    };
-    if (!res.ok || !data.token || !data.user) {
-      await signOutFirebase().catch(() => {});
-      throw new Error(data.error || 'Server verification of Google session failed.');
+    try {
+      const result = await signInWithGoogleBasic();
+      const res = await fetch('/api/auth/firebase', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken: result.idToken }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        token?: string;
+        user?: AppUser;
+        error?: string;
+      };
+      if (!res.ok || !data.token || !data.user) {
+        await signOutFirebase().catch(() => {});
+        throw new Error(data.error || 'Server verification of Google session failed.');
+      }
+      dismissAuthBlockedAlert();
+      persistToken(data.token);
+      setUser(data.user);
+    } catch (err) {
+      reportAuthBlockedAlert(err, 'login');
+      throw err;
     }
-    persistToken(data.token);
-    setUser(data.user);
   };
 
   const connectWorkspaceOAuth = async (): Promise<string | null> => {
-    const result = await signInWithGoogleWorkspace();
-    setGoogleAccessToken(result.accessToken);
-    return result.accessToken;
+    try {
+      const result = await signInWithGoogleWorkspace();
+      setGoogleAccessToken(result.accessToken);
+      dismissAuthBlockedAlert();
+      return result.accessToken;
+    } catch (err) {
+      reportAuthBlockedAlert(err, 'workspace');
+      throw err;
+    }
   };
 
   const loginDemoRole = async (role: UserRole) => {
@@ -377,6 +426,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Demo login failed');
+    dismissAuthBlockedAlert();
     setDemoMode(true);
     persistToken(data.token);
     setUser(data.user);
@@ -415,6 +465,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         operatorIncidents,
         notifications,
         mapsApiKey,
+        developerContactEmail,
+        authBlockedAlert,
+        reportAuthBlockedAlert,
+        dismissAuthBlockedAlert,
         realtimeConnected,
         apiFetch,
         loginWithEmail,

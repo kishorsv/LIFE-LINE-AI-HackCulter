@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext.tsx';
 import { formatGoogleAuthError } from '../lib/firebaseAuthErrors.ts';
+import { FirebaseAuthBlockedAlert } from './FirebaseAuthBlockedAlert.tsx';
 import { ActiveView, AiRecommendationItem, SupportResource, WorkspaceConfirmPayload } from '../types/lifeline.ts';
 import {
   createSafetyActionTask,
@@ -46,6 +47,9 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
     notifications,
     googleAccessToken,
     connectWorkspaceOAuth,
+    developerContactEmail,
+    authBlockedAlert,
+    dismissAuthBlockedAlert,
     apiFetch,
     refreshAllData,
     realtimeConnected,
@@ -165,7 +169,7 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
       return tok;
     } catch (err) {
       const formatted = formatGoogleAuthError(err, { mode: 'workspace' });
-      setWorkspaceError(`${formatted.title}: ${formatted.message} ${formatted.recoveryHint}`);
+      setWorkspaceError(`${formatted.title}: ${formatted.message}`);
       return null;
     }
   };
@@ -635,10 +639,27 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
             {workspaceStatusMsg}
           </div>
         )}
-        {workspaceError && (
-          <div className="mb-3 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-600 dark:text-rose-300">
-            {workspaceError}
+        {authBlockedAlert?.mode === 'workspace' ? (
+          <div className="mb-3">
+            <FirebaseAuthBlockedAlert
+              alert={authBlockedAlert}
+              developerContactEmail={developerContactEmail}
+              variant="inline"
+              onRetryGoogle={() => {
+                void ensureWorkspaceToken();
+              }}
+              onDismiss={() => {
+                dismissAuthBlockedAlert();
+                setWorkspaceError('');
+              }}
+            />
           </div>
+        ) : (
+          workspaceError && (
+            <div className="mb-3 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-600 dark:text-rose-300">
+              {workspaceError}
+            </div>
+          )
         )}
 
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
