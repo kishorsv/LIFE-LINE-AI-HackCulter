@@ -58,15 +58,13 @@ export default defineConfig(() => {
           runtimeCaching: [
             {
               urlPattern: ({url}) =>
-                /^\/api\/(support-directory|contacts|incidents|profile|auth\/me)/.test(
-                  url.pathname
-                ),
+                /^\/api\/(support-directory|health)$/.test(url.pathname),
               handler: 'NetworkFirst',
               options: {
-                cacheName: 'emergency-api-cache',
+                cacheName: 'public-directory-cache',
                 networkTimeoutSeconds: 3,
                 expiration: {
-                  maxEntries: 30,
+                  maxEntries: 20,
                   maxAgeSeconds: 60 * 60 * 24,
                 },
                 cacheableResponse: {

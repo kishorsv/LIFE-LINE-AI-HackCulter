@@ -284,7 +284,19 @@ export function LiveMapPage() {
     if (!('geolocation' in navigator)) return;
     navigator.geolocation.getCurrentPosition(
       (pos) => {
-        const coords = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        const { latitude, longitude } = pos.coords;
+        if (
+          !Number.isFinite(latitude) ||
+          latitude < -90 ||
+          latitude > 90 ||
+          !Number.isFinite(longitude) ||
+          longitude < -180 ||
+          longitude > 180
+        ) {
+          setPlacesError('Browser returned invalid GPS coordinates. Use manual area search below.');
+          return;
+        }
+        const coords = { lat: latitude, lng: longitude };
         setUserCoords(coords);
         setLocationLabel(`Live GPS (${coords.lat.toFixed(4)}, ${coords.lng.toFixed(4)})`);
         if (user) {
@@ -301,11 +313,16 @@ export function LiveMapPage() {
       },
       () => {
         setPlacesError('Browser location permission denied. Use manual area search below.');
-      }
+      },
+      { enableHighAccuracy: true, timeout: 8000 }
     );
   };
 
   const fetchLiveNearbyPlaces = async (lat: number, lng: number) => {
+    if (!Number.isFinite(lat) || lat < -90 || lat > 90 || !Number.isFinite(lng) || lng < -180 || lng > 180) {
+      setPlacesError('Invalid reference coordinates.');
+      return;
+    }
     setLoadingLive(true);
     setPlacesError('');
     try {
@@ -326,7 +343,11 @@ export function LiveMapPage() {
         }
         throw new Error(data?.error?.message || data?.error || 'Unable to query Google Places.');
       }
-      setLivePlaces(data.places || []);
+      const places = Array.isArray(data.places) ? data.places : [];
+      setLivePlaces(places);
+      if (places.length === 0) {
+        setPlacesError('No nearby Google Places returned within 5 km. Support Directory listings below remain active.');
+      }
     } catch (err) {
       setPlacesError(err instanceof Error ? err.message : 'Places lookup unavailable.');
     } finally {

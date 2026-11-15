@@ -94,20 +94,38 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
 
   const handleCaptureGps = () => {
     if (!('geolocation' in navigator)) return;
-    navigator.geolocation.getCurrentPosition(async (pos) => {
-      const label = `GPS ${pos.coords.latitude.toFixed(4)}, ${pos.coords.longitude.toFixed(4)}`;
-      setLiveLocText(label);
-      await apiFetch('/api/profile', {
-        method: 'PUT',
-        body: JSON.stringify({
-          lastKnownLat: pos.coords.latitude,
-          lastKnownLng: pos.coords.longitude,
-          lastLocationLabel: label,
-          locationSharingConsent: true,
-        }),
-      });
-      await refreshAllData();
-    });
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        const { latitude, longitude } = pos.coords;
+        if (
+          !Number.isFinite(latitude) ||
+          latitude < -90 ||
+          latitude > 90 ||
+          !Number.isFinite(longitude) ||
+          longitude < -180 ||
+          longitude > 180
+        ) {
+          setWorkspaceError('Browser returned invalid GPS coordinates.');
+          return;
+        }
+        const label = `GPS ${latitude.toFixed(4)}, ${longitude.toFixed(4)}`;
+        setLiveLocText(label);
+        await apiFetch('/api/profile', {
+          method: 'PUT',
+          body: JSON.stringify({
+            lastKnownLat: latitude,
+            lastKnownLng: longitude,
+            lastLocationLabel: label,
+            locationSharingConsent: true,
+          }),
+        });
+        await refreshAllData();
+      },
+      () => {
+        setWorkspaceError('GPS location permission denied or unavailable.');
+      },
+      { enableHighAccuracy: true, timeout: 8000 }
+    );
   };
 
   const handleAddContact = async (e: React.FormEvent) => {
@@ -534,13 +552,28 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
             ) : (
               incidents.slice(0, 6).map((inc) => (
                 <div key={inc.id} className="rounded-xl border border-slate-200 dark:border-slate-800 p-3.5 space-y-1.5">
-                  <div className="flex items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
                     <span className="text-sm font-semibold text-slate-900 dark:text-white">
                       {inc.isSimulated ? '[SIMULATED] ' : ''}#{inc.id} · {inc.title}
                     </span>
-                    <span className="rounded-md border border-violet-500/35 bg-violet-500/10 px-2 py-0.5 text-[11px] font-semibold text-violet-700 dark:text-violet-300">
-                      {inc.status}
-                    </span>
+                    <div className="flex items-center gap-1.5">
+                      {inc.deliveryStatus && (
+                        <span
+                          className={`rounded-md px-2 py-0.5 font-mono text-[10px] font-semibold uppercase ${
+                            inc.deliveryStatus === 'delivered'
+                              ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                              : inc.deliveryStatus === 'failed'
+                              ? 'bg-rose-500/15 text-rose-700 dark:text-rose-300'
+                              : 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                          }`}
+                        >
+                          {inc.deliveryStatus}
+                        </span>
+                      )}
+                      <span className="rounded-md border border-violet-500/35 bg-violet-500/10 px-2 py-0.5 text-[11px] font-semibold text-violet-700 dark:text-violet-300">
+                        {inc.status}
+                      </span>
+                    </div>
                   </div>
                   <div className="text-xs text-slate-500 dark:text-slate-400">
                     {inc.locationLabel} · Priority: {inc.priority}

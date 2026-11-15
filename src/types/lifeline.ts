@@ -62,6 +62,7 @@ export interface IncidentUpdateItem {
   previousStatus: string;
   newStatus: string;
   note: string;
+  isInternal?: boolean;
   createdAt: string;
 }
 
@@ -77,6 +78,8 @@ export interface DeliveryLogItem {
   createdAt: string;
 }
 
+export type IncidentDeliveryStatus = 'queued' | 'submitted' | 'delivered' | 'failed';
+
 export interface EmergencyIncident {
   id: number;
   userId: number;
@@ -86,6 +89,7 @@ export interface EmergencyIncident {
   description: string;
   category: string;
   status: 'SOS Activated' | 'Alert Sent' | 'Acknowledged' | 'Assistance in Progress' | 'Resolved' | 'Cancelled';
+  deliveryStatus?: IncidentDeliveryStatus;
   priority: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
   latitude: number | null;
   longitude: number | null;

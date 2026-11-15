@@ -14,7 +14,13 @@ import { AuthModal } from './components/AuthModal.tsx';
 import { SosModal } from './components/SosModal.tsx';
 import { WorkspaceConfirmModal } from './components/WorkspaceConfirmModal.tsx';
 import { OfflineIndicator } from './components/OfflineIndicator.tsx';
-import { getQueuedSosAlerts, removeQueuedSos } from './lib/offlineSosQueue.ts';
+import {
+  clearLegacySharedSosQueue,
+  getQueuedSosAlerts,
+  getRetryableQueuedSosAlerts,
+  recordQueuedSosRetryFailure,
+  removeQueuedSos,
+} from './lib/offlineSosQueue.ts';
 
 function AppShell() {
   const { user, loading, notifications, apiFetch, refreshAllData } = useAuth();
@@ -24,42 +30,83 @@ function AppShell() {
   const [notifDrawerOpen, setNotifDrawerOpen] = useState(false);
   const [workspaceConfirm, setWorkspaceConfirm] = useState<WorkspaceConfirmPayload | null>(null);
   const [mapsQuotaExceeded, setMapsQuotaExceeded] = useState(false);
-  const [queuedSosCount, setQueuedSosCount] = useState(() => getQueuedSosAlerts().length);
+  const [queuedSosCount, setQueuedSosCount] = useState(0);
+  const [failedSosCount, setFailedSosCount] = useState(0);
+  const flushingRef = React.useRef(false);
 
   useEffect(() => {
+    clearLegacySharedSosQueue();
     const onQuota = () => setMapsQuotaExceeded(true);
     window.addEventListener('gmp-quota-exceeded', onQuota);
     return () => window.removeEventListener('gmp-quota-exceeded', onQuota);
   }, []);
 
   useEffect(() => {
-    const syncQueueCount = () => setQueuedSosCount(getQueuedSosAlerts().length);
-    const flushQueue = async () => {
-      if (!user || !navigator.onLine) return;
-      const queued = getQueuedSosAlerts();
-      if (queued.length === 0) return;
-      for (const item of queued) {
-        try {
-          await apiFetch('/api/incidents/sos', {
-            method: 'POST',
-            body: JSON.stringify(item),
-          });
-          removeQueuedSos(item.id);
-        } catch {
-          // keep remaining items queued until connection stabilizes
-          break;
-        }
-      }
-      setQueuedSosCount(getQueuedSosAlerts().length);
-      await refreshAllData();
+    const syncQueueCounts = () => {
+      const items = getQueuedSosAlerts(user);
+      setQueuedSosCount(items.filter((i) => i.state === 'queued').length);
+      setFailedSosCount(items.filter((i) => i.state === 'failed').length);
     };
 
-    window.addEventListener('lifeline-sos-queue-updated', syncQueueCount);
+    const flushQueue = async () => {
+      if (!user || !navigator.onLine || flushingRef.current) {
+        syncQueueCounts();
+        return;
+      }
+      const retryable = getRetryableQueuedSosAlerts(user);
+      if (retryable.length === 0) {
+        syncQueueCounts();
+        return;
+      }
+
+      flushingRef.current = true;
+      let anySynced = false;
+      try {
+        for (const item of retryable) {
+          try {
+            await apiFetch('/api/incidents/sos', {
+              method: 'POST',
+              body: JSON.stringify({
+                idempotencyKey: item.idempotencyKey,
+                clientQueuedAt: item.queuedAt,
+                title: item.title,
+                description: item.description,
+                category: item.category,
+                priority: item.priority,
+                latitude: item.latitude,
+                longitude: item.longitude,
+                locationLabel: item.locationLabel,
+                locationAccuracyMeters: item.locationAccuracyMeters,
+                isSimulated: item.isSimulated,
+              }),
+            });
+            removeQueuedSos(item.id, user);
+            anySynced = true;
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : 'Network error';
+            const isPermanentValidationErr = /invalid|forbidden|unauthorized|must be/i.test(msg);
+            recordQueuedSosRetryFailure(item.id, user, msg, { permanent: isPermanentValidationErr });
+            if (!isPermanentValidationErr) break;
+          }
+        }
+      } finally {
+        flushingRef.current = false;
+        syncQueueCounts();
+        if (anySynced) {
+          await refreshAllData();
+        }
+      }
+    };
+
+    syncQueueCounts();
+    window.addEventListener('lifeline-sos-queue-updated', syncQueueCounts);
     window.addEventListener('online', flushQueue);
+    const retryTimer = setInterval(flushQueue, 15_000);
     void flushQueue();
 
     return () => {
-      window.removeEventListener('lifeline-sos-queue-updated', syncQueueCount);
+      clearInterval(retryTimer);
+      window.removeEventListener('lifeline-sos-queue-updated', syncQueueCounts);
       window.removeEventListener('online', flushQueue);
     };
   }, [user, apiFetch, refreshAllData]);
@@ -225,7 +272,7 @@ function AppShell() {
 
       <WorkspaceConfirmModal payload={workspaceConfirm} onClose={() => setWorkspaceConfirm(null)} />
 
-      <OfflineIndicator queuedCount={queuedSosCount} />
+      <OfflineIndicator queuedCount={queuedSosCount} failedCount={failedSosCount} />
     </div>
   );
 }

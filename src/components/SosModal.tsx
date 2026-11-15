@@ -12,12 +12,28 @@ import {
   X,
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext.tsx';
-import { EmergencyIncident } from '../types/lifeline.ts';
+import { EmergencyIncident, IncidentDeliveryStatus } from '../types/lifeline.ts';
 import { enqueueOfflineSos, QueuedSosPayload } from '../lib/offlineSosQueue.ts';
 
 interface SosModalProps {
   open: boolean;
   onClose: () => void;
+}
+
+interface DeliverySummaryResult {
+  overallDeliveryState: IncidentDeliveryStatus;
+  operatorRecorded: boolean;
+  externalConfirmedCount: number;
+  externalFailedCount: number;
+  externalUnconfiguredCount: number;
+  truthfulMessage: string;
+}
+
+function createIdempotencyKey(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `sos_${crypto.randomUUID()}`;
+  }
+  return `sos_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
 }
 
 export function SosModal({ open, onClose }: SosModalProps) {
@@ -35,27 +51,45 @@ export function SosModal({ open, onClose }: SosModalProps) {
   const [simulateAlert, setSimulateAlert] = useState<boolean>(demoMode || Boolean(user?.isDemoAccount));
   const [submitting, setSubmitting] = useState(false);
   const [createdIncident, setCreatedIncident] = useState<EmergencyIncident | null>(null);
-  const [deliverySummary, setDeliverySummary] = useState<
-    Array<{ recipient: string; channel: string; status: string; provider: string }>
+  const [deliveryResults, setDeliveryResults] = useState<
+    Array<{ recipient: string; channel: string; status: string; provider: string; error?: string }>
   >([]);
+  const [deliveryReport, setDeliveryReport] = useState<DeliverySummaryResult | null>(null);
   const [recording, setRecording] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
   const [error, setError] = useState('');
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
+  const idempotencyKeyRef = useRef<string>(createIdempotencyKey());
+  const submittingRef = useRef<boolean>(false);
 
   useEffect(() => {
     if (!open) return;
+    idempotencyKeyRef.current = createIdempotencyKey();
+    submittingRef.current = false;
     setSimulateAlert(demoMode || Boolean(user?.isDemoAccount));
     setError('');
+    setDeliveryReport(null);
     if ('geolocation' in navigator) {
       navigator.geolocation.getCurrentPosition(
         (pos) => {
-          setLat(pos.coords.latitude);
-          setLng(pos.coords.longitude);
-          setAccuracy(Math.round(pos.coords.accuracy));
-          setLocationLabel(`GPS ${pos.coords.latitude.toFixed(5)}, ${pos.coords.longitude.toFixed(5)}`);
+          const { latitude, longitude, accuracy: acc } = pos.coords;
+          if (
+            Number.isFinite(latitude) &&
+            latitude >= -90 &&
+            latitude <= 90 &&
+            Number.isFinite(longitude) &&
+            longitude >= -180 &&
+            longitude <= 180
+          ) {
+            setLat(latitude);
+            setLng(longitude);
+            setAccuracy(Number.isFinite(acc) ? Math.round(acc) : null);
+            setLocationLabel(`GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`);
+          } else {
+            setLocationLabel('Invalid GPS reading — enter address or landmark manually');
+          }
         },
         () => {
           setLocationLabel('Location permission declined — enter address or landmark manually');
@@ -68,9 +102,20 @@ export function SosModal({ open, onClose }: SosModalProps) {
   }, [open, demoMode, user?.isDemoAccount]);
 
   const triggerSosDispatch = async () => {
+    if (submittingRef.current) return;
+    if (!user) {
+      setError('Please sign in to submit an SOS incident to operators, or dial 911/112 directly.');
+      setStage('confirm');
+      return;
+    }
+
+    submittingRef.current = true;
     setSubmitting(true);
     setError('');
+
     const payload = {
+      idempotencyKey: idempotencyKeyRef.current,
+      clientQueuedAt: new Date().toISOString(),
       title,
       description,
       category,
@@ -83,9 +128,14 @@ export function SosModal({ open, onClose }: SosModalProps) {
     };
 
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
-      const queued = enqueueOfflineSos(payload);
+      const queued = enqueueOfflineSos({
+        userId: user.id,
+        userUid: user.uid,
+        ...payload,
+      });
       setQueuedItem(queued);
       setStage('queued_offline');
+      submittingRef.current = false;
       setSubmitting(false);
       return;
     }
@@ -93,13 +143,16 @@ export function SosModal({ open, onClose }: SosModalProps) {
     try {
       const res = await apiFetch<{
         incident: EmergencyIncident;
-        deliveryResults: Array<{ recipient: string; channel: string; status: string; provider: string }>;
+        deliveryResults: Array<{ recipient: string; channel: string; status: string; provider: string; error?: string }>;
+        deliverySummary?: DeliverySummaryResult;
+        deduplicated?: boolean;
       }>('/api/incidents/sos', {
         method: 'POST',
         body: JSON.stringify(payload),
       });
       setCreatedIncident(res.incident);
-      setDeliverySummary(res.deliveryResults || []);
+      setDeliveryResults(res.deliveryResults || []);
+      setDeliveryReport(res.deliverySummary || null);
       setStage('active');
       await refreshAllData();
     } catch (err) {
@@ -108,7 +161,11 @@ export function SosModal({ open, onClose }: SosModalProps) {
         err instanceof TypeError ||
         (err instanceof Error && /network|fetch|offline|failed to fetch/i.test(err.message));
       if (isNetworkFailure) {
-        const queued = enqueueOfflineSos(payload);
+        const queued = enqueueOfflineSos({
+          userId: user.id,
+          userUid: user.uid,
+          ...payload,
+        });
         setQueuedItem(queued);
         setStage('queued_offline');
       } else {
@@ -116,6 +173,7 @@ export function SosModal({ open, onClose }: SosModalProps) {
         setStage('confirm');
       }
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
     }
   };
@@ -147,14 +205,19 @@ export function SosModal({ open, onClose }: SosModalProps) {
           const reader = new FileReader();
           reader.onloadend = async () => {
             const base64 = String(reader.result || '').split(',')[1] || '';
-            const res = await apiFetch<{ transcript: string }>('/api/ai/transcribe', {
-              method: 'POST',
-              body: JSON.stringify({ audioBase64: base64, mimeType: blob.type || 'audio/webm' }),
-            });
-            if (res.transcript) {
-              setDescription((prev) => (prev ? `${prev}\n${res.transcript}` : res.transcript));
+            try {
+              const res = await apiFetch<{ transcript: string }>('/api/ai/transcribe', {
+                method: 'POST',
+                body: JSON.stringify({ audioBase64: base64, mimeType: blob.type || 'audio/webm' }),
+              });
+              if (res.transcript) {
+                setDescription((prev) => (prev ? `${prev}\n${res.transcript}` : res.transcript));
+              }
+            } catch (err) {
+              setError(err instanceof Error ? err.message : 'Voice transcription failed.');
+            } finally {
+              setTranscribing(false);
             }
-            setTranscribing(false);
           };
           reader.readAsDataURL(blob);
         } catch {
@@ -187,6 +250,8 @@ export function SosModal({ open, onClose }: SosModalProps) {
   };
 
   if (!open) return null;
+
+  const overallState = deliveryReport?.overallDeliveryState || createdIncident?.deliveryStatus || 'submitted';
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-md p-4 overflow-y-auto">
@@ -332,11 +397,12 @@ export function SosModal({ open, onClose }: SosModalProps) {
               </button>
               <button
                 type="button"
+                disabled={submitting}
                 onClick={() => {
                   setCountdown(5);
                   setStage('countdown');
                 }}
-                className="rounded-xl bg-rose-600 px-5 py-2.5 text-sm font-bold text-white shadow-lg shadow-rose-600/30 hover:bg-rose-500"
+                className="rounded-xl bg-rose-600 px-5 py-2.5 text-sm font-bold text-white shadow-lg shadow-rose-600/30 hover:bg-rose-500 disabled:opacity-60"
               >
                 Start 5s SOS Dispatch
               </button>
@@ -370,7 +436,7 @@ export function SosModal({ open, onClose }: SosModalProps) {
                 type="button"
                 disabled={submitting}
                 onClick={triggerSosDispatch}
-                className="rounded-xl bg-rose-600 px-5 py-2.5 text-sm font-bold text-white hover:bg-rose-500"
+                className="rounded-xl bg-rose-600 px-5 py-2.5 text-sm font-bold text-white hover:bg-rose-500 disabled:opacity-60"
               >
                 Send Immediately
               </button>
@@ -380,14 +446,36 @@ export function SosModal({ open, onClose }: SosModalProps) {
 
         {stage === 'active' && createdIncident && (
           <div className="mt-5 space-y-4">
-            <div className="rounded-xl border border-emerald-500/35 bg-emerald-500/10 p-4 flex items-start gap-3">
-              <CheckCircle2 className="h-5 w-5 text-emerald-500 shrink-0 mt-0.5" />
+            <div
+              className={`rounded-xl border p-4 flex items-start gap-3 ${
+                overallState === 'delivered'
+                  ? 'border-emerald-500/35 bg-emerald-500/10'
+                  : overallState === 'failed'
+                  ? 'border-rose-500/35 bg-rose-500/10'
+                  : 'border-amber-500/35 bg-amber-500/10'
+              }`}
+            >
+              <CheckCircle2
+                className={`h-5 w-5 shrink-0 mt-0.5 ${
+                  overallState === 'delivered'
+                    ? 'text-emerald-500'
+                    : overallState === 'failed'
+                    ? 'text-rose-500'
+                    : 'text-amber-500'
+                }`}
+              />
               <div>
-                <div className="text-sm font-bold text-slate-900 dark:text-white">
-                  Incident #{createdIncident.id} — Status: {createdIncident.status}
+                <div className="flex flex-wrap items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+                  <span>
+                    Incident #{createdIncident.id} — {createdIncident.status}
+                  </span>
+                  <span className="rounded px-2 py-0.5 font-mono text-[11px] uppercase bg-slate-900/10 dark:bg-white/10">
+                    delivery: {overallState}
+                  </span>
                 </div>
-                <p className="text-xs text-slate-600 dark:text-slate-300 mt-0.5">
-                  Real-time operator synchronization active. Operators see your incident immediately.
+                <p className="text-xs text-slate-600 dark:text-slate-300 mt-1">
+                  {deliveryReport?.truthfulMessage ||
+                    'Real-time operator synchronization active. Operators see your incident immediately.'}
                 </p>
               </div>
             </div>
@@ -395,20 +483,31 @@ export function SosModal({ open, onClose }: SosModalProps) {
             <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3.5 space-y-2">
               <div className="flex items-center gap-2 text-xs font-semibold text-slate-700 dark:text-slate-200">
                 <Radio className="h-4 w-4 text-violet-500" />
-                <span>Alert Delivery Audit</span>
+                <span>Verified Alert Delivery Audit</span>
               </div>
-              {deliverySummary.length === 0 ? (
+              {deliveryResults.length === 0 ? (
                 <p className="text-xs text-slate-500 dark:text-slate-400">
-                  In-app operator alert delivered. Add trusted contacts on your Dashboard for multi-channel notifications.
+                  In-app operator alert submitted. Add trusted contacts on your Dashboard to dispatch Email/SMS alerts.
                 </p>
               ) : (
                 <div className="space-y-1.5">
-                  {deliverySummary.map((d, idx) => (
-                    <div key={idx} className="flex items-center justify-between text-xs border-b border-slate-100 dark:border-slate-800/80 pb-1 last:border-0">
+                  {deliveryResults.map((d, idx) => (
+                    <div
+                      key={idx}
+                      className="flex items-center justify-between text-xs border-b border-slate-100 dark:border-slate-800/80 pb-1 last:border-0"
+                    >
                       <span className="text-slate-700 dark:text-slate-300">
                         {d.recipient} ({d.channel})
                       </span>
-                      <span className="rounded bg-slate-100 dark:bg-slate-800 px-2 py-0.5 font-mono text-[11px] text-slate-700 dark:text-slate-300">
+                      <span
+                        className={`rounded px-2 py-0.5 font-mono text-[11px] ${
+                          d.status === 'delivered' || d.status === 'simulated'
+                            ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                            : d.status === 'failed'
+                            ? 'bg-rose-500/15 text-rose-700 dark:text-rose-300'
+                            : 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                        }`}
+                      >
                         {d.status} · {d.provider}
                       </span>
                     </div>
@@ -445,12 +544,16 @@ export function SosModal({ open, onClose }: SosModalProps) {
             <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-4 flex items-start gap-3">
               <WifiOff className="h-5 w-5 text-amber-500 shrink-0 mt-0.5" />
               <div>
-                <div className="text-sm font-bold text-slate-900 dark:text-white">
-                  Temporary Network Interruption — SOS Queued Locally
+                <div className="flex flex-wrap items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+                  <span>Temporary Network Interruption — SOS Queued</span>
+                  <span className="rounded px-2 py-0.5 font-mono text-[11px] uppercase bg-amber-500/20 text-amber-800 dark:text-amber-200">
+                    {queuedItem.state}
+                  </span>
                 </div>
                 <p className="text-xs text-slate-600 dark:text-slate-300 mt-0.5">
-                  Your SOS report ({queuedItem.locationLabel}) is saved offline and will auto-dispatch as soon as
-                  connectivity returns. Use direct phone calls below if immediate help is needed.
+                  Your SOS report ({queuedItem.locationLabel}) is securely bound to your account (expires after 24h) and
+                  will auto-submit with deduplication key <span className="font-mono">{queuedItem.idempotencyKey}</span>{' '}
+                  when connectivity returns.
                 </p>
               </div>
             </div>
@@ -502,6 +605,7 @@ export function SosModal({ open, onClose }: SosModalProps) {
             <div className="flex items-center justify-end gap-2 pt-2">
               <button
                 type="button"
+                disabled={submitting}
                 onClick={triggerSosDispatch}
                 className="rounded-xl border border-violet-500/40 bg-violet-500/10 px-4 py-2 text-xs font-semibold text-violet-700 dark:text-violet-300"
               >

@@ -23,6 +23,7 @@ interface AuthContextValue {
   googleAccessToken: string | null;
   loading: boolean;
   demoMode: boolean;
+  demoSandboxEnabled: boolean;
   setDemoMode: (v: boolean) => void;
   contacts: TrustedContact[];
   incidents: EmergencyIncident[];
@@ -36,7 +37,6 @@ interface AuthContextValue {
     email: string;
     password: string;
     displayName: string;
-    role: 'regular_user' | 'emergency_operator' | 'support_organization';
   }) => Promise<{ verificationCodePreview?: string }>;
   loginWithGoogle: () => Promise<void>;
   connectWorkspaceOAuth: () => Promise<string | null>;
@@ -49,6 +49,25 @@ interface AuthContextValue {
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 const TOKEN_STORAGE_KEY = 'lifeline_session_token';
+const CONTACTS_SNAPSHOT_PREFIX = 'lifeline_contacts_snapshot_';
+
+function clearUserOfflineSnapshots() {
+  try {
+    const keysToRemove: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(CONTACTS_SNAPSHOT_PREFIX)) {
+        keysToRemove.push(key);
+      }
+    }
+    keysToRemove.forEach((k) => localStorage.removeItem(k));
+  } catch {
+    // ignore storage access issues
+  }
+  if (typeof caches !== 'undefined') {
+    caches.delete('emergency-api-cache').catch(() => {});
+  }
+}
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<AppUser | null>(null);
@@ -58,6 +77,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [googleAccessToken, setGoogleAccessToken] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [demoMode, setDemoMode] = useState<boolean>(() => localStorage.getItem('lifeline_demo_mode') === 'true');
+  const [demoSandboxEnabled, setDemoSandboxEnabled] = useState<boolean>(true);
   const [contacts, setContacts] = useState<TrustedContact[]>([]);
   const [incidents, setIncidents] = useState<EmergencyIncident[]>([]);
   const [operatorIncidents, setOperatorIncidents] = useState<EmergencyIncident[]>([]);
@@ -66,21 +86,23 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [realtimeConnected, setRealtimeConnected] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
+  const lastEventSeqRef = useRef<number>(0);
 
   useEffect(() => {
     localStorage.setItem('lifeline_demo_mode', String(demoMode));
   }, [demoMode]);
 
-  // Load public Maps client key fallback if not injected via VITE_ at build time
+  // Load public non-secret configuration (Maps client key fallback & demo sandbox availability)
   useEffect(() => {
-    if (!mapsApiKey) {
-      fetch('/api/config/public')
-        .then((r) => r.json())
-        .then((data: { mapsApiKey?: string }) => {
-          if (data.mapsApiKey) setMapsApiKey(data.mapsApiKey);
-        })
-        .catch(() => {});
-    }
+    fetch('/api/config/public')
+      .then((r) => r.json())
+      .then((data: { mapsApiKey?: string; demoSandboxEnabled?: boolean }) => {
+        if (!mapsApiKey && data.mapsApiKey) setMapsApiKey(data.mapsApiKey);
+        if (typeof data.demoSandboxEnabled === 'boolean') {
+          setDemoSandboxEnabled(data.demoSandboxEnabled);
+        }
+      })
+      .catch(() => {});
   }, [mapsApiKey]);
 
   const apiFetch = useCallback(
@@ -133,6 +155,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setIncidents(iRes.incidents);
       setNotifications(nRes.notifications);
 
+      // Save user-scoped offline contact snapshot strictly under the active user's UID
+      try {
+        localStorage.setItem(`${CONTACTS_SNAPSHOT_PREFIX}${me.user.uid}`, JSON.stringify(cRes.contacts));
+      } catch {
+        // ignore quota errors
+      }
+
       if (['emergency_operator', 'support_organization', 'administrator'].includes(me.user.role)) {
         const opRes = await apiFetch<{ incidents: EmergencyIncident[] }>('/api/operator/incidents');
         setOperatorIncidents(opRes.incidents);
@@ -140,6 +169,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setOperatorIncidents([]);
       }
     } catch {
+      // Do not clear session if we are merely offline; restore user-scoped snapshot only if token is still valid later
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        return;
+      }
       localStorage.removeItem(TOKEN_STORAGE_KEY);
       setToken(null);
       setUser(null);
@@ -156,7 +189,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     })();
   }, [token, refreshAllData]);
 
-  // Real-time WebSocket connection for instant SOS & operator synchronization
+  // Real-time WebSocket connection with heartbeat, exponential-backoff reconnect & missed-event recovery
   useEffect(() => {
     if (!token || !user) {
       wsRef.current?.close();
@@ -165,48 +198,112 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${proto}//${window.location.host}/ws/realtime?token=${encodeURIComponent(token)}`);
-    wsRef.current = ws;
+    let disposed = false;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let pingTimer: ReturnType<typeof setInterval> | null = null;
+    let attempt = 0;
+    let hasConnectedOnce = false;
 
-    ws.onopen = () => setRealtimeConnected(true);
-    ws.onclose = () => setRealtimeConnected(false);
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data) as { type?: string; incident?: EmergencyIncident };
-        if (msg.type === 'incident:created' || msg.type === 'incident:updated') {
-          if (msg.incident) {
-            const inc = msg.incident;
-            setIncidents((prev) => {
-              if (inc.userId !== user.id) return prev;
-              const exists = prev.some((i) => i.id === inc.id);
-              return exists ? prev.map((i) => (i.id === inc.id ? inc : i)) : [inc, ...prev];
-            });
-            setOperatorIncidents((prev) => {
-              if (!['emergency_operator', 'support_organization', 'administrator'].includes(user.role)) return prev;
-              const exists = prev.some((i) => i.id === inc.id);
-              return exists ? prev.map((i) => (i.id === inc.id ? inc : i)) : [inc, ...prev];
-            });
-          }
-          apiFetch<{ notifications: NotificationItem[] }>('/api/notifications')
-            .then((res) => setNotifications(res.notifications))
-            .catch(() => {});
-        } else if (msg.type === 'notification:new') {
-          apiFetch<{ notifications: NotificationItem[] }>('/api/notifications')
-            .then((res) => setNotifications(res.notifications))
-            .catch(() => {});
+    const connectSocket = () => {
+      if (disposed) return;
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const sinceParam = lastEventSeqRef.current > 0 ? `&since=${lastEventSeqRef.current}` : '';
+      const ws = new WebSocket(
+        `${proto}//${window.location.host}/ws/realtime?token=${encodeURIComponent(token)}${sinceParam}`
+      );
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        if (disposed) {
+          ws.close();
+          return;
         }
-      } catch {
-        // ignore malformed message
-      }
+        const reconnecting = hasConnectedOnce;
+        hasConnectedOnce = true;
+        attempt = 0;
+        setRealtimeConnected(true);
+
+        if (reconnecting) {
+          void refreshAllData();
+        }
+
+        if (pingTimer) clearInterval(pingTimer);
+        pingTimer = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'ping' }));
+          }
+        }, 20_000);
+      };
+
+      ws.onclose = (ev) => {
+        setRealtimeConnected(false);
+        if (pingTimer) {
+          clearInterval(pingTimer);
+          pingTimer = null;
+        }
+        // Do not retry if server closed due to failed authentication (1008)
+        if (disposed || ev.code === 1008) return;
+        const backoffMs = Math.min(30_000, 1000 * Math.pow(2, attempt));
+        attempt += 1;
+        reconnectTimer = setTimeout(connectSocket, backoffMs);
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data) as {
+            type?: string;
+            seq?: number;
+            latestSeq?: number;
+            incident?: EmergencyIncident;
+          };
+          if (typeof msg.seq === 'number' && msg.seq > lastEventSeqRef.current) {
+            lastEventSeqRef.current = msg.seq;
+          }
+          if (typeof msg.latestSeq === 'number' && msg.latestSeq > lastEventSeqRef.current) {
+            lastEventSeqRef.current = msg.latestSeq;
+          }
+          if (msg.type === 'pong') return;
+
+          if (msg.type === 'incident:created' || msg.type === 'incident:updated') {
+            if (msg.incident) {
+              const inc = msg.incident;
+              setIncidents((prev) => {
+                if (inc.userId !== user.id) return prev;
+                const exists = prev.some((i) => i.id === inc.id);
+                return exists ? prev.map((i) => (i.id === inc.id ? inc : i)) : [inc, ...prev];
+              });
+              setOperatorIncidents((prev) => {
+                if (!['emergency_operator', 'support_organization', 'administrator'].includes(user.role)) return prev;
+                const exists = prev.some((i) => i.id === inc.id);
+                return exists ? prev.map((i) => (i.id === inc.id ? inc : i)) : [inc, ...prev];
+              });
+            }
+            apiFetch<{ notifications: NotificationItem[] }>('/api/notifications')
+              .then((res) => setNotifications(res.notifications))
+              .catch(() => {});
+          } else if (msg.type === 'notification:new') {
+            apiFetch<{ notifications: NotificationItem[] }>('/api/notifications')
+              .then((res) => setNotifications(res.notifications))
+              .catch(() => {});
+          }
+        } catch {
+          // ignore malformed message
+        }
+      };
     };
+
+    connectSocket();
 
     return () => {
-      ws.close();
+      disposed = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (pingTimer) clearInterval(pingTimer);
+      wsRef.current?.close();
     };
-  }, [token, user, apiFetch]);
+  }, [token, user, apiFetch, refreshAllData]);
 
   const persistToken = (newToken: string) => {
+    lastEventSeqRef.current = 0;
     localStorage.setItem(TOKEN_STORAGE_KEY, newToken);
     setToken(newToken);
   };
@@ -227,12 +324,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     email: string;
     password: string;
     displayName: string;
-    role: 'regular_user' | 'emergency_operator' | 'support_organization';
   }) => {
     const res = await fetch('/api/auth/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(input),
+      body: JSON.stringify({
+        email: input.email,
+        password: input.password,
+        displayName: input.displayName,
+        role: 'regular_user',
+      }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Registration failed');
@@ -267,7 +368,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const logout = async () => {
+    lastEventSeqRef.current = 0;
     localStorage.removeItem(TOKEN_STORAGE_KEY);
+    clearUserOfflineSnapshots();
     clearInMemoryGoogleToken();
     setGoogleAccessToken(null);
     setToken(null);
@@ -290,6 +393,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         googleAccessToken,
         loading,
         demoMode,
+        demoSandboxEnabled,
         setDemoMode,
         contacts,
         incidents,

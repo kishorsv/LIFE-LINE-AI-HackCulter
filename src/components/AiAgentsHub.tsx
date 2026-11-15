@@ -44,8 +44,9 @@ function base64PcmToAudioBuffer(ctx: AudioContext, base64: string): AudioBuffer 
 }
 
 export function AiAgentsHub() {
-  const { apiFetch, profile } = useAuth();
+  const { apiFetch, profile, token } = useAuth();
   const [activeTab, setActiveTab] = useState<AgentTab>('assessment');
+  const [agentError, setAgentError] = useState('');
 
   // 1. Emergency Assessment State
   const [assessDesc, setAssessDesc] = useState('');
@@ -53,6 +54,9 @@ export function AiAgentsHub() {
   const [assessImage, setAssessImage] = useState<{ base64: string; mimeType: string; name: string } | null>(null);
   const [assessResult, setAssessResult] = useState<{
     modelUsed: string;
+    isAiAdvisory?: boolean;
+    verificationStatus?: string;
+    advisoryNotice?: string;
     urgencyLevel: string;
     classification: string;
     recommendedPriority: string;
@@ -71,6 +75,9 @@ export function AiAgentsHub() {
   const [useSearchGrounding, setUseSearchGrounding] = useState(true);
   const [safetyResult, setSafetyResult] = useState<{
     modelUsed: string;
+    isAiAdvisory?: boolean;
+    verificationStatus?: string;
+    advisoryNotice?: string;
     summary: string;
     recommendations: Array<{ title: string; detail: string; confidence: number }>;
     uncertaintyDisclosure: string;
@@ -82,6 +89,9 @@ export function AiAgentsHub() {
   const [resourceQuery, setResourceQuery] = useState('24/7 hospital and women crisis support shelter');
   const [resourceResult, setResourceResult] = useState<{
     modelUsed: string;
+    isAiAdvisory?: boolean;
+    verificationStatus?: string;
+    advisoryNotice?: string;
     summary: string;
     mapsLinks: Array<{ title: string; uri: string }>;
   } | null>(null);
@@ -92,6 +102,9 @@ export function AiAgentsHub() {
   const [coordDesc, setCoordDesc] = useState('Walking from transit station alone; would like check-in draft ready.');
   const [coordResult, setCoordResult] = useState<{
     modelUsed: string;
+    isAiAdvisory?: boolean;
+    verificationStatus?: string;
+    advisoryNotice?: string;
     recommendedWorkflow: string;
     preparedActions: Array<{ tool: string; args: Record<string, unknown>; requiresAuthorization: boolean }>;
     coordinationSummary: string;
@@ -131,6 +144,7 @@ export function AiAgentsHub() {
   const runAssessment = async (e: React.FormEvent) => {
     e.preventDefault();
     setAssessBusy(true);
+    setAgentError('');
     try {
       const res = await apiFetch<{ assessment: typeof assessResult }>('/api/ai/assess-emergency', {
         method: 'POST',
@@ -142,6 +156,8 @@ export function AiAgentsHub() {
         }),
       });
       setAssessResult(res.assessment);
+    } catch (err) {
+      setAgentError(err instanceof Error ? err.message : 'Emergency assessment failed.');
     } finally {
       setAssessBusy(false);
     }
@@ -150,6 +166,7 @@ export function AiAgentsHub() {
   const runSafety = async (e: React.FormEvent) => {
     e.preventDefault();
     setSafetyBusy(true);
+    setAgentError('');
     try {
       const res = await apiFetch<{ intelligence: typeof safetyResult }>('/api/ai/safety-intelligence', {
         method: 'POST',
@@ -160,6 +177,8 @@ export function AiAgentsHub() {
         }),
       });
       setSafetyResult(res.intelligence);
+    } catch (err) {
+      setAgentError(err instanceof Error ? err.message : 'Safety intelligence analysis failed.');
     } finally {
       setSafetyBusy(false);
     }
@@ -168,6 +187,7 @@ export function AiAgentsHub() {
   const runResources = async (e: React.FormEvent) => {
     e.preventDefault();
     setResourceBusy(true);
+    setAgentError('');
     try {
       const res = await apiFetch<{ discovery: typeof resourceResult }>('/api/ai/discover-resources', {
         method: 'POST',
@@ -178,6 +198,8 @@ export function AiAgentsHub() {
         }),
       });
       setResourceResult(res.discovery);
+    } catch (err) {
+      setAgentError(err instanceof Error ? err.message : 'Resource discovery failed.');
     } finally {
       setResourceBusy(false);
     }
@@ -187,6 +209,7 @@ export function AiAgentsHub() {
     e.preventDefault();
     setCoordBusy(true);
     setCoordAuthorizedMsg('');
+    setAgentError('');
     try {
       const res = await apiFetch<{ coordination: typeof coordResult }>('/api/ai/coordinate', {
         method: 'POST',
@@ -198,6 +221,8 @@ export function AiAgentsHub() {
         }),
       });
       setCoordResult(res.coordination);
+    } catch (err) {
+      setAgentError(err instanceof Error ? err.message : 'Coordination agent failed.');
     } finally {
       setCoordBusy(false);
     }
@@ -245,6 +270,10 @@ export function AiAgentsHub() {
 
   const startLiveVoiceSession = async () => {
     setLiveError('');
+    if (!token) {
+      setLiveError('Please sign in first to open an authenticated voice session.');
+      return;
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       liveStreamRef.current = stream;
@@ -255,7 +284,7 @@ export function AiAgentsHub() {
       nextStartTimeRef.current = outputCtx.currentTime;
 
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${proto}//${window.location.host}/ws/live`);
+      const ws = new WebSocket(`${proto}//${window.location.host}/ws/live?token=${encodeURIComponent(token)}`);
       liveWsRef.current = ws;
 
       ws.onmessage = (event) => {
@@ -336,6 +365,18 @@ export function AiAgentsHub() {
           Five transparent safety agents with structured triage, grounded search/maps, and human-authorized coordination.
         </p>
       </div>
+
+      <div className="rounded-xl border border-amber-500/35 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-800 dark:text-amber-200">
+        <strong>AI Advisory Notice:</strong> AI outputs below are unverified recommendations separate from verified
+        emergency directory records and live incident status. Verify facts independently and dial 911/112/999 in
+        immediate danger.
+      </div>
+
+      {agentError && (
+        <div className="rounded-xl border border-rose-500/35 bg-rose-500/10 px-4 py-2.5 text-xs text-rose-700 dark:text-rose-300">
+          {agentError}
+        </div>
+      )}
 
       {/* Agent Tabs */}
       <div className="flex flex-wrap gap-2">

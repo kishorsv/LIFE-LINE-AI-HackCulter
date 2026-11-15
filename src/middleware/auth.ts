@@ -3,15 +3,61 @@ import { Request, Response, NextFunction } from 'express';
 import { adminAuth } from '../lib/firebase-admin.ts';
 import { AppUser, getOrCreateUserByFirebase, getUserById, UserRole } from '../db/repository.ts';
 
-const SESSION_SECRET =
-  process.env.SESSION_SECRET ||
-  crypto.createHash('sha256').update(process.env.GEMINI_API_KEY || 'lifeline-ai-dev-session-secret').digest('hex');
+const WEAK_SECRETS = new Set([
+  'lifeline-ai-dev-session-secret',
+  'my_session_secret',
+  'changeme',
+  'secret',
+  'default',
+  'dev-secret',
+]);
+
+let ephemeralDevSecret: string | null = null;
+
+export function resolveSessionSecret(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = (env.SESSION_SECRET || '').trim();
+  const isProd = env.NODE_ENV === 'production';
+
+  if (configured) {
+    if (configured.length < 32 || WEAK_SECRETS.has(configured.toLowerCase())) {
+      if (isProd) {
+        throw new Error(
+          'FATAL SECURITY ERROR: SESSION_SECRET must be at least 32 non-trivial characters in production.'
+        );
+      }
+      console.warn(
+        '[security] Weak SESSION_SECRET detected in non-production; generating an ephemeral random secret for this process.'
+      );
+    } else {
+      return configured;
+    }
+  }
+
+  if (isProd) {
+    throw new Error(
+      'FATAL SECURITY ERROR: SESSION_SECRET environment variable is required in production (minimum 32 characters).'
+    );
+  }
+
+  if (!ephemeralDevSecret) {
+    ephemeralDevSecret = crypto.randomBytes(32).toString('hex');
+    console.warn(
+      '[security] SESSION_SECRET not configured in development/test; using a cryptographically random ephemeral secret.'
+    );
+  }
+  return ephemeralDevSecret;
+}
+
+export function resetEphemeralSecretForTests() {
+  ephemeralDevSecret = null;
+}
 
 export interface AuthRequest extends Request {
   appUser?: AppUser;
 }
 
-export function signAppToken(user: AppUser): string {
+export function signAppToken(user: AppUser, secretOverride?: string): string {
+  const secret = secretOverride || resolveSessionSecret();
   const payload = Buffer.from(
     JSON.stringify({
       userId: user.id,
@@ -20,24 +66,73 @@ export function signAppToken(user: AppUser): string {
       exp: Date.now() + 1000 * 60 * 60 * 24 * 7, // 7 days
     })
   ).toString('base64url');
-  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  const sig = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
   return `ll_${payload}.${sig}`;
 }
 
-export function verifyAppToken(token: string): { userId: number; uid: string; role: UserRole } | null {
-  if (!token.startsWith('ll_')) return null;
+export function verifyAppToken(
+  token: string,
+  secretOverride?: string
+): { userId: number; uid: string; role: UserRole; exp: number } | null {
+  if (!token || !token.startsWith('ll_')) return null;
   const raw = token.slice(3);
   const parts = raw.split('.');
   if (parts.length !== 2) return null;
   const [payload, sig] = parts;
-  const expected = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  if (!payload || !sig) return null;
+
+  const secret = secretOverride || resolveSessionSecret();
+  const expected = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
   if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
     return null;
   }
   try {
-    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
-    if (parsed.exp < Date.now()) return null;
-    return parsed;
+    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as {
+      userId?: unknown;
+      uid?: unknown;
+      role?: unknown;
+      exp?: unknown;
+    };
+    if (
+      typeof parsed.userId !== 'number' ||
+      !Number.isSafeInteger(parsed.userId) ||
+      parsed.userId <= 0 ||
+      typeof parsed.uid !== 'string' ||
+      typeof parsed.exp !== 'number' ||
+      parsed.exp < Date.now()
+    ) {
+      return null;
+    }
+    return {
+      userId: parsed.userId,
+      uid: parsed.uid,
+      role: parsed.role as UserRole,
+      exp: parsed.exp,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function resolveUserFromToken(token: string): Promise<AppUser | null> {
+  if (!token) return null;
+  if (token.startsWith('ll_')) {
+    const decoded = verifyAppToken(token);
+    if (!decoded) return null;
+    const user = await getUserById(decoded.userId);
+    if (!user || user.uid !== decoded.uid) return null;
+    return user;
+  }
+
+  try {
+    const decodedFirebase = await adminAuth.verifyIdToken(token);
+    const email = decodedFirebase.email || `${decodedFirebase.uid}@firebase.user`;
+    return await getOrCreateUserByFirebase(
+      decodedFirebase.uid,
+      email,
+      decodedFirebase.name || '',
+      Boolean(decodedFirebase.email_verified)
+    );
   } catch {
     return null;
   }
@@ -51,28 +146,10 @@ export const requireAuth = async (req: AuthRequest, res: Response, next: NextFun
 
   const token = authHeader.split('Bearer ')[1].trim();
   try {
-    if (token.startsWith('ll_')) {
-      const decoded = verifyAppToken(token);
-      if (!decoded) {
-        return res.status(401).json({ error: 'Unauthorized: Session expired or invalid' });
-      }
-      const user = await getUserById(decoded.userId);
-      if (!user) {
-        return res.status(401).json({ error: 'Unauthorized: Account not found' });
-      }
-      req.appUser = user;
-      return next();
+    const user = await resolveUserFromToken(token);
+    if (!user) {
+      return res.status(401).json({ error: 'Unauthorized: Session expired or invalid' });
     }
-
-    // Verify Firebase ID token from Google Sign-In
-    const decodedFirebase = await adminAuth.verifyIdToken(token);
-    const email = decodedFirebase.email || `${decodedFirebase.uid}@firebase.user`;
-    const user = await getOrCreateUserByFirebase(
-      decodedFirebase.uid,
-      email,
-      decodedFirebase.name || '',
-      Boolean(decodedFirebase.email_verified)
-    );
     req.appUser = user;
     return next();
   } catch (error) {

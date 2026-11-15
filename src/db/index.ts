@@ -6,6 +6,16 @@ declare global {
   var _postgresPool: Pool | undefined;
 }
 
+export function hasPostgresConfig(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(
+    env.SQL_HOST &&
+      env.SQL_DB_NAME &&
+      env.SQL_USER &&
+      env.SQL_PASSWORD &&
+      env.SQL_PASSWORD !== 'MY_SQL_PASSWORD'
+  );
+}
+
 export const createPool = () => {
   if (!global._postgresPool) {
     global._postgresPool = new Pool({
@@ -14,7 +24,7 @@ export const createPool = () => {
       password: process.env.SQL_PASSWORD,
       database: process.env.SQL_DB_NAME,
       max: 10,
-      connectionTimeoutMillis: 15000,
+      connectionTimeoutMillis: 3000,
     });
 
     global._postgresPool.on('error', (err) => {
@@ -26,3 +36,4 @@ export const createPool = () => {
 
 const pool = createPool();
 export const db = drizzle(pool, { schema });
+export { pool };

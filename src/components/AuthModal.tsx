@@ -10,12 +10,19 @@ interface AuthModalProps {
 }
 
 export function AuthModal({ open, onClose, onAuthenticated }: AuthModalProps) {
-  const { loginWithEmail, registerWithEmail, loginWithGoogle, loginDemoRole, apiFetch, refreshAllData } = useAuth();
+  const {
+    loginWithEmail,
+    registerWithEmail,
+    loginWithGoogle,
+    loginDemoRole,
+    demoSandboxEnabled,
+    apiFetch,
+    refreshAllData,
+  } = useAuth();
   const [mode, setMode] = useState<'login' | 'signup' | 'forgot' | 'verify'>('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [displayName, setDisplayName] = useState('');
-  const [role, setRole] = useState<'regular_user' | 'emergency_operator' | 'support_organization'>('regular_user');
   const [verificationCode, setVerificationCode] = useState('');
   const [codePreview, setCodePreview] = useState('');
   const [resetEmail, setResetEmail] = useState('');
@@ -47,12 +54,12 @@ export function AuthModal({ open, onClose, onAuthenticated }: AuthModalProps) {
     setBusy(true);
     setError('');
     try {
-      const res = await registerWithEmail({ email, password, displayName, role });
+      const res = await registerWithEmail({ email, password, displayName });
       if (res.verificationCodePreview) {
         setCodePreview(res.verificationCodePreview);
       }
       setMode('verify');
-      setInfo('Account created! Verify your email using the 6-digit code below.');
+      setInfo('Account created! Verify your email using the 6-digit code below (expires in 15 minutes).');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Sign up failed.');
     } finally {
@@ -79,6 +86,22 @@ export function AuthModal({ open, onClose, onAuthenticated }: AuthModalProps) {
     }
   };
 
+  const handleResendVerification = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      const res = await apiFetch<{ message?: string; verificationCodePreview?: string }>('/api/auth/resend-verification', {
+        method: 'POST',
+      });
+      if (res.verificationCodePreview) setCodePreview(res.verificationCodePreview);
+      setInfo(res.message || 'New verification code sent.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to resend code.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handleForgotSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true);
@@ -91,6 +114,7 @@ export function AuthModal({ open, onClose, onAuthenticated }: AuthModalProps) {
           body: JSON.stringify({ email: resetEmail }),
         });
         const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Could not request reset code.');
         setInfo(data.message || 'Reset code requested.');
         if (data.resetCodePreview) setCodePreview(data.resetCodePreview);
       } else {
@@ -286,20 +310,9 @@ export function AuthModal({ open, onClose, onAuthenticated }: AuthModalProps) {
                     className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900/70 px-3 py-2 text-sm text-slate-900 dark:text-white focus:border-violet-500 focus:outline-none"
                   />
                 </div>
-                <div>
-                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">Account Role</label>
-                  <select
-                    value={role}
-                    onChange={(e) => setRole(e.target.value as 'regular_user' | 'emergency_operator' | 'support_organization')}
-                    className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900/70 px-3 py-2 text-sm text-slate-900 dark:text-white focus:border-violet-500 focus:outline-none"
-                  >
-                    <option value="regular_user">Regular User (Personal Safety)</option>
-                    <option value="emergency_operator">Emergency Support Operator</option>
-                    <option value="support_organization">Verified Support Organization</option>
-                  </select>
-                  <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
-                    Administrator roles cannot be self-registered publicly.
-                  </p>
+                <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 px-3 py-2 text-[11px] text-slate-600 dark:text-slate-300">
+                  <strong>Account Role:</strong> Regular User (Personal Safety). Emergency Operator, Support Organization,
+                  and Administrator roles are assigned strictly by an Administrator.
                 </div>
                 <button
                   type="submit"
@@ -340,13 +353,21 @@ export function AuthModal({ open, onClose, onAuthenticated }: AuthModalProps) {
                   </button>
                   <button
                     type="button"
+                    disabled={busy}
+                    onClick={handleResendVerification}
+                    className="rounded-xl border border-violet-500/40 px-3 py-2 text-xs font-semibold text-violet-600 dark:text-violet-300"
+                  >
+                    Resend
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => {
                       onAuthenticated();
                       onClose();
                     }}
                     className="rounded-xl border border-slate-300 dark:border-slate-700 px-3 py-2 text-xs text-slate-600 dark:text-slate-300"
                   >
-                    Verify Later
+                    Later
                   </button>
                 </div>
               </form>
@@ -442,69 +463,80 @@ export function AuthModal({ open, onClose, onAuthenticated }: AuthModalProps) {
                 <FlaskConical className="h-4 w-4" />
                 <span>Hackathon Demonstration Sandbox</span>
               </div>
-              <p className="mt-1.5 text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
-                Judges can inspect every RBAC persona with one click. Actions inside demo accounts are explicitly tagged as{' '}
-                <strong className="font-mono">[SIMULATED]</strong> and separated from live metrics.
-              </p>
+              {!demoSandboxEnabled ? (
+                <p className="mt-2 text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+                  One-click demo sandbox login is disabled in production mode. Sign in with your verified credentials
+                  or Google Workspace account.
+                </p>
+              ) : (
+                <>
+                  <p className="mt-1.5 text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+                    Judges can inspect every RBAC persona with one click. Actions inside demo accounts are explicitly tagged as{' '}
+                    <strong className="font-mono">[SIMULATED]</strong> and separated from live metrics.
+                  </p>
 
-              <div className="mt-4 space-y-2.5">
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => handleDemo('regular_user')}
-                  className="w-full flex items-center gap-3 rounded-xl border border-slate-200 dark:border-slate-700/80 bg-white dark:bg-slate-900/70 p-3 text-left hover:border-violet-500/50 transition-colors"
-                >
-                  <User className="h-5 w-5 text-violet-500 shrink-0" />
-                  <div>
-                    <div className="text-sm font-semibold text-slate-900 dark:text-white">Maya Lin · Regular User</div>
-                    <div className="text-[11px] text-slate-500 dark:text-slate-400">Trigger SOS, manage contacts, talk to AI agents</div>
-                  </div>
-                </button>
+                  <div className="mt-4 space-y-2.5">
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => handleDemo('regular_user')}
+                      className="w-full flex items-center gap-3 rounded-xl border border-slate-200 dark:border-slate-700/80 bg-white dark:bg-slate-900/70 p-3 text-left hover:border-violet-500/50 transition-colors"
+                    >
+                      <User className="h-5 w-5 text-violet-500 shrink-0" />
+                      <div>
+                        <div className="text-sm font-semibold text-slate-900 dark:text-white">Maya Lin · Regular User</div>
+                        <div className="text-[11px] text-slate-500 dark:text-slate-400">Trigger SOS, manage contacts, talk to AI agents</div>
+                      </div>
+                    </button>
 
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => handleDemo('emergency_operator')}
-                  className="w-full flex items-center gap-3 rounded-xl border border-slate-200 dark:border-slate-700/80 bg-white dark:bg-slate-900/70 p-3 text-left hover:border-violet-500/50 transition-colors"
-                >
-                  <ShieldCheck className="h-5 w-5 text-rose-500 shrink-0" />
-                  <div>
-                    <div className="text-sm font-semibold text-slate-900 dark:text-white">Elena Vance · Emergency Operator</div>
-                    <div className="text-[11px] text-slate-500 dark:text-slate-400">Live SOS queue, map pins, acknowledge & resolve</div>
-                  </div>
-                </button>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => handleDemo('emergency_operator')}
+                      className="w-full flex items-center gap-3 rounded-xl border border-slate-200 dark:border-slate-700/80 bg-white dark:bg-slate-900/70 p-3 text-left hover:border-violet-500/50 transition-colors"
+                    >
+                      <ShieldCheck className="h-5 w-5 text-rose-500 shrink-0" />
+                      <div>
+                        <div className="text-sm font-semibold text-slate-900 dark:text-white">Elena Vance · Emergency Operator</div>
+                        <div className="text-[11px] text-slate-500 dark:text-slate-400">Live SOS queue, map pins, acknowledge & resolve</div>
+                      </div>
+                    </button>
 
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => handleDemo('support_organization')}
-                  className="w-full flex items-center gap-3 rounded-xl border border-slate-200 dark:border-slate-700/80 bg-white dark:bg-slate-900/70 p-3 text-left hover:border-violet-500/50 transition-colors"
-                >
-                  <Building2 className="h-5 w-5 text-emerald-500 shrink-0" />
-                  <div>
-                    <div className="text-sm font-semibold text-slate-900 dark:text-white">Safe Haven · Support Organization</div>
-                    <div className="text-[11px] text-slate-500 dark:text-slate-400">Responder coordination & shelter intake updates</div>
-                  </div>
-                </button>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => handleDemo('support_organization')}
+                      className="w-full flex items-center gap-3 rounded-xl border border-slate-200 dark:border-slate-700/80 bg-white dark:bg-slate-900/70 p-3 text-left hover:border-violet-500/50 transition-colors"
+                    >
+                      <Building2 className="h-5 w-5 text-emerald-500 shrink-0" />
+                      <div>
+                        <div className="text-sm font-semibold text-slate-900 dark:text-white">Safe Haven · Support Organization</div>
+                        <div className="text-[11px] text-slate-500 dark:text-slate-400">Responder coordination & shelter intake updates</div>
+                      </div>
+                    </button>
 
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => handleDemo('administrator')}
-                  className="w-full flex items-center gap-3 rounded-xl border border-slate-200 dark:border-slate-700/80 bg-white dark:bg-slate-900/70 p-3 text-left hover:border-violet-500/50 transition-colors"
-                >
-                  <Shield className="h-5 w-5 text-amber-500 shrink-0" />
-                  <div>
-                    <div className="text-sm font-semibold text-slate-900 dark:text-white">System Governance · Admin Sandbox</div>
-                    <div className="text-[11px] text-slate-500 dark:text-slate-400">Audit trails, analytics & role governance</div>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => handleDemo('administrator')}
+                      className="w-full flex items-center gap-3 rounded-xl border border-slate-200 dark:border-slate-700/80 bg-white dark:bg-slate-900/70 p-3 text-left hover:border-violet-500/50 transition-colors"
+                    >
+                      <Shield className="h-5 w-5 text-amber-500 shrink-0" />
+                      <div>
+                        <div className="text-sm font-semibold text-slate-900 dark:text-white">System Governance · Admin Sandbox</div>
+                        <div className="text-[11px] text-slate-500 dark:text-slate-400">Audit trails, analytics & role governance</div>
+                      </div>
+                    </button>
                   </div>
-                </button>
-              </div>
+                </>
+              )}
             </div>
 
-            <p className="mt-4 text-[11px] text-slate-500 dark:text-slate-400">
-              Demo credentials: <span className="font-mono">*.demo@lifeline-ai.demo</span> · <span className="font-mono">LifelineDemo2026!</span>
-            </p>
+            {demoSandboxEnabled && (
+              <p className="mt-4 text-[11px] text-slate-500 dark:text-slate-400">
+                Demo credentials: <span className="font-mono">*.demo@lifeline-ai.demo</span> · <span className="font-mono">LifelineDemo2026!</span>
+              </p>
+            )}
           </div>
         </div>
       </div>

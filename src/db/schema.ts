@@ -9,7 +9,14 @@ import {
   serial,
   text,
   timestamp,
+  uniqueIndex,
 } from 'drizzle-orm/pg-core';
+
+// 0. schema_migrations
+export const schemaMigrations = pgTable('schema_migrations', {
+  version: text('version').primaryKey(),
+  appliedAt: timestamp('applied_at').defaultNow().notNull(),
+});
 
 // 1. users
 export const users = pgTable(
@@ -20,7 +27,14 @@ export const users = pgTable(
     email: text('email').notNull(),
     displayName: text('display_name').notNull().default(''),
     role: text('role').notNull().default('regular_user'),
+    passwordHash: text('password_hash').notNull().default(''),
     emailVerified: boolean('email_verified').notNull().default(false),
+    verificationCodeHash: text('verification_code_hash').notNull().default(''),
+    verificationCodeExpiresAt: timestamp('verification_code_expires_at'),
+    verificationAttempts: integer('verification_attempts').notNull().default(0),
+    resetCodeHash: text('reset_code_hash').notNull().default(''),
+    resetCodeExpiresAt: timestamp('reset_code_expires_at'),
+    resetAttempts: integer('reset_attempts').notNull().default(0),
     isDemoAccount: boolean('is_demo_account').notNull().default(false),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at').defaultNow().notNull(),
@@ -83,6 +97,9 @@ export const emergencyIncidents = pgTable(
     userId: integer('user_id')
       .references(() => users.id, { onDelete: 'cascade' })
       .notNull(),
+    idempotencyKey: text('idempotency_key'),
+    clientQueuedAt: timestamp('client_queued_at'),
+    deliveryStatus: text('delivery_status').notNull().default('submitted'),
     title: text('title').notNull(),
     description: text('description').notNull().default(''),
     category: text('category').notNull().default('Personal Safety'),
@@ -105,6 +122,7 @@ export const emergencyIncidents = pgTable(
     index('incidents_user_idx').on(table.userId),
     index('incidents_status_idx').on(table.status),
     index('incidents_created_idx').on(table.createdAt),
+    uniqueIndex('incidents_user_idempotency_idx').on(table.userId, table.idempotencyKey),
   ]
 );
 

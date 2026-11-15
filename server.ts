@@ -1,12 +1,14 @@
 import 'dotenv/config';
 import http from 'node:http';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
 import {
   addTrustedContact,
+  checkDatabaseHealth,
   completePasswordReset,
   createIncident,
   deleteTrustedContact,
@@ -14,9 +16,9 @@ import {
   getDemoAccounts,
   getIncidentById,
   getOperationalAnalytics,
-  getOrCreateUserByFirebase,
-  getUserById,
   getUserProfile,
+  IncidentRecord,
+  initializeDatabase,
   initiatePasswordReset,
   listAllIncidentsForOperator,
   listAllUsersForAdmin,
@@ -30,7 +32,10 @@ import {
   loginEmailUser,
   markNotificationRead,
   registerEmailUser,
+  resendVerificationCode,
+  sanitizeIncidentForViewer,
   saveAiAssessment,
+  updateIncidentDeliveryState,
   updateIncidentStatus,
   updateTrustedContact,
   updateUserProfile,
@@ -39,9 +44,39 @@ import {
   verifyUserEmailCode,
   writeAuditLog,
 } from './src/db/repository.ts';
-import { AuthRequest, requireAuth, requireRole, signAppToken, verifyAppToken } from './src/middleware/auth.ts';
-import { adminAuth } from './src/lib/firebase-admin.ts';
 import {
+  AuthRequest,
+  requireAuth,
+  requireRole,
+  resolveSessionSecret,
+  resolveUserFromToken,
+  signAppToken,
+} from './src/middleware/auth.ts';
+import { createRateLimiter } from './src/middleware/rateLimit.ts';
+import {
+  ALLOWED_MAP_PLACE_TYPES,
+  isValidEmail,
+  isValidIdempotencyKey,
+  isValidLatitude,
+  isValidLongitude,
+  isValidPassword,
+  isValidPhone,
+  isValidVerificationCode,
+  normalizeEmail,
+  parsePositiveInt,
+  sanitizeBoundedString,
+  VALID_INCIDENT_STATUSES,
+  VALID_LOCATION_MODES,
+  VALID_PRIORITIES,
+  VALID_SAFETY_STATUSES,
+  VALID_THEMES,
+  VALID_USER_ROLES,
+  validateOptionalCoordinates,
+} from './src/lib/validation.ts';
+import {
+  GEMINI_MODELS,
+  GeminiServiceError,
+  isGeminiConfigured,
   runEmergencyAssessmentAgent,
   runEmergencyCoordinationAgent,
   runResourceDiscoveryAgent,
@@ -50,979 +85,1544 @@ import {
   synthesizeSafetyGuidanceSpeech,
   transcribeAudioNote,
 } from './src/services/gemini.ts';
-import { dispatchEmergencyNotifications } from './src/services/notifications.ts';
+import { dispatchEmergencyNotifications, DispatchSummary } from './src/services/notifications.ts';
 
-const PORT = Number(process.env.PORT || 3000);
 const MAPS_ATTRIBUTION_ID = 'gmp_mcp_codeassist_v1_aistudio';
+const OPERATOR_ROLES: UserRole[] = ['emergency_operator', 'support_organization', 'administrator'];
+const MAX_REALTIME_PER_USER = 5;
+const MAX_REALTIME_TOTAL = 200;
+const MAX_LIVE_PER_USER = 2;
+const MAX_LIVE_TOTAL = 50;
+const REALTIME_REPLAY_LIMIT = 500;
+const WS_HEARTBEAT_INTERVAL_MS = 25_000;
 
-const app = express();
-app.use(express.json({ limit: '15mb' }));
-
-// Track authenticated realtime WebSocket clients
-interface RealtimeClient {
-  ws: WebSocket;
-  userId: number;
-  role: UserRole;
+function isConfiguredKey(val: string | undefined, placeholder: string): boolean {
+  const trimmed = (val || '').trim();
+  return Boolean(trimmed && trimmed !== placeholder);
 }
-const realtimeClients = new Set<RealtimeClient>();
 
-function broadcastRealtimeEvent(
-  eventPayload: Record<string, unknown>,
-  targetUserId?: number,
-  includeOperators = false
-) {
-  const serialized = JSON.stringify(eventPayload);
-  for (const client of realtimeClients) {
-    if (client.ws.readyState !== WebSocket.OPEN) continue;
-    const isTargetUser = targetUserId !== undefined && client.userId === targetUserId;
-    const isAuthorizedOperator =
-      includeOperators && ['emergency_operator', 'support_organization', 'administrator'].includes(client.role);
-    if (isTargetUser || isAuthorizedOperator) {
-      client.ws.send(serialized);
+function getServerMapsApiKey(): string {
+  if (isConfiguredKey(process.env.GOOGLE_MAPS_API_KEY, 'MY_GOOGLE_MAPS_API_KEY')) {
+    return process.env.GOOGLE_MAPS_API_KEY!.trim();
+  }
+  if (isConfiguredKey(process.env.VITE_GOOGLE_MAPS_API_KEY, 'MY_GOOGLE_MAPS_API_KEY')) {
+    return process.env.VITE_GOOGLE_MAPS_API_KEY!.trim();
+  }
+  return '';
+}
+
+function getPublicClientMapsApiKey(): string {
+  if (isConfiguredKey(process.env.VITE_GOOGLE_MAPS_API_KEY, 'MY_GOOGLE_MAPS_API_KEY')) {
+    return process.env.VITE_GOOGLE_MAPS_API_KEY!.trim();
+  }
+  return '';
+}
+
+function isDemoLoginAllowed(): boolean {
+  return process.env.NODE_ENV !== 'production' || process.env.ALLOW_DEMO_LOGIN === 'true';
+}
+
+function extractWsToken(req: http.IncomingMessage): string {
+  const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+  const queryToken = url.searchParams.get('token');
+  if (queryToken) return queryToken.trim();
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+    return authHeader.slice(7).trim();
+  }
+  return '';
+}
+
+export async function createAppServer(options?: { enableVite?: boolean }) {
+  // Enforce strong SESSION_SECRET and lock authoritative DB before serving requests
+  resolveSessionSecret();
+  await initializeDatabase();
+
+  const app = express();
+  app.use(express.json({ limit: '15mb' }));
+
+  interface RealtimeClient {
+    ws: WebSocket;
+    userId: number;
+    role: UserRole;
+    isAlive: boolean;
+  }
+
+  interface BufferedRealtimeEvent {
+    seq: number;
+    targetUserId?: number;
+    includeOperators: boolean;
+    userPayload: Record<string, unknown>;
+    operatorPayload: Record<string, unknown>;
+  }
+
+  const realtimeClients = new Set<RealtimeClient>();
+  const liveClients = new Set<{ ws: WebSocket; userId: number; isAlive: boolean }>();
+  const eventReplayBuffer: BufferedRealtimeEvent[] = [];
+  let currentEventSeq = 0;
+
+  function pushAndBroadcastRealtimeEvent(params: {
+    targetUserId?: number;
+    includeOperators?: boolean;
+    userPayload: Record<string, unknown>;
+    operatorPayload?: Record<string, unknown>;
+  }) {
+    const seq = ++currentEventSeq;
+    const includeOperators = Boolean(params.includeOperators);
+    const userMsg = { ...params.userPayload, seq };
+    const opMsg = { ...(params.operatorPayload || params.userPayload), seq };
+
+    eventReplayBuffer.push({
+      seq,
+      targetUserId: params.targetUserId,
+      includeOperators,
+      userPayload: userMsg,
+      operatorPayload: opMsg,
+    });
+    if (eventReplayBuffer.length > REALTIME_REPLAY_LIMIT) {
+      eventReplayBuffer.shift();
+    }
+
+    const serializedUser = JSON.stringify(userMsg);
+    const serializedOp = JSON.stringify(opMsg);
+
+    for (const client of realtimeClients) {
+      if (client.ws.readyState !== WebSocket.OPEN) continue;
+      const isOperator = OPERATOR_ROLES.includes(client.role);
+      const isTargetUser = params.targetUserId !== undefined && client.userId === params.targetUserId;
+      if (includeOperators && isOperator) {
+        client.ws.send(serializedOp);
+      } else if (isTargetUser) {
+        client.ws.send(serializedUser);
+      }
     }
   }
-}
 
-function sendRealtimeToUser(userId: number, payload: Record<string, unknown>) {
-  const serialized = JSON.stringify(payload);
-  for (const client of realtimeClients) {
-    if (client.ws.readyState === WebSocket.OPEN && client.userId === userId) {
-      client.ws.send(serialized);
-    }
+  function sendRealtimeToUser(userId: number, payload: Record<string, unknown>) {
+    pushAndBroadcastRealtimeEvent({
+      targetUserId: userId,
+      includeOperators: false,
+      userPayload: payload,
+    });
   }
-}
 
-// Health & non-secret client config
-app.get('/api/health', (_req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'LIFE-LINE AI',
-    timestamp: new Date().toISOString(),
-    aiConfigured: Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'),
+  // Rate Limiters
+  const loginLimiter = createRateLimiter({
+    name: 'auth_login',
+    windowMs: 15 * 60 * 1000,
+    maxRequests: 15,
+    keyGenerator: (req) => `${req.ip || 'ip'}:${String((req.body as { email?: string })?.email || '').toLowerCase()}`,
+    message: 'Too many login attempts. Please wait 15 minutes before trying again.',
   });
-});
 
-app.get('/api/config/public', (_req, res) => {
-  res.json({
-    mapsApiKey: process.env.VITE_GOOGLE_MAPS_API_KEY || process.env.GOOGLE_MAPS_API_KEY || '',
-    appUrl: process.env.APP_URL || '',
+  const registerLimiter = createRateLimiter({
+    name: 'auth_register',
+    windowMs: 15 * 60 * 1000,
+    maxRequests: 8,
+    message: 'Too many registration attempts from this address. Please try again later.',
   });
-});
 
-// ========================
-// AUTHENTICATION & RBAC
-// ========================
-app.post('/api/auth/register', async (req, res) => {
-  try {
-    const { email, password, displayName, role } = req.body as {
-      email?: string;
-      password?: string;
-      displayName?: string;
-      role?: string;
-    };
+  const resetLimiter = createRateLimiter({
+    name: 'auth_reset',
+    windowMs: 15 * 60 * 1000,
+    maxRequests: 8,
+    keyGenerator: (req) => `${req.ip || 'ip'}:${String((req.body as { email?: string })?.email || '').toLowerCase()}`,
+    message: 'Too many password reset attempts. Please wait before trying again.',
+  });
 
-    if (!email || !password || password.length < 8) {
-      return res.status(400).json({ error: 'Valid email and password (minimum 8 characters) are required.' });
-    }
+  const verifyLimiter = createRateLimiter({
+    name: 'auth_verify',
+    windowMs: 15 * 60 * 1000,
+    maxRequests: 12,
+    message: 'Too many verification attempts. Please wait before trying again.',
+  });
 
-    // Strictly forbid public self-registration as administrator
-    if (role === 'administrator') {
+  const sosLimiter = createRateLimiter({
+    name: 'sos_dispatch',
+    windowMs: 60 * 1000,
+    maxRequests: 15,
+    keyGenerator: (req) => String((req as AuthRequest).appUser?.id || req.ip || 'anon'),
+    message: 'SOS rate limit reached. Wait briefly or dial local emergency services directly.',
+  });
+
+  const mapsLimiter = createRateLimiter({
+    name: 'maps_proxy',
+    windowMs: 60 * 1000,
+    maxRequests: 30,
+    message: 'Too many map lookup requests. Please wait a moment.',
+  });
+
+  const aiLimiter = createRateLimiter({
+    name: 'ai_agents',
+    windowMs: 60 * 1000,
+    maxRequests: 25,
+    keyGenerator: (req) => String((req as AuthRequest).appUser?.id || req.ip || 'anon'),
+    message: 'AI agent rate limit reached. Please wait a moment before sending another request.',
+  });
+
+  // ========================
+  // HEALTH & NON-SECRET CLIENT CONFIG
+  // ========================
+  app.get('/api/health', async (_req, res) => {
+    const dbHealth = await checkDatabaseHealth();
+    res.status(dbHealth.ok ? 200 : 503).json({
+      status: dbHealth.ok ? 'ok' : 'degraded',
+      service: 'LIFE-LINE AI',
+      timestamp: new Date().toISOString(),
+      database: dbHealth,
+      aiConfigured: isGeminiConfigured(),
+      aiModels: GEMINI_MODELS,
+      mapsConfigured: Boolean(getServerMapsApiKey() || getPublicClientMapsApiKey()),
+      notificationProviders: {
+        resendConfigured: Boolean(process.env.RESEND_API_KEY),
+        twilioConfigured: Boolean(
+          process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_FROM_NUMBER
+        ),
+      },
+    });
+  });
+
+  app.get('/api/health/db', async (_req, res) => {
+    const dbHealth = await checkDatabaseHealth();
+    res.status(dbHealth.ok ? 200 : 503).json(dbHealth);
+  });
+
+  app.get('/api/config/public', (_req, res) => {
+    res.json({
+      mapsApiKey: getPublicClientMapsApiKey(),
+      appUrl: process.env.APP_URL || '',
+      demoSandboxEnabled: isDemoLoginAllowed(),
+    });
+  });
+
+  // ========================
+  // AUTHENTICATION & RBAC
+  // ========================
+  app.post('/api/auth/register', registerLimiter, async (req, res) => {
+    try {
+      const { email, password, displayName, role } = req.body as {
+        email?: unknown;
+        password?: unknown;
+        displayName?: unknown;
+        role?: unknown;
+      };
+
+      if (!isValidEmail(email) || !isValidPassword(password)) {
+        return res
+          .status(400)
+          .json({ error: 'Valid email and password (8 to 128 characters) are required.' });
+      }
+
+      const normalized = normalizeEmail(email);
+
+      // Force public registration to regular_user ONLY
+      if (role !== undefined && role !== 'regular_user') {
+        await writeAuditLog({
+          actorEmail: normalized,
+          actorRole: 'public',
+          action: 'BLOCKED_ELEVATED_SELF_REGISTRATION',
+          resourceType: 'user',
+          details: { attemptedRole: String(role) },
+          ipAddress: req.ip,
+        });
+        return res.status(403).json({
+          error:
+            'Public self-registration is restricted to Regular User accounts. Operator, Support Organization, and Administrator roles must be assigned by an Administrator.',
+        });
+      }
+
+      const safeName = sanitizeBoundedString(displayName, 80) || normalized.split('@')[0];
+      const { user, verificationCode } = await registerEmailUser({
+        email: normalized,
+        password,
+        displayName: safeName,
+      });
+
+      const token = signAppToken(user);
       await writeAuditLog({
-        actorEmail: email,
+        actorUserId: user.id,
+        actorEmail: user.email,
+        actorRole: user.role,
+        action: 'USER_REGISTERED',
+        resourceType: 'user',
+        resourceId: String(user.id),
+        ipAddress: req.ip,
+      });
+
+      res.status(201).json({
+        user,
+        token,
+        verificationCodePreview:
+          process.env.NODE_ENV !== 'production' && !process.env.RESEND_API_KEY ? verificationCode : undefined,
+      });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Registration failed.' });
+    }
+  });
+
+  app.post('/api/auth/login', loginLimiter, async (req, res) => {
+    try {
+      const { email, password } = req.body as { email?: unknown; password?: unknown };
+      if (!isValidEmail(email) || typeof password !== 'string' || !password) {
+        return res.status(400).json({ error: 'Valid email and password are required.' });
+      }
+      const user = await loginEmailUser(normalizeEmail(email), password);
+      const token = signAppToken(user);
+      await writeAuditLog({
+        actorUserId: user.id,
+        actorEmail: user.email,
+        actorRole: user.role,
+        action: 'USER_LOGIN',
+        resourceType: 'user',
+        resourceId: String(user.id),
+        ipAddress: req.ip,
+      });
+      res.json({ user, token });
+    } catch (err) {
+      const emailStr = typeof req.body?.email === 'string' ? normalizeEmail(req.body.email) : 'unknown';
+      await writeAuditLog({
+        actorEmail: emailStr,
         actorRole: 'public',
-        action: 'BLOCKED_ADMIN_SELF_REGISTRATION',
+        action: 'USER_LOGIN_FAILED',
+        resourceType: 'user',
+        ipAddress: req.ip,
+      }).catch(() => {});
+      res.status(401).json({ error: err instanceof Error ? err.message : 'Invalid credentials.' });
+    }
+  });
+
+  app.post('/api/auth/verify-email', verifyLimiter, requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const { code } = req.body as { code?: unknown };
+      if (!isValidVerificationCode(code)) {
+        return res.status(400).json({ error: 'A valid 6-digit verification code is required.' });
+      }
+      const updated = await verifyUserEmailCode(req.appUser!.id, code.trim());
+      await writeAuditLog({
+        actorUserId: updated.id,
+        actorEmail: updated.email,
+        actorRole: updated.role,
+        action: 'EMAIL_VERIFIED',
+        resourceType: 'user',
+        resourceId: String(updated.id),
+        ipAddress: req.ip,
+      });
+      res.json({ user: updated });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Email verification failed.' });
+    }
+  });
+
+  app.post('/api/auth/resend-verification', verifyLimiter, requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const code = await resendVerificationCode(req.appUser!.id);
+      await writeAuditLog({
+        actorUserId: req.appUser!.id,
+        actorEmail: req.appUser!.email,
+        actorRole: req.appUser!.role,
+        action: 'VERIFICATION_CODE_RESENT',
+        resourceType: 'user',
+        resourceId: String(req.appUser!.id),
+        ipAddress: req.ip,
+      });
+      res.json({
+        message: 'A new 6-digit verification code has been issued (expires in 15 minutes).',
+        verificationCodePreview:
+          process.env.NODE_ENV !== 'production' && !process.env.RESEND_API_KEY ? code : undefined,
+      });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Unable to resend verification code.' });
+    }
+  });
+
+  app.post('/api/auth/forgot-password', resetLimiter, async (req, res) => {
+    try {
+      const { email } = req.body as { email?: unknown };
+      if (!isValidEmail(email)) {
+        return res.status(400).json({ error: 'Valid email is required.' });
+      }
+      const result = await initiatePasswordReset(normalizeEmail(email));
+      res.json({
+        message: 'If an account matches that email, a password reset code has been generated (expires in 15 minutes).',
+        resetCodePreview:
+          process.env.NODE_ENV !== 'production' && !process.env.RESEND_API_KEY && result
+            ? result.resetCode
+            : undefined,
+      });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Could not initiate password reset.' });
+    }
+  });
+
+  app.post('/api/auth/reset-password', resetLimiter, async (req, res) => {
+    try {
+      const { email, code, newPassword } = req.body as {
+        email?: unknown;
+        code?: unknown;
+        newPassword?: unknown;
+      };
+      if (!isValidEmail(email) || !isValidVerificationCode(code) || !isValidPassword(newPassword)) {
+        return res
+          .status(400)
+          .json({ error: 'Valid email, 6-digit reset code, and password (8 to 128 characters) are required.' });
+      }
+      const result = await completePasswordReset(normalizeEmail(email), code.trim(), newPassword);
+      if (!result.ok) {
+        return res.status(400).json({ error: result.reason || 'Invalid or expired reset code.' });
+      }
+      await writeAuditLog({
+        actorEmail: normalizeEmail(email),
+        actorRole: 'public',
+        action: 'PASSWORD_RESET_COMPLETED',
         resourceType: 'user',
         ipAddress: req.ip,
       });
-      return res.status(403).json({
-        error: 'Public self-registration as administrator is prohibited. Administrators must be provisioned internally.',
-      });
-    }
-
-    const allowedPublicRoles = new Set(['regular_user', 'emergency_operator', 'support_organization']);
-    const chosenRole = allowedPublicRoles.has(role || '') ? (role as 'regular_user' | 'emergency_operator' | 'support_organization') : 'regular_user';
-
-    const { user, verificationCode } = await registerEmailUser({
-      email,
-      password,
-      displayName: displayName || email.split('@')[0],
-      role: chosenRole,
-    });
-
-    const token = signAppToken(user);
-    await writeAuditLog({
-      actorUserId: user.id,
-      actorEmail: user.email,
-      actorRole: user.role,
-      action: 'USER_REGISTERED',
-      resourceType: 'user',
-      resourceId: String(user.id),
-      ipAddress: req.ip,
-    });
-
-    res.status(201).json({
-      user,
-      token,
-      // Provided when external SMTP is unconfigured so local/demo email verification works cleanly
-      verificationCodePreview: process.env.RESEND_API_KEY ? undefined : verificationCode,
-    });
-  } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'Registration failed.' });
-  }
-});
-
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { email, password } = req.body as { email?: string; password?: string };
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required.' });
-    }
-    const user = await loginEmailUser(email, password);
-    const token = signAppToken(user);
-    await writeAuditLog({
-      actorUserId: user.id,
-      actorEmail: user.email,
-      actorRole: user.role,
-      action: 'USER_LOGIN',
-      resourceType: 'user',
-      resourceId: String(user.id),
-      ipAddress: req.ip,
-    });
-    res.json({ user, token });
-  } catch (err) {
-    res.status(401).json({ error: err instanceof Error ? err.message : 'Invalid credentials.' });
-  }
-});
-
-app.post('/api/auth/verify-email', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const { code } = req.body as { code?: string };
-    if (!code) return res.status(400).json({ error: 'Verification code is required.' });
-    const updated = await verifyUserEmailCode(req.appUser!.id, code);
-    await writeAuditLog({
-      actorUserId: updated.id,
-      actorEmail: updated.email,
-      actorRole: updated.role,
-      action: 'EMAIL_VERIFIED',
-      resourceType: 'user',
-      resourceId: String(updated.id),
-    });
-    res.json({ user: updated });
-  } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'Email verification failed.' });
-  }
-});
-
-app.post('/api/auth/forgot-password', async (req, res) => {
-  try {
-    const { email } = req.body as { email?: string };
-    if (!email) return res.status(400).json({ error: 'Email is required.' });
-    const result = await initiatePasswordReset(email);
-    res.json({
-      message: 'If an account matches that email, a password reset code has been generated.',
-      resetCodePreview: !process.env.RESEND_API_KEY && result ? result.resetCode : undefined,
-    });
-  } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'Could not initiate password reset.' });
-  }
-});
-
-app.post('/api/auth/reset-password', async (req, res) => {
-  try {
-    const { email, code, newPassword } = req.body as { email?: string; code?: string; newPassword?: string };
-    if (!email || !code || !newPassword || newPassword.length < 8) {
-      return res.status(400).json({ error: 'Valid email, reset code, and password (8+ characters) are required.' });
-    }
-    const ok = await completePasswordReset(email, code, newPassword);
-    if (!ok) return res.status(400).json({ error: 'Invalid or expired reset code.' });
-    res.json({ message: 'Password updated successfully.' });
-  } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'Password reset failed.' });
-  }
-});
-
-app.get('/api/auth/me', requireAuth, async (req: AuthRequest, res) => {
-  const profileData = await getUserProfile(req.appUser!.id);
-  res.json({ user: req.appUser, ...profileData });
-});
-
-app.get('/api/auth/demo-accounts', async (_req, res) => {
-  const accounts = await getDemoAccounts();
-  res.json({
-    accounts: accounts.map((a) => ({
-      id: a.id,
-      email: a.email,
-      displayName: a.displayName,
-      role: a.role,
-      isDemoAccount: true,
-    })),
-  });
-});
-
-app.post('/api/auth/demo-login', async (req, res) => {
-  try {
-    const { role } = req.body as { role?: UserRole };
-    const accounts = await getDemoAccounts();
-    const target = accounts.find((a) => a.role === (role || 'regular_user'));
-    if (!target) {
-      return res.status(404).json({ error: 'Requested demo sandbox account not found.' });
-    }
-    const token = signAppToken(target);
-    await writeAuditLog({
-      actorUserId: target.id,
-      actorEmail: target.email,
-      actorRole: target.role,
-      action: 'DEMO_SANDBOX_LOGIN',
-      resourceType: 'user',
-      resourceId: String(target.id),
-    });
-    res.json({ user: target, token });
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Demo login failed.' });
-  }
-});
-
-// ========================
-// PROFILE & ACCOUNT DELETION
-// ========================
-app.get('/api/profile', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const data = await getUserProfile(req.appUser!.id);
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load profile.' });
-  }
-});
-
-app.put('/api/profile', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const updated = await updateUserProfile(req.appUser!.id, req.body);
-    await writeAuditLog({
-      actorUserId: req.appUser!.id,
-      actorEmail: req.appUser!.email,
-      actorRole: req.appUser!.role,
-      action: 'PROFILE_UPDATED',
-      resourceType: 'user_profile',
-      resourceId: String(req.appUser!.id),
-    });
-    res.json(updated);
-  } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to update profile.' });
-  }
-});
-
-app.delete('/api/profile', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    if (req.appUser!.isDemoAccount) {
-      return res.status(400).json({ error: 'Shared demo sandbox accounts cannot be deleted.' });
-    }
-    await writeAuditLog({
-      actorUserId: req.appUser!.id,
-      actorEmail: req.appUser!.email,
-      actorRole: req.appUser!.role,
-      action: 'ACCOUNT_DELETED',
-      resourceType: 'user',
-      resourceId: String(req.appUser!.id),
-    });
-    await deleteUserAccount(req.appUser!.id);
-    res.json({ deleted: true });
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to delete account.' });
-  }
-});
-
-// ========================
-// TRUSTED CONTACTS
-// ========================
-app.get('/api/contacts', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const contacts = await listTrustedContacts(req.appUser!.id);
-    res.json({ contacts });
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load contacts.' });
-  }
-});
-
-app.post('/api/contacts', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const { name } = req.body as { name?: string };
-    if (!name || !name.trim()) {
-      return res.status(400).json({ error: 'Contact name is required.' });
-    }
-    const contact = await addTrustedContact(req.appUser!.id, req.body);
-    await writeAuditLog({
-      actorUserId: req.appUser!.id,
-      actorEmail: req.appUser!.email,
-      actorRole: req.appUser!.role,
-      action: 'TRUSTED_CONTACT_ADDED',
-      resourceType: 'trusted_contact',
-      resourceId: String(contact.id),
-    });
-    res.status(201).json({ contact });
-  } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to add contact.' });
-  }
-});
-
-app.put('/api/contacts/:id', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const contactId = Number(req.params.id);
-    const contacts = await updateTrustedContact(req.appUser!.id, contactId, req.body);
-    res.json({ contacts });
-  } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to update contact.' });
-  }
-});
-
-app.delete('/api/contacts/:id', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const contactId = Number(req.params.id);
-    await deleteTrustedContact(req.appUser!.id, contactId);
-    res.json({ deleted: true });
-  } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to remove contact.' });
-  }
-});
-
-// ========================
-// SOS & INCIDENT MANAGEMENT
-// ========================
-app.post('/api/incidents/sos', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const {
-      title,
-      description,
-      category,
-      priority,
-      latitude,
-      longitude,
-      locationLabel,
-      locationAccuracyMeters,
-      isSimulated,
-    } = req.body as {
-      title?: string;
-      description?: string;
-      category?: string;
-      priority?: string;
-      latitude?: number | null;
-      longitude?: number | null;
-      locationLabel?: string;
-      locationAccuracyMeters?: number | null;
-      isSimulated?: boolean;
-    };
-
-    const simulatedFlag = Boolean(isSimulated || req.appUser!.isDemoAccount);
-    const incident = await createIncident({
-      userId: req.appUser!.id,
-      title: title?.trim() || (simulatedFlag ? '[SIMULATED] Emergency SOS Alert' : 'Emergency SOS Alert'),
-      description: description?.trim() || 'User activated LIFE-LINE AI SOS.',
-      category: category || 'Personal Safety',
-      priority: priority || 'CRITICAL',
-      latitude: typeof latitude === 'number' ? latitude : null,
-      longitude: typeof longitude === 'number' ? longitude : null,
-      locationLabel: locationLabel || 'Location shared via browser/device',
-      locationAccuracyMeters: typeof locationAccuracyMeters === 'number' ? locationAccuracyMeters : null,
-      isSimulated: simulatedFlag,
-    });
-
-    if (!incident) {
-      return res.status(500).json({ error: 'Incident creation failed.' });
-    }
-
-    const contacts = await listTrustedContacts(req.appUser!.id);
-    const operatorIds = await listOperatorUserIds();
-    const googleToken = req.headers['x-google-access-token'] ? String(req.headers['x-google-access-token']) : undefined;
-
-    let deliveryResults: Array<{ recipient: string; channel: string; status: string; provider: string }> = [];
-    try {
-      deliveryResults = await dispatchEmergencyNotifications({
-        senderUserId: req.appUser!.id,
-        incidentId: incident.id,
-        incidentTitle: incident.title,
-        locationLabel: incident.locationLabel,
-        latitude: incident.latitude,
-        longitude: incident.longitude,
-        isSimulated: simulatedFlag,
-        contacts: contacts.map((c) => ({
-          id: c.id,
-          name: c.name,
-          email: c.email,
-          phone: c.phone,
-          notifyEmail: c.notifyEmail,
-          notifySms: c.notifySms,
-        })),
-        googleAccessToken: googleToken,
-        operatorUserIds: operatorIds,
-        onRealtimeNotify: sendRealtimeToUser,
-      });
-    } catch (notifyErr) {
-      console.error('Notification dispatch notice:', notifyErr);
-    }
-
-    const sentIncident = await updateIncidentStatus({
-      incidentId: incident.id,
-      actorUserId: req.appUser!.id,
-      actorRole: req.appUser!.role,
-      newStatus: 'Alert Sent',
-      note:
-        contacts.length > 0
-          ? `Alert dispatched to ${contacts.length} trusted contact(s) and active LIFE-LINE AI operators.`
-          : 'Alert routed to active LIFE-LINE AI operators. No trusted contacts configured yet.',
-    });
-
-    await writeAuditLog({
-      actorUserId: req.appUser!.id,
-      actorEmail: req.appUser!.email,
-      actorRole: req.appUser!.role,
-      action: simulatedFlag ? 'SIMULATED_SOS_ACTIVATED' : 'SOS_ACTIVATED',
-      resourceType: 'emergency_incident',
-      resourceId: String(incident.id),
-      details: { locationLabel: incident.locationLabel, contactsNotified: contacts.length },
-      ipAddress: req.ip,
-    });
-
-    broadcastRealtimeEvent(
-      { type: 'incident:created', incident: sentIncident },
-      req.appUser!.id,
-      true
-    );
-
-    res.status(201).json({ incident: sentIncident, deliveryResults });
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to activate SOS.' });
-  }
-});
-
-app.get('/api/incidents', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const incidents = await listIncidentsForUser(req.appUser!.id);
-    res.json({ incidents });
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load incidents.' });
-  }
-});
-
-app.get(
-  '/api/operator/incidents',
-  requireAuth,
-  requireRole(['emergency_operator', 'support_organization', 'administrator']),
-  async (_req, res) => {
-    try {
-      const incidents = await listAllIncidentsForOperator();
-      res.json({ incidents });
+      res.json({ message: 'Password updated successfully.' });
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load operator queue.' });
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Password reset failed.' });
     }
-  }
-);
+  });
 
-app.patch('/api/incidents/:id/status', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const incidentId = Number(req.params.id);
-    const existing = await getIncidentById(incidentId);
-    if (!existing) return res.status(404).json({ error: 'Incident not found.' });
+  app.get('/api/auth/me', requireAuth, async (req: AuthRequest, res) => {
+    const profileData = await getUserProfile(req.appUser!.id);
+    res.json({ user: req.appUser, ...profileData });
+  });
 
-    const { status, note, priority, isInternal } = req.body as {
-      status?: string;
-      note?: string;
-      priority?: string;
-      isInternal?: boolean;
-    };
-
-    const validStatuses = ['SOS Activated', 'Alert Sent', 'Acknowledged', 'Assistance in Progress', 'Resolved', 'Cancelled'];
-    if (!status || !validStatuses.includes(status)) {
-      return res.status(400).json({ error: 'Invalid emergency status.' });
+  app.get('/api/auth/demo-accounts', async (_req, res) => {
+    if (!isDemoLoginAllowed()) {
+      return res.status(403).json({ error: 'Demo sandbox login is disabled in production.' });
     }
-
-    const isOperator = ['emergency_operator', 'support_organization', 'administrator'].includes(req.appUser!.role);
-    const isOwner = existing.userId === req.appUser!.id;
-
-    if (!isOperator && !isOwner) {
-      return res.status(403).json({ error: 'Forbidden: You cannot modify this incident.' });
-    }
-    if (!isOperator && !['Cancelled', 'Resolved'].includes(status)) {
-      return res.status(403).json({ error: 'Only authorized operators can acknowledge or advance responder states.' });
-    }
-
-    const updated = await updateIncidentStatus({
-      incidentId,
-      actorUserId: req.appUser!.id,
-      actorRole: req.appUser!.role,
-      newStatus: status,
-      note,
-      priority: isOperator ? priority : undefined,
-      isInternal: isOperator ? Boolean(isInternal) : false,
-    });
-
-    await writeAuditLog({
-      actorUserId: req.appUser!.id,
-      actorEmail: req.appUser!.email,
-      actorRole: req.appUser!.role,
-      action: 'INCIDENT_STATUS_UPDATED',
-      resourceType: 'emergency_incident',
-      resourceId: String(incidentId),
-      details: { previousStatus: existing.status, newStatus: status },
-      ipAddress: req.ip,
-    });
-
-    broadcastRealtimeEvent(
-      { type: 'incident:updated', incident: updated },
-      existing.userId,
-      true
-    );
-
-    res.json({ incident: updated });
-  } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to update incident.' });
-  }
-});
-
-// ========================
-// SUPPORT DIRECTORY & GOOGLE MAPS PROXY
-// ========================
-app.get('/api/support-directory', async (req, res) => {
-  try {
-    const category = req.query.category ? String(req.query.category) : undefined;
-    const query = req.query.q ? String(req.query.q) : undefined;
-    const resources = await listSupportDirectory(category, query);
-    res.json({ resources });
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load support directory.' });
-  }
-});
-
-app.post('/api/maps/nearby-support', async (req, res) => {
-  const mapsKey = process.env.GOOGLE_MAPS_API_KEY || process.env.VITE_GOOGLE_MAPS_API_KEY;
-  if (!mapsKey) {
-    return res.status(503).json({ error: 'Google Maps Places proxy key not configured on server.' });
-  }
-  const { latitude, longitude, radiusMeters = 5000, includedTypes = ['hospital', 'police', 'pharmacy'] } = req.body as {
-    latitude?: number;
-    longitude?: number;
-    radiusMeters?: number;
-    includedTypes?: string[];
-  };
-
-  if (typeof latitude !== 'number' || typeof longitude !== 'number') {
-    return res.status(400).json({ error: 'Valid latitude and longitude are required.' });
-  }
-
-  try {
-    const resp = await fetch('https://places.googleapis.com/v1/places:searchNearby', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Goog-Api-Key': mapsKey,
-        'X-Goog-Maps-Solution-ID': MAPS_ATTRIBUTION_ID,
-        'X-Goog-FieldMask':
-          'places.id,places.displayName,places.formattedAddress,places.location,places.types,places.nationalPhoneNumber,places.regularOpeningHours.openNow,places.googleMapsUri',
-      },
-      body: JSON.stringify({
-        includedTypes,
-        maxResultCount: 10,
-        locationRestriction: {
-          circle: {
-            center: { latitude, longitude },
-            radius: Math.min(Math.max(radiusMeters, 500), 25000),
-          },
-        },
-      }),
-    });
-
-    const data = await resp.json();
-    if (!resp.ok) {
-      return res.status(resp.status).json(data);
-    }
-    res.json({ places: data.places || [], source: 'Google Places API (New)', retrievedAt: new Date().toISOString() });
-  } catch (err) {
-    res.status(502).json({ error: err instanceof Error ? err.message : 'Failed to query Places API.' });
-  }
-});
-
-app.post('/api/maps/search-places', async (req, res) => {
-  const mapsKey = process.env.GOOGLE_MAPS_API_KEY || process.env.VITE_GOOGLE_MAPS_API_KEY;
-  if (!mapsKey) {
-    return res.status(503).json({ error: 'Google Maps Places proxy key not configured on server.' });
-  }
-  const { textQuery, latitude, longitude } = req.body as {
-    textQuery?: string;
-    latitude?: number;
-    longitude?: number;
-  };
-  if (!textQuery || !textQuery.trim()) {
-    return res.status(400).json({ error: 'Search query is required.' });
-  }
-
-  try {
-    const body: Record<string, unknown> = {
-      textQuery: textQuery.trim(),
-      maxResultCount: 10,
-    };
-    if (typeof latitude === 'number' && typeof longitude === 'number') {
-      body.locationBias = {
-        circle: {
-          center: { latitude, longitude },
-          radius: 15000,
-        },
-      };
-    }
-
-    const resp = await fetch('https://places.googleapis.com/v1/places:searchText', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Goog-Api-Key': mapsKey,
-        'X-Goog-Maps-Solution-ID': MAPS_ATTRIBUTION_ID,
-        'X-Goog-FieldMask':
-          'places.id,places.displayName,places.formattedAddress,places.location,places.types,places.nationalPhoneNumber,places.regularOpeningHours.openNow,places.googleMapsUri',
-      },
-      body: JSON.stringify(body),
-    });
-
-    const data = await resp.json();
-    if (!resp.ok) return res.status(resp.status).json(data);
-    res.json({ places: data.places || [], source: 'Google Places API (New)', retrievedAt: new Date().toISOString() });
-  } catch (err) {
-    res.status(502).json({ error: err instanceof Error ? err.message : 'Places search failed.' });
-  }
-});
-
-app.get('/api/maps/geocode', async (req, res) => {
-  const mapsKey = process.env.GOOGLE_MAPS_API_KEY || process.env.VITE_GOOGLE_MAPS_API_KEY;
-  if (!mapsKey) {
-    return res.status(503).json({ error: 'Geocoding API key not configured.' });
-  }
-  const address = req.query.address ? String(req.query.address) : '';
-  const latlng = req.query.latlng ? String(req.query.latlng) : '';
-  if (!address && !latlng) {
-    return res.status(400).json({ error: 'Provide address or latlng parameter.' });
-  }
-
-  try {
-    const url = new URL('https://maps.googleapis.com/maps/api/geocode/json');
-    if (address) url.searchParams.set('address', address);
-    if (latlng) url.searchParams.set('latlng', latlng);
-    url.searchParams.set('key', mapsKey);
-
-    const resp = await fetch(url.toString(), {
-      headers: { 'X-Goog-Maps-Solution-ID': MAPS_ATTRIBUTION_ID },
-    });
-    const data = (await resp.json()) as { status?: string; results?: unknown[]; error_message?: string };
-    if (data.status === 'OVER_QUERY_LIMIT') {
-      return res.status(429).json({ error: { status: 'RESOURCE_EXHAUSTED', message: data.error_message || 'Geocoding quota exceeded' } });
-    }
-    res.json(data);
-  } catch (err) {
-    res.status(502).json({ error: err instanceof Error ? err.message : 'Geocoding failed.' });
-  }
-});
-
-// ========================
-// AGENTIC AI ENGINE (5 AGENTS + TRANSCRIBE + TTS)
-// ========================
-app.post('/api/ai/assess-emergency', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const { description, locationLabel, incidentId, imageBase64, imageMimeType } = req.body as {
-      description?: string;
-      locationLabel?: string;
-      incidentId?: number;
-      imageBase64?: string;
-      imageMimeType?: string;
-    };
-    if (!description || !description.trim()) {
-      return res.status(400).json({ error: 'Please describe the situation for emergency assessment.' });
-    }
-    const assessment = await runEmergencyAssessmentAgent({
-      description: description.trim(),
-      locationLabel,
-      imageBase64,
-      imageMimeType,
-    });
-
-    await saveAiAssessment({
-      incidentId: incidentId ?? null,
-      userId: req.appUser!.id,
-      agentName: 'Emergency Assessment Agent',
-      modelUsed: assessment.modelUsed,
-      inputSummary: description.trim(),
-      urgencyLevel: String(assessment.urgencyLevel || 'HIGH'),
-      classification: String(assessment.classification || 'Safety Concern'),
-      assignedPriority: String(assessment.recommendedPriority || 'HIGH'),
-      confidenceScore: Number(assessment.confidenceScore ?? 0.7),
-      rationale: String(assessment.rationale || ''),
-      missingInfoQuestions: Array.isArray(assessment.missingInfoQuestions) ? assessment.missingInfoQuestions : [],
-      uncertaintyNotes: String(assessment.uncertaintyNotes || ''),
-      escalateToHuman: Boolean(assessment.escalateToHumanOperator),
-      rawStructuredOutput: assessment as unknown as Record<string, unknown>,
-      recommendations: (Array.isArray(assessment.immediateSteps) ? assessment.immediateSteps : []).map((step: string, idx: number) => ({
-        title: `Immediate Step ${idx + 1}`,
-        text: step,
-        category: 'Emergency Triage',
-        sourceCitation: assessment.modelUsed,
+    const accounts = await getDemoAccounts();
+    res.json({
+      accounts: accounts.map((a) => ({
+        id: a.id,
+        email: a.email,
+        displayName: a.displayName,
+        role: a.role,
+        isDemoAccount: true,
       })),
     });
+  });
 
-    res.json({ assessment });
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Emergency assessment failed.' });
-  }
-});
+  app.post('/api/auth/demo-login', loginLimiter, async (req, res) => {
+    try {
+      if (!isDemoLoginAllowed()) {
+        return res.status(403).json({ error: 'Demo sandbox login is disabled in production.' });
+      }
+      const { role } = req.body as { role?: unknown };
+      const requestedRole = typeof role === 'string' ? role : 'regular_user';
+      if (!(VALID_USER_ROLES as readonly string[]).includes(requestedRole)) {
+        return res.status(400).json({ error: 'Invalid demo role requested.' });
+      }
 
-app.post('/api/ai/safety-intelligence', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const { concern, areaLabel, timeContext, useSearchGrounding } = req.body as {
-      concern?: string;
-      areaLabel?: string;
-      timeContext?: string;
-      useSearchGrounding?: boolean;
+      const accounts = await getDemoAccounts();
+      const target = accounts.find((a) => a.role === requestedRole);
+      if (!target) {
+        return res.status(404).json({ error: 'Requested demo sandbox account not found.' });
+      }
+      const token = signAppToken(target);
+      await writeAuditLog({
+        actorUserId: target.id,
+        actorEmail: target.email,
+        actorRole: target.role,
+        action: 'DEMO_SANDBOX_LOGIN',
+        resourceType: 'user',
+        resourceId: String(target.id),
+        ipAddress: req.ip,
+      });
+      res.json({ user: target, token });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Demo login failed.' });
+    }
+  });
+
+  // ========================
+  // PROFILE & ACCOUNT DELETION
+  // ========================
+  app.get('/api/profile', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const data = await getUserProfile(req.appUser!.id);
+      res.json(data);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load profile.' });
+    }
+  });
+
+  app.put('/api/profile', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const body = (req.body || {}) as Record<string, unknown>;
+
+      if (body.safetyStatus !== undefined && !(VALID_SAFETY_STATUSES as readonly string[]).includes(String(body.safetyStatus))) {
+        return res.status(400).json({ error: 'Invalid safetyStatus value.' });
+      }
+      if (body.theme !== undefined && !(VALID_THEMES as readonly string[]).includes(String(body.theme))) {
+        return res.status(400).json({ error: 'Theme must be dark or light.' });
+      }
+      if (
+        body.locationConsentMode !== undefined &&
+        !(VALID_LOCATION_MODES as readonly string[]).includes(String(body.locationConsentMode))
+      ) {
+        return res.status(400).json({ error: 'Invalid locationConsentMode value.' });
+      }
+      if (body.phone !== undefined && !isValidPhone(body.phone)) {
+        return res.status(400).json({ error: 'Invalid phone number format.' });
+      }
+      if (body.lastKnownLat !== undefined || body.lastKnownLng !== undefined) {
+        const coordCheck = validateOptionalCoordinates(body.lastKnownLat, body.lastKnownLng);
+        if (!coordCheck.valid) {
+          return res.status(400).json({ error: coordCheck.error });
+        }
+      }
+      if (body.dataRetentionDays !== undefined) {
+        const days = Number(body.dataRetentionDays);
+        if (!Number.isSafeInteger(days) || days < 1 || days > 3650) {
+          return res.status(400).json({ error: 'dataRetentionDays must be between 1 and 3650.' });
+        }
+      }
+
+      const sanitizedPayload = {
+        fullName: body.fullName !== undefined ? sanitizeBoundedString(body.fullName, 100) : undefined,
+        phone: body.phone !== undefined ? sanitizeBoundedString(body.phone, 32) : undefined,
+        emergencyNotes: body.emergencyNotes !== undefined ? sanitizeBoundedString(body.emergencyNotes, 1000) : undefined,
+        medicalNotes: body.medicalNotes !== undefined ? sanitizeBoundedString(body.medicalNotes, 1000) : undefined,
+        bloodType: body.bloodType !== undefined ? sanitizeBoundedString(body.bloodType, 16) : undefined,
+        preferredLanguage: body.preferredLanguage !== undefined ? sanitizeBoundedString(body.preferredLanguage, 16) : undefined,
+        safetyStatus: body.safetyStatus !== undefined ? String(body.safetyStatus) : undefined,
+        lastKnownLat: body.lastKnownLat === null ? null : typeof body.lastKnownLat === 'number' ? body.lastKnownLat : undefined,
+        lastKnownLng: body.lastKnownLng === null ? null : typeof body.lastKnownLng === 'number' ? body.lastKnownLng : undefined,
+        lastLocationLabel: body.lastLocationLabel !== undefined ? sanitizeBoundedString(body.lastLocationLabel, 240) : undefined,
+        locationSharingConsent:
+          body.locationSharingConsent !== undefined ? Boolean(body.locationSharingConsent) : undefined,
+        theme: body.theme !== undefined ? (body.theme as 'dark' | 'light') : undefined,
+        enableEmailAlerts: body.enableEmailAlerts !== undefined ? Boolean(body.enableEmailAlerts) : undefined,
+        enableSmsAlerts: body.enableSmsAlerts !== undefined ? Boolean(body.enableSmsAlerts) : undefined,
+        enableInAppAlerts: body.enableInAppAlerts !== undefined ? Boolean(body.enableInAppAlerts) : undefined,
+        locationConsentMode: body.locationConsentMode !== undefined ? String(body.locationConsentMode) : undefined,
+        dataRetentionDays: body.dataRetentionDays !== undefined ? Number(body.dataRetentionDays) : undefined,
+        demoModeEnabled: body.demoModeEnabled !== undefined ? Boolean(body.demoModeEnabled) : undefined,
+      };
+
+      const updated = await updateUserProfile(req.appUser!.id, sanitizedPayload);
+      await writeAuditLog({
+        actorUserId: req.appUser!.id,
+        actorEmail: req.appUser!.email,
+        actorRole: req.appUser!.role,
+        action: 'PROFILE_UPDATED',
+        resourceType: 'user_profile',
+        resourceId: String(req.appUser!.id),
+        ipAddress: req.ip,
+      });
+      res.json(updated);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to update profile.' });
+    }
+  });
+
+  app.delete('/api/profile', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      if (req.appUser!.isDemoAccount) {
+        return res.status(400).json({ error: 'Shared demo sandbox accounts cannot be deleted.' });
+      }
+      await writeAuditLog({
+        actorUserId: req.appUser!.id,
+        actorEmail: req.appUser!.email,
+        actorRole: req.appUser!.role,
+        action: 'ACCOUNT_DELETED',
+        resourceType: 'user',
+        resourceId: String(req.appUser!.id),
+        ipAddress: req.ip,
+      });
+      await deleteUserAccount(req.appUser!.id);
+      res.json({ deleted: true });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to delete account.' });
+    }
+  });
+
+  // ========================
+  // TRUSTED CONTACTS
+  // ========================
+  app.get('/api/contacts', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const contacts = await listTrustedContacts(req.appUser!.id);
+      res.json({ contacts });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load contacts.' });
+    }
+  });
+
+  app.post('/api/contacts', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const body = (req.body || {}) as Record<string, unknown>;
+      const name = sanitizeBoundedString(body.name, 80);
+      if (!name) {
+        return res.status(400).json({ error: 'Contact name is required (1 to 80 characters).' });
+      }
+      const emailRaw = sanitizeBoundedString(body.email, 254);
+      if (emailRaw && !isValidEmail(emailRaw)) {
+        return res.status(400).json({ error: 'Contact email address is invalid.' });
+      }
+      const phoneRaw = sanitizeBoundedString(body.phone, 32);
+      if (phoneRaw && !isValidPhone(phoneRaw)) {
+        return res.status(400).json({ error: 'Contact phone number format is invalid.' });
+      }
+
+      const contact = await addTrustedContact(req.appUser!.id, {
+        name,
+        relationship: sanitizeBoundedString(body.relationship, 60) || 'Trusted Contact',
+        email: emailRaw ? normalizeEmail(emailRaw) : '',
+        phone: phoneRaw,
+        notifyEmail: body.notifyEmail !== undefined ? Boolean(body.notifyEmail) : Boolean(emailRaw),
+        notifySms: body.notifySms !== undefined ? Boolean(body.notifySms) : Boolean(phoneRaw),
+        notifyWhatsapp: Boolean(body.notifyWhatsapp),
+        priorityOrder:
+          typeof body.priorityOrder === 'number' && Number.isSafeInteger(body.priorityOrder)
+            ? Math.min(50, Math.max(1, body.priorityOrder))
+            : 1,
+        source: sanitizeBoundedString(body.source, 32) || 'manual',
+      });
+
+      await writeAuditLog({
+        actorUserId: req.appUser!.id,
+        actorEmail: req.appUser!.email,
+        actorRole: req.appUser!.role,
+        action: 'TRUSTED_CONTACT_ADDED',
+        resourceType: 'trusted_contact',
+        resourceId: String(contact.id),
+        ipAddress: req.ip,
+      });
+      res.status(201).json({ contact });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to add contact.' });
+    }
+  });
+
+  app.put('/api/contacts/:id', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const contactId = parsePositiveInt(req.params.id);
+      if (!contactId) {
+        return res.status(400).json({ error: 'Valid contact ID is required.' });
+      }
+      const body = (req.body || {}) as Record<string, unknown>;
+      if (body.email !== undefined && String(body.email).trim() !== '' && !isValidEmail(body.email)) {
+        return res.status(400).json({ error: 'Contact email address is invalid.' });
+      }
+      if (body.phone !== undefined && !isValidPhone(body.phone)) {
+        return res.status(400).json({ error: 'Contact phone number format is invalid.' });
+      }
+
+      const contacts = await updateTrustedContact(req.appUser!.id, contactId, {
+        name: body.name !== undefined ? sanitizeBoundedString(body.name, 80) : undefined,
+        relationship: body.relationship !== undefined ? sanitizeBoundedString(body.relationship, 60) : undefined,
+        email: body.email !== undefined ? sanitizeBoundedString(body.email, 254) : undefined,
+        phone: body.phone !== undefined ? sanitizeBoundedString(body.phone, 32) : undefined,
+        notifyEmail: body.notifyEmail !== undefined ? Boolean(body.notifyEmail) : undefined,
+        notifySms: body.notifySms !== undefined ? Boolean(body.notifySms) : undefined,
+        notifyWhatsapp: body.notifyWhatsapp !== undefined ? Boolean(body.notifyWhatsapp) : undefined,
+      });
+      res.json({ contacts });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to update contact.' });
+    }
+  });
+
+  app.delete('/api/contacts/:id', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const contactId = parsePositiveInt(req.params.id);
+      if (!contactId) {
+        return res.status(400).json({ error: 'Valid contact ID is required.' });
+      }
+      const deleted = await deleteTrustedContact(req.appUser!.id, contactId);
+      if (!deleted) {
+        return res.status(404).json({ error: 'Trusted contact not found.' });
+      }
+      await writeAuditLog({
+        actorUserId: req.appUser!.id,
+        actorEmail: req.appUser!.email,
+        actorRole: req.appUser!.role,
+        action: 'TRUSTED_CONTACT_DELETED',
+        resourceType: 'trusted_contact',
+        resourceId: String(contactId),
+        ipAddress: req.ip,
+      });
+      res.json({ deleted: true });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to remove contact.' });
+    }
+  });
+
+  // ========================
+  // SOS & INCIDENT MANAGEMENT
+  // ========================
+  app.post('/api/incidents/sos', requireAuth, sosLimiter, async (req: AuthRequest, res) => {
+    try {
+      const body = (req.body || {}) as {
+        idempotencyKey?: unknown;
+        clientQueuedAt?: unknown;
+        title?: unknown;
+        description?: unknown;
+        category?: unknown;
+        priority?: unknown;
+        latitude?: unknown;
+        longitude?: unknown;
+        locationLabel?: unknown;
+        locationAccuracyMeters?: unknown;
+        isSimulated?: unknown;
+      };
+
+      let cleanIdempotencyKey: string | null = null;
+      if (body.idempotencyKey !== undefined && body.idempotencyKey !== null && body.idempotencyKey !== '') {
+        if (!isValidIdempotencyKey(body.idempotencyKey)) {
+          return res.status(400).json({ error: 'Invalid idempotencyKey format.' });
+        }
+        cleanIdempotencyKey = body.idempotencyKey.trim();
+      }
+
+      let cleanQueuedAt: string | null = null;
+      if (body.clientQueuedAt !== undefined && body.clientQueuedAt !== null && body.clientQueuedAt !== '') {
+        const parsedDate = new Date(String(body.clientQueuedAt));
+        if (Number.isNaN(parsedDate.getTime())) {
+          return res.status(400).json({ error: 'Invalid clientQueuedAt timestamp.' });
+        }
+        cleanQueuedAt = parsedDate.toISOString();
+      }
+
+      const coordCheck = validateOptionalCoordinates(body.latitude, body.longitude);
+      if (!coordCheck.valid) {
+        return res.status(400).json({ error: coordCheck.error });
+      }
+
+      const priority = body.priority !== undefined ? String(body.priority) : 'CRITICAL';
+      if (!(VALID_PRIORITIES as readonly string[]).includes(priority)) {
+        return res.status(400).json({ error: 'Invalid SOS priority level.' });
+      }
+
+      let cleanAccuracy: number | null = null;
+      if (body.locationAccuracyMeters !== undefined && body.locationAccuracyMeters !== null) {
+        const acc = Number(body.locationAccuracyMeters);
+        if (!Number.isFinite(acc) || acc < 0 || acc > 100_000) {
+          return res.status(400).json({ error: 'locationAccuracyMeters must be a valid non-negative distance.' });
+        }
+        cleanAccuracy = Math.round(acc);
+      }
+
+      const simulatedFlag = Boolean(body.isSimulated || req.appUser!.isDemoAccount);
+      const { incident, deduplicated } = await createIncident({
+        userId: req.appUser!.id,
+        idempotencyKey: cleanIdempotencyKey,
+        clientQueuedAt: cleanQueuedAt,
+        title:
+          sanitizeBoundedString(body.title, 160) ||
+          (simulatedFlag ? '[SIMULATED] Emergency SOS Alert' : 'Emergency SOS Alert'),
+        description: sanitizeBoundedString(body.description, 2000) || 'User activated LIFE-LINE AI SOS.',
+        category: sanitizeBoundedString(body.category, 60) || 'Personal Safety',
+        priority,
+        latitude: coordCheck.latitude,
+        longitude: coordCheck.longitude,
+        locationLabel: sanitizeBoundedString(body.locationLabel, 240) || 'Location shared via browser/device',
+        locationAccuracyMeters: cleanAccuracy,
+        isSimulated: simulatedFlag,
+      });
+
+      if (!incident) {
+        return res.status(500).json({ error: 'Incident creation failed.' });
+      }
+
+      if (deduplicated) {
+        const confirmed = incident.deliveryLogs.filter((l) => l.status === 'delivered' || l.status === 'simulated').length;
+        const failed = incident.deliveryLogs.filter((l) => l.status === 'failed').length;
+        const unconfigured = incident.deliveryLogs.filter((l) => l.status === 'provider_not_configured').length;
+        const dedupSummary: DispatchSummary = {
+          overallDeliveryState: incident.deliveryStatus,
+          operatorRecorded: true,
+          externalConfirmedCount: confirmed,
+          externalFailedCount: failed,
+          externalUnconfiguredCount: unconfigured,
+          truthfulMessage: `Duplicate SOS submission prevented via idempotency key; returning existing Incident #${incident.id}.`,
+          deliveryResults: incident.deliveryLogs.map((l) => ({
+            recipient: l.recipient,
+            channel: l.channel,
+            status: l.status as DispatchSummary['deliveryResults'][number]['status'],
+            provider: l.provider,
+            error: l.errorMessage || undefined,
+          })),
+        };
+        return res.status(200).json({
+          incident: sanitizeIncidentForViewer(incident, req.appUser!.role),
+          deliveryResults: dedupSummary.deliveryResults,
+          deliverySummary: dedupSummary,
+          deduplicated: true,
+        });
+      }
+
+      const contacts = await listTrustedContacts(req.appUser!.id);
+      const operatorIds = await listOperatorUserIds();
+      const googleToken = req.headers['x-google-access-token']
+        ? String(req.headers['x-google-access-token'])
+        : undefined;
+
+      let dispatchSummary: DispatchSummary = {
+        overallDeliveryState: 'submitted',
+        operatorRecorded: operatorIds.length > 0,
+        externalConfirmedCount: 0,
+        externalFailedCount: 0,
+        externalUnconfiguredCount: 0,
+        truthfulMessage: 'Incident submitted to LIFE-LINE AI operator queue.',
+        deliveryResults: [],
+      };
+
+      try {
+        dispatchSummary = await dispatchEmergencyNotifications({
+          senderUserId: req.appUser!.id,
+          incidentId: incident.id,
+          incidentTitle: incident.title,
+          locationLabel: incident.locationLabel,
+          latitude: incident.latitude,
+          longitude: incident.longitude,
+          isSimulated: simulatedFlag,
+          contacts: contacts.map((c) => ({
+            id: c.id,
+            name: c.name,
+            email: c.email,
+            phone: c.phone,
+            notifyEmail: c.notifyEmail,
+            notifySms: c.notifySms,
+          })),
+          googleAccessToken: googleToken,
+          operatorUserIds: operatorIds,
+          onRealtimeNotify: sendRealtimeToUser,
+        });
+      } catch (notifyErr) {
+        const errMsg = notifyErr instanceof Error ? notifyErr.message : 'Notification dispatch error';
+        dispatchSummary = {
+          overallDeliveryState: 'failed',
+          operatorRecorded: operatorIds.length > 0,
+          externalConfirmedCount: 0,
+          externalFailedCount: contacts.length || 1,
+          externalUnconfiguredCount: 0,
+          truthfulMessage: `Incident #${incident.id} recorded, but external notification dispatch failed: ${errMsg}`,
+          deliveryResults: [],
+        };
+      }
+
+      await updateIncidentDeliveryState(incident.id, dispatchSummary.overallDeliveryState);
+
+      const sentIncident = await updateIncidentStatus({
+        incidentId: incident.id,
+        actorUserId: req.appUser!.id,
+        actorRole: req.appUser!.role,
+        newStatus: 'Alert Sent',
+        note: dispatchSummary.truthfulMessage,
+      });
+
+      const finalIncident = sentIncident || incident;
+
+      await writeAuditLog({
+        actorUserId: req.appUser!.id,
+        actorEmail: req.appUser!.email,
+        actorRole: req.appUser!.role,
+        action: simulatedFlag ? 'SIMULATED_SOS_ACTIVATED' : 'SOS_ACTIVATED',
+        resourceType: 'emergency_incident',
+        resourceId: String(finalIncident.id),
+        details: {
+          locationLabel: finalIncident.locationLabel,
+          deliveryStatus: dispatchSummary.overallDeliveryState,
+          externalConfirmedCount: dispatchSummary.externalConfirmedCount,
+          externalFailedCount: dispatchSummary.externalFailedCount,
+          externalUnconfiguredCount: dispatchSummary.externalUnconfiguredCount,
+        },
+        ipAddress: req.ip,
+      });
+
+      const sanitizedForReporter = sanitizeIncidentForViewer(finalIncident, 'regular_user');
+      pushAndBroadcastRealtimeEvent({
+        targetUserId: req.appUser!.id,
+        includeOperators: true,
+        userPayload: { type: 'incident:created', incident: sanitizedForReporter },
+        operatorPayload: { type: 'incident:created', incident: finalIncident },
+      });
+
+      res.status(201).json({
+        incident: sanitizeIncidentForViewer(finalIncident, req.appUser!.role),
+        deliveryResults: dispatchSummary.deliveryResults,
+        deliverySummary: dispatchSummary,
+        deduplicated: false,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to activate SOS.' });
+    }
+  });
+
+  app.get('/api/incidents', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const incidents = await listIncidentsForUser(req.appUser!.id, req.appUser!.role);
+      res.json({ incidents });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load incidents.' });
+    }
+  });
+
+  app.get(
+    '/api/operator/incidents',
+    requireAuth,
+    requireRole(OPERATOR_ROLES),
+    async (_req, res) => {
+      try {
+        const incidents = await listAllIncidentsForOperator();
+        res.json({ incidents });
+      } catch (err) {
+        res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load operator queue.' });
+      }
+    }
+  );
+
+  app.patch('/api/incidents/:id/status', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const incidentId = parsePositiveInt(req.params.id);
+      if (!incidentId) {
+        return res.status(400).json({ error: 'Valid incident ID is required.' });
+      }
+
+      const existing = await getIncidentById(incidentId);
+      if (!existing) return res.status(404).json({ error: 'Incident not found.' });
+
+      const { status, note, priority, isInternal } = req.body as {
+        status?: unknown;
+        note?: unknown;
+        priority?: unknown;
+        isInternal?: unknown;
+      };
+
+      if (typeof status !== 'string' || !(VALID_INCIDENT_STATUSES as readonly string[]).includes(status)) {
+        return res.status(400).json({ error: 'Invalid emergency status.' });
+      }
+      if (priority !== undefined && !(VALID_PRIORITIES as readonly string[]).includes(String(priority))) {
+        return res.status(400).json({ error: 'Invalid priority level.' });
+      }
+
+      const isOperator = OPERATOR_ROLES.includes(req.appUser!.role);
+      const isOwner = existing.userId === req.appUser!.id;
+
+      if (!isOperator && !isOwner) {
+        return res.status(403).json({ error: 'Forbidden: You cannot modify this incident.' });
+      }
+      if (!isOperator && !['Cancelled', 'Resolved'].includes(status)) {
+        return res.status(403).json({ error: 'Only authorized operators can acknowledge or advance responder states.' });
+      }
+
+      const updated = await updateIncidentStatus({
+        incidentId,
+        actorUserId: req.appUser!.id,
+        actorRole: req.appUser!.role,
+        newStatus: status,
+        note: sanitizeBoundedString(note, 1000) || undefined,
+        priority: isOperator && priority !== undefined ? String(priority) : undefined,
+        isInternal: isOperator ? Boolean(isInternal) : false,
+      });
+
+      if (!updated) {
+        return res.status(404).json({ error: 'Incident not found after update.' });
+      }
+
+      await writeAuditLog({
+        actorUserId: req.appUser!.id,
+        actorEmail: req.appUser!.email,
+        actorRole: req.appUser!.role,
+        action: 'INCIDENT_STATUS_UPDATED',
+        resourceType: 'emergency_incident',
+        resourceId: String(incidentId),
+        details: { previousStatus: existing.status, newStatus: status, isInternal: isOperator ? Boolean(isInternal) : false },
+        ipAddress: req.ip,
+      });
+
+      const sanitizedForReporter = sanitizeIncidentForViewer(updated, 'regular_user');
+      pushAndBroadcastRealtimeEvent({
+        targetUserId: existing.userId,
+        includeOperators: true,
+        userPayload: { type: 'incident:updated', incident: sanitizedForReporter },
+        operatorPayload: { type: 'incident:updated', incident: updated },
+      });
+
+      res.json({ incident: sanitizeIncidentForViewer(updated, req.appUser!.role) });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to update incident.' });
+    }
+  });
+
+  // ========================
+  // SUPPORT DIRECTORY & GOOGLE MAPS PROXY
+  // ========================
+  app.get('/api/support-directory', async (req, res) => {
+    try {
+      const category = req.query.category ? sanitizeBoundedString(req.query.category, 64) : undefined;
+      const query = req.query.q ? sanitizeBoundedString(req.query.q, 120) : undefined;
+      const resources = await listSupportDirectory(category, query);
+      res.json({ resources });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load support directory.' });
+    }
+  });
+
+  app.post('/api/maps/nearby-support', mapsLimiter, async (req, res) => {
+    const { latitude, longitude, radiusMeters = 5000, includedTypes = ['hospital', 'police', 'pharmacy'] } = req.body as {
+      latitude?: unknown;
+      longitude?: unknown;
+      radiusMeters?: unknown;
+      includedTypes?: unknown;
     };
-    if (!concern || !concern.trim()) {
-      return res.status(400).json({ error: 'Please provide a safety concern or route question.' });
+
+    if (!isValidLatitude(latitude) || !isValidLongitude(longitude)) {
+      return res.status(400).json({ error: 'Valid finite latitude (-90..90) and longitude (-180..180) are required.' });
     }
-    const intelligence = await runSafetyIntelligenceAgent({
-      concern: concern.trim(),
-      areaLabel,
-      timeContext,
-      useSearchGrounding: Boolean(useSearchGrounding),
-    });
 
-    await saveAiAssessment({
-      userId: req.appUser!.id,
-      agentName: 'Safety Intelligence Agent',
-      modelUsed: intelligence.modelUsed,
-      inputSummary: concern.trim(),
-      urgencyLevel: 'ADVISORY',
-      classification: 'Contextual Safety Guidance',
-      assignedPriority: 'MEDIUM',
-      confidenceScore: 0.78,
-      rationale: String(intelligence.summary || ''),
-      missingInfoQuestions: [],
-      uncertaintyNotes: String(intelligence.uncertaintyDisclosure || ''),
-      escalateToHuman: false,
-      rawStructuredOutput: intelligence as unknown as Record<string, unknown>,
-      recommendations: (Array.isArray(intelligence.recommendations) ? intelligence.recommendations : []).map(
-        (rec: { title: string; detail: string }) => ({
-          title: rec.title,
-          text: rec.detail,
-          category: 'Safety Intelligence',
-          sourceCitation: intelligence.modelUsed,
-        })
-      ),
-    });
+    const radius = typeof radiusMeters === 'number' && Number.isFinite(radiusMeters)
+      ? Math.min(Math.max(Math.round(radiusMeters), 500), 25000)
+      : 5000;
 
-    res.json({ intelligence });
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Safety intelligence analysis failed.' });
-  }
-});
+    const cleanTypes = Array.isArray(includedTypes)
+      ? includedTypes.filter((t): t is string => typeof t === 'string' && ALLOWED_MAP_PLACE_TYPES.has(t)).slice(0, 8)
+      : ['hospital', 'police', 'pharmacy'];
+    if (cleanTypes.length === 0) {
+      return res.status(400).json({ error: 'At least one supported place type is required.' });
+    }
 
-app.post('/api/ai/discover-resources', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const { query, latitude, longitude } = req.body as {
-      query?: string;
-      latitude?: number;
-      longitude?: number;
+    const mapsKey = getServerMapsApiKey();
+    if (!mapsKey) {
+      return res.status(503).json({ error: 'Google Maps Places proxy key is not configured on server.' });
+    }
+
+    try {
+      const resp = await fetch('https://places.googleapis.com/v1/places:searchNearby', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Goog-Api-Key': mapsKey,
+          'X-Goog-Maps-Solution-ID': MAPS_ATTRIBUTION_ID,
+          'X-Goog-FieldMask':
+            'places.id,places.displayName,places.formattedAddress,places.location,places.types,places.nationalPhoneNumber,places.regularOpeningHours.openNow,places.googleMapsUri',
+        },
+        body: JSON.stringify({
+          includedTypes: cleanTypes,
+          maxResultCount: 10,
+          locationRestriction: {
+            circle: {
+              center: { latitude, longitude },
+              radius,
+            },
+          },
+        }),
+        signal: AbortSignal.timeout(8000),
+      });
+
+      const data = (await resp.json().catch(() => ({}))) as {
+        places?: unknown[];
+        error?: { status?: string; message?: string };
+      };
+      if (!resp.ok) {
+        if (resp.status === 429 || data?.error?.status === 'RESOURCE_EXHAUSTED') {
+          return res.status(429).json({
+            error: { status: 'RESOURCE_EXHAUSTED', message: 'Google Places quota temporarily reached.' },
+          });
+        }
+        return res.status(resp.status >= 400 && resp.status < 500 ? resp.status : 502).json({
+          error: data?.error?.message || 'Google Places API returned an error.',
+        });
+      }
+      res.json({ places: data.places || [], source: 'Google Places API (New)', retrievedAt: new Date().toISOString() });
+    } catch (err) {
+      const isTimeout = err instanceof Error && /timeout|abort/i.test(err.message);
+      res.status(isTimeout ? 504 : 502).json({
+        error: isTimeout ? 'Google Places API request timed out.' : 'Failed to query Google Places API.',
+      });
+    }
+  });
+
+  app.post('/api/maps/search-places', mapsLimiter, async (req, res) => {
+    const { textQuery, latitude, longitude } = req.body as {
+      textQuery?: unknown;
+      latitude?: unknown;
+      longitude?: unknown;
     };
-    if (!query || !query.trim()) {
-      return res.status(400).json({ error: 'Search query is required for resource discovery.' });
+    const cleanQuery = sanitizeBoundedString(textQuery, 200);
+    if (!cleanQuery) {
+      return res.status(400).json({ error: 'Search query (1 to 200 characters) is required.' });
     }
-    const discovery = await runResourceDiscoveryAgent({
-      query: query.trim(),
-      latitude,
-      longitude,
-    });
-    res.json({ discovery });
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Resource discovery agent failed.' });
-  }
-});
 
-app.post('/api/ai/coordinate', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const { incidentTitle, incidentDescription, incidentStatus, locationLabel } = req.body as {
-      incidentTitle?: string;
-      incidentDescription?: string;
-      incidentStatus?: string;
-      locationLabel?: string;
-    };
-    const contacts = await listTrustedContacts(req.appUser!.id);
-    const coordination = await runEmergencyCoordinationAgent({
-      incidentTitle: incidentTitle || 'Active Safety Check-In',
-      incidentDescription: incidentDescription || 'Preparing coordinated emergency workflow.',
-      incidentStatus: incidentStatus || 'SOS Activated',
-      locationLabel: locationLabel || 'Current location',
-      trustedContactsCount: contacts.length,
-    });
-    res.json({ coordination });
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Coordination agent failed.' });
-  }
-});
-
-app.post('/api/ai/assistant', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const { history, message, fastMode } = req.body as {
-      history?: Array<{ role: 'user' | 'model'; text: string }>;
-      message?: string;
-      fastMode?: boolean;
-    };
-    if (!message || !message.trim()) {
-      return res.status(400).json({ error: 'Message is required.' });
+    const coordCheck = validateOptionalCoordinates(latitude, longitude);
+    if (!coordCheck.valid) {
+      return res.status(400).json({ error: coordCheck.error });
     }
-    const reply = await runSupportAssistantChat({
-      history: Array.isArray(history) ? history : [],
-      message: message.trim(),
-      fastMode: Boolean(fastMode),
-    });
-    res.json(reply);
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Assistant request failed.' });
-  }
-});
 
-app.post('/api/ai/transcribe', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const { audioBase64, mimeType } = req.body as { audioBase64?: string; mimeType?: string };
-    if (!audioBase64 || !mimeType) {
-      return res.status(400).json({ error: 'Audio payload and mimeType are required.' });
+    const mapsKey = getServerMapsApiKey();
+    if (!mapsKey) {
+      return res.status(503).json({ error: 'Google Maps Places proxy key is not configured on server.' });
     }
-    const result = await transcribeAudioNote(audioBase64, mimeType);
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Audio transcription failed.' });
-  }
-});
 
-app.post('/api/ai/tts', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const { text, voiceName } = req.body as { text?: string; voiceName?: string };
-    if (!text || !text.trim()) {
-      return res.status(400).json({ error: 'Text is required for speech synthesis.' });
+    try {
+      const body: Record<string, unknown> = {
+        textQuery: cleanQuery,
+        maxResultCount: 10,
+      };
+      if (coordCheck.latitude !== null && coordCheck.longitude !== null) {
+        body.locationBias = {
+          circle: {
+            center: { latitude: coordCheck.latitude, longitude: coordCheck.longitude },
+            radius: 15000,
+          },
+        };
+      }
+
+      const resp = await fetch('https://places.googleapis.com/v1/places:searchText', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Goog-Api-Key': mapsKey,
+          'X-Goog-Maps-Solution-ID': MAPS_ATTRIBUTION_ID,
+          'X-Goog-FieldMask':
+            'places.id,places.displayName,places.formattedAddress,places.location,places.types,places.nationalPhoneNumber,places.regularOpeningHours.openNow,places.googleMapsUri',
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(8000),
+      });
+
+      const data = (await resp.json().catch(() => ({}))) as {
+        places?: unknown[];
+        error?: { status?: string; message?: string };
+      };
+      if (!resp.ok) {
+        if (resp.status === 429 || data?.error?.status === 'RESOURCE_EXHAUSTED') {
+          return res.status(429).json({
+            error: { status: 'RESOURCE_EXHAUSTED', message: 'Google Places search quota temporarily reached.' },
+          });
+        }
+        return res.status(resp.status >= 400 && resp.status < 500 ? resp.status : 502).json({
+          error: data?.error?.message || 'Google Places search failed.',
+        });
+      }
+      res.json({ places: data.places || [], source: 'Google Places API (New)', retrievedAt: new Date().toISOString() });
+    } catch (err) {
+      const isTimeout = err instanceof Error && /timeout|abort/i.test(err.message);
+      res.status(isTimeout ? 504 : 502).json({
+        error: isTimeout ? 'Places search timed out.' : 'Places search failed.',
+      });
     }
-    const audio = await synthesizeSafetyGuidanceSpeech(text.trim(), voiceName || 'Kore');
-    res.json(audio);
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Voice readout failed.' });
-  }
-});
+  });
 
-app.get('/api/ai/recommendations', requireAuth, async (req: AuthRequest, res) => {
-  const recommendations = await listAiRecommendationsForUser(req.appUser!.id);
-  res.json({ recommendations });
-});
+  app.get('/api/maps/geocode', mapsLimiter, async (req, res) => {
+    const address = req.query.address ? sanitizeBoundedString(req.query.address, 250) : '';
+    const latlng = req.query.latlng ? sanitizeBoundedString(req.query.latlng, 64) : '';
+    if (!address && !latlng) {
+      return res.status(400).json({ error: 'Provide address or latlng parameter.' });
+    }
+    if (latlng) {
+      const parts = latlng.split(',').map((p) => Number(p.trim()));
+      if (parts.length !== 2 || !isValidLatitude(parts[0]) || !isValidLongitude(parts[1])) {
+        return res.status(400).json({ error: 'latlng must be formatted as "latitude,longitude".' });
+      }
+    }
 
-// ========================
-// NOTIFICATIONS, ANALYTICS & ADMIN
-// ========================
-app.get('/api/notifications', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const items = await listNotificationsForUser(req.appUser!.id);
-    res.json({ notifications: items });
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load notifications.' });
-  }
-});
+    const mapsKey = getServerMapsApiKey();
+    if (!mapsKey) {
+      return res.status(503).json({ error: 'Geocoding API key is not configured.' });
+    }
 
-app.patch('/api/notifications/:id/read', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    await markNotificationRead(req.appUser!.id, Number(req.params.id));
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to update notification.' });
-  }
-});
+    try {
+      const url = new URL('https://maps.googleapis.com/maps/api/geocode/json');
+      if (address) url.searchParams.set('address', address);
+      if (latlng) url.searchParams.set('latlng', latlng);
+      url.searchParams.set('key', mapsKey);
 
-app.get('/api/analytics', requireAuth, async (_req, res) => {
-  try {
-    const analytics = await getOperationalAnalytics();
-    res.json(analytics);
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load analytics.' });
-  }
-});
+      const resp = await fetch(url.toString(), {
+        headers: { 'X-Goog-Maps-Solution-ID': MAPS_ATTRIBUTION_ID },
+        signal: AbortSignal.timeout(8000),
+      });
+      const data = (await resp.json().catch(() => ({}))) as {
+        status?: string;
+        results?: unknown[];
+        error_message?: string;
+      };
+      if (data.status === 'OVER_QUERY_LIMIT') {
+        return res.status(429).json({
+          error: { status: 'RESOURCE_EXHAUSTED', message: data.error_message || 'Geocoding quota exceeded.' },
+        });
+      }
+      if (!resp.ok) {
+        return res.status(502).json({ error: 'Geocoding upstream service error.' });
+      }
+      res.json({ status: data.status, results: data.results || [] });
+    } catch (err) {
+      const isTimeout = err instanceof Error && /timeout|abort/i.test(err.message);
+      res.status(isTimeout ? 504 : 502).json({
+        error: isTimeout ? 'Geocoding request timed out.' : 'Geocoding failed.',
+      });
+    }
+  });
 
-app.get(
-  '/api/admin/audit-logs',
-  requireAuth,
-  requireRole(['administrator', 'emergency_operator']),
-  async (_req, res) => {
-    const logs = await listAuditLogs(80);
-    res.json({ logs });
-  }
-);
+  // ========================
+  // AGENTIC AI ENGINE (5 AGENTS + TRANSCRIBE + TTS)
+  // ========================
+  app.post('/api/ai/assess-emergency', requireAuth, aiLimiter, async (req: AuthRequest, res) => {
+    try {
+      const { description, locationLabel, incidentId, imageBase64, imageMimeType } = req.body as {
+        description?: unknown;
+        locationLabel?: unknown;
+        incidentId?: unknown;
+        imageBase64?: unknown;
+        imageMimeType?: unknown;
+      };
+      const cleanDesc = sanitizeBoundedString(description, 4000);
+      if (!cleanDesc) {
+        return res.status(400).json({ error: 'Please describe the situation for emergency assessment.' });
+      }
 
-app.get(
-  '/api/admin/users',
-  requireAuth,
-  requireRole(['administrator']),
-  async (_req, res) => {
+      let verifiedIncidentId: number | null = null;
+      if (incidentId !== undefined && incidentId !== null) {
+        const parsedId = parsePositiveInt(incidentId);
+        if (!parsedId) return res.status(400).json({ error: 'Invalid incidentId.' });
+        const inc = await getIncidentById(parsedId);
+        if (!inc) return res.status(404).json({ error: 'Referenced incident not found.' });
+        if (inc.userId !== req.appUser!.id && !OPERATOR_ROLES.includes(req.appUser!.role)) {
+          return res.status(403).json({ error: 'Forbidden: Cannot attach assessment to this incident.' });
+        }
+        verifiedIncidentId = parsedId;
+      }
+
+      const assessment = await runEmergencyAssessmentAgent({
+        description: cleanDesc,
+        locationLabel: sanitizeBoundedString(locationLabel, 240) || undefined,
+        imageBase64: typeof imageBase64 === 'string' && imageBase64.length <= 8_000_000 ? imageBase64 : undefined,
+        imageMimeType: typeof imageMimeType === 'string' ? sanitizeBoundedString(imageMimeType, 64) : undefined,
+      });
+
+      await saveAiAssessment({
+        incidentId: verifiedIncidentId,
+        userId: req.appUser!.id,
+        agentName: 'Emergency Assessment Agent',
+        modelUsed: assessment.modelUsed,
+        inputSummary: cleanDesc,
+        urgencyLevel: String(assessment.urgencyLevel || 'HIGH'),
+        classification: String(assessment.classification || 'Safety Concern'),
+        assignedPriority: String(assessment.recommendedPriority || 'HIGH'),
+        confidenceScore: Number(assessment.confidenceScore ?? 0.7),
+        rationale: String(assessment.rationale || ''),
+        missingInfoQuestions: Array.isArray(assessment.missingInfoQuestions) ? assessment.missingInfoQuestions : [],
+        uncertaintyNotes: String(assessment.uncertaintyNotes || ''),
+        escalateToHuman: Boolean(assessment.escalateToHumanOperator),
+        rawStructuredOutput: assessment as unknown as Record<string, unknown>,
+        recommendations: (Array.isArray(assessment.immediateSteps) ? assessment.immediateSteps : []).map(
+          (step: string, idx: number) => ({
+            title: `Immediate Step ${idx + 1}`,
+            text: step,
+            category: 'Emergency Triage',
+            sourceCitation: `${assessment.modelUsed} (${assessment.verificationStatus})`,
+          })
+        ),
+      });
+
+      res.json({ assessment });
+    } catch (err) {
+      if (err instanceof GeminiServiceError) {
+        return res.status(err.statusCode).json({ error: err.message, reason: err.reason });
+      }
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Emergency assessment failed.' });
+    }
+  });
+
+  app.post('/api/ai/safety-intelligence', requireAuth, aiLimiter, async (req: AuthRequest, res) => {
+    try {
+      const { concern, areaLabel, timeContext, useSearchGrounding } = req.body as {
+        concern?: unknown;
+        areaLabel?: unknown;
+        timeContext?: unknown;
+        useSearchGrounding?: unknown;
+      };
+      const cleanConcern = sanitizeBoundedString(concern, 2000);
+      if (!cleanConcern) {
+        return res.status(400).json({ error: 'Please provide a safety concern or route question.' });
+      }
+      const intelligence = await runSafetyIntelligenceAgent({
+        concern: cleanConcern,
+        areaLabel: sanitizeBoundedString(areaLabel, 200) || undefined,
+        timeContext: sanitizeBoundedString(timeContext, 100) || undefined,
+        useSearchGrounding: Boolean(useSearchGrounding),
+      });
+
+      await saveAiAssessment({
+        userId: req.appUser!.id,
+        agentName: 'Safety Intelligence Agent',
+        modelUsed: intelligence.modelUsed,
+        inputSummary: cleanConcern,
+        urgencyLevel: 'ADVISORY',
+        classification: 'Contextual Safety Guidance',
+        assignedPriority: 'MEDIUM',
+        confidenceScore: 0.78,
+        rationale: String(intelligence.summary || ''),
+        missingInfoQuestions: [],
+        uncertaintyNotes: String(intelligence.uncertaintyDisclosure || ''),
+        escalateToHuman: false,
+        rawStructuredOutput: intelligence as unknown as Record<string, unknown>,
+        recommendations: (Array.isArray(intelligence.recommendations) ? intelligence.recommendations : []).map(
+          (rec: { title: string; detail: string }) => ({
+            title: rec.title,
+            text: rec.detail,
+            category: 'Safety Intelligence',
+            sourceCitation: `${intelligence.modelUsed} (${intelligence.verificationStatus})`,
+          })
+        ),
+      });
+
+      res.json({ intelligence });
+    } catch (err) {
+      if (err instanceof GeminiServiceError) {
+        return res.status(err.statusCode).json({ error: err.message, reason: err.reason });
+      }
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Safety intelligence analysis failed.' });
+    }
+  });
+
+  app.post('/api/ai/discover-resources', requireAuth, aiLimiter, async (req: AuthRequest, res) => {
+    try {
+      const { query, latitude, longitude } = req.body as {
+        query?: unknown;
+        latitude?: unknown;
+        longitude?: unknown;
+      };
+      const cleanQuery = sanitizeBoundedString(query, 300);
+      if (!cleanQuery) {
+        return res.status(400).json({ error: 'Search query is required for resource discovery.' });
+      }
+      const coordCheck = validateOptionalCoordinates(latitude, longitude);
+      if (!coordCheck.valid) {
+        return res.status(400).json({ error: coordCheck.error });
+      }
+
+      const discovery = await runResourceDiscoveryAgent({
+        query: cleanQuery,
+        latitude: coordCheck.latitude ?? undefined,
+        longitude: coordCheck.longitude ?? undefined,
+      });
+      res.json({ discovery });
+    } catch (err) {
+      if (err instanceof GeminiServiceError) {
+        return res.status(err.statusCode).json({ error: err.message, reason: err.reason });
+      }
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Resource discovery agent failed.' });
+    }
+  });
+
+  app.post('/api/ai/coordinate', requireAuth, aiLimiter, async (req: AuthRequest, res) => {
+    try {
+      const { incidentTitle, incidentDescription, incidentStatus, locationLabel } = req.body as {
+        incidentTitle?: unknown;
+        incidentDescription?: unknown;
+        incidentStatus?: unknown;
+        locationLabel?: unknown;
+      };
+      const contacts = await listTrustedContacts(req.appUser!.id);
+      const coordination = await runEmergencyCoordinationAgent({
+        incidentTitle: sanitizeBoundedString(incidentTitle, 160) || 'Active Safety Check-In',
+        incidentDescription: sanitizeBoundedString(incidentDescription, 2000) || 'Preparing coordinated emergency workflow.',
+        incidentStatus: sanitizeBoundedString(incidentStatus, 60) || 'SOS Activated',
+        locationLabel: sanitizeBoundedString(locationLabel, 200) || 'Current location',
+        trustedContactsCount: contacts.length,
+      });
+      res.json({ coordination });
+    } catch (err) {
+      if (err instanceof GeminiServiceError) {
+        return res.status(err.statusCode).json({ error: err.message, reason: err.reason });
+      }
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Coordination agent failed.' });
+    }
+  });
+
+  app.post('/api/ai/assistant', requireAuth, aiLimiter, async (req: AuthRequest, res) => {
+    try {
+      const { history, message, fastMode } = req.body as {
+        history?: unknown;
+        message?: unknown;
+        fastMode?: unknown;
+      };
+      const cleanMessage = sanitizeBoundedString(message, 2000);
+      if (!cleanMessage) {
+        return res.status(400).json({ error: 'Message is required.' });
+      }
+      const cleanHistory = Array.isArray(history)
+        ? history
+            .filter(
+              (h): h is { role: 'user' | 'model'; text: string } =>
+                Boolean(h) &&
+                (h.role === 'user' || h.role === 'model') &&
+                typeof h.text === 'string' &&
+                h.text.trim().length > 0
+            )
+            .slice(-20)
+            .map((h) => ({ role: h.role, text: h.text.slice(0, 2000) }))
+        : [];
+      const reply = await runSupportAssistantChat({
+        history: cleanHistory,
+        message: cleanMessage,
+        fastMode: Boolean(fastMode),
+      });
+      res.json(reply);
+    } catch (err) {
+      if (err instanceof GeminiServiceError) {
+        return res.status(err.statusCode).json({ error: err.message, reason: err.reason });
+      }
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Assistant request failed.' });
+    }
+  });
+
+  app.post('/api/ai/transcribe', requireAuth, aiLimiter, async (req: AuthRequest, res) => {
+    try {
+      const { audioBase64, mimeType } = req.body as { audioBase64?: unknown; mimeType?: unknown };
+      if (
+        typeof audioBase64 !== 'string' ||
+        !audioBase64 ||
+        audioBase64.length > 10_000_000 ||
+        typeof mimeType !== 'string' ||
+        !mimeType
+      ) {
+        return res.status(400).json({ error: 'Valid audio payload and mimeType are required.' });
+      }
+      const result = await transcribeAudioNote(audioBase64, sanitizeBoundedString(mimeType, 64));
+      res.json(result);
+    } catch (err) {
+      if (err instanceof GeminiServiceError) {
+        return res.status(err.statusCode).json({ error: err.message, reason: err.reason });
+      }
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Audio transcription failed.' });
+    }
+  });
+
+  app.post('/api/ai/tts', requireAuth, aiLimiter, async (req: AuthRequest, res) => {
+    try {
+      const { text, voiceName } = req.body as { text?: unknown; voiceName?: unknown };
+      const cleanText = sanitizeBoundedString(text, 1000);
+      if (!cleanText) {
+        return res.status(400).json({ error: 'Text is required for speech synthesis.' });
+      }
+      const audio = await synthesizeSafetyGuidanceSpeech(cleanText, sanitizeBoundedString(voiceName, 32) || 'Kore');
+      res.json(audio);
+    } catch (err) {
+      if (err instanceof GeminiServiceError) {
+        return res.status(err.statusCode).json({ error: err.message, reason: err.reason });
+      }
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Voice readout failed.' });
+    }
+  });
+
+  app.get('/api/ai/recommendations', requireAuth, async (req: AuthRequest, res) => {
+    const recommendations = await listAiRecommendationsForUser(req.appUser!.id);
+    res.json({ recommendations });
+  });
+
+  // ========================
+  // NOTIFICATIONS, ANALYTICS & ADMIN
+  // ========================
+  app.get('/api/notifications', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const items = await listNotificationsForUser(req.appUser!.id);
+      res.json({ notifications: items });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load notifications.' });
+    }
+  });
+
+  app.patch('/api/notifications/:id/read', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const notifId = parsePositiveInt(req.params.id);
+      if (!notifId) {
+        return res.status(400).json({ error: 'Valid notification ID is required.' });
+      }
+      const updated = await markNotificationRead(req.appUser!.id, notifId);
+      if (!updated) {
+        return res.status(404).json({ error: 'Notification not found.' });
+      }
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to update notification.' });
+    }
+  });
+
+  app.get('/api/analytics', requireAuth, requireRole(OPERATOR_ROLES), async (_req, res) => {
+    try {
+      const analytics = await getOperationalAnalytics();
+      res.json(analytics);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load analytics.' });
+    }
+  });
+
+  app.get(
+    '/api/admin/audit-logs',
+    requireAuth,
+    requireRole(['administrator', 'emergency_operator']),
+    async (_req, res) => {
+      const logs = await listAuditLogs(80);
+      res.json({ logs });
+    }
+  );
+
+  app.get('/api/admin/users', requireAuth, requireRole(['administrator']), async (_req, res) => {
     const users = await listAllUsersForAdmin();
     res.json({ users });
-  }
-);
+  });
 
-app.patch(
-  '/api/admin/users/:id/role',
-  requireAuth,
-  requireRole(['administrator']),
-  async (req: AuthRequest, res) => {
-    const targetId = Number(req.params.id);
-    const { role } = req.body as { role?: UserRole };
-    const validRoles: UserRole[] = ['regular_user', 'emergency_operator', 'support_organization', 'administrator'];
-    if (!role || !validRoles.includes(role)) {
-      return res.status(400).json({ error: 'Invalid role.' });
+  app.patch('/api/admin/users/:id/role', requireAuth, requireRole(['administrator']), async (req: AuthRequest, res) => {
+    try {
+      const targetId = parsePositiveInt(req.params.id);
+      if (!targetId) {
+        return res.status(400).json({ error: 'Valid target user ID is required.' });
+      }
+      const { role } = req.body as { role?: unknown };
+      if (typeof role !== 'string' || !(VALID_USER_ROLES as readonly string[]).includes(role)) {
+        return res.status(400).json({ error: 'Invalid role.' });
+      }
+      const updated = await updateUserRole(targetId, role as UserRole);
+      if (!updated) return res.status(404).json({ error: 'User not found.' });
+
+      await writeAuditLog({
+        actorUserId: req.appUser!.id,
+        actorEmail: req.appUser!.email,
+        actorRole: req.appUser!.role,
+        action: 'USER_ROLE_CHANGED',
+        resourceType: 'user',
+        resourceId: String(targetId),
+        details: { newRole: role },
+        ipAddress: req.ip,
+      });
+      res.json({ user: updated });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to update user role.' });
     }
-    const updated = await updateUserRole(targetId, role);
-    if (!updated) return res.status(404).json({ error: 'User not found.' });
-    await writeAuditLog({
-      actorUserId: req.appUser!.id,
-      actorEmail: req.appUser!.email,
-      actorRole: req.appUser!.role,
-      action: 'USER_ROLE_CHANGED',
-      resourceType: 'user',
-      resourceId: String(targetId),
-      details: { newRole: role },
-    });
-    res.json({ user: updated });
-  }
-);
+  });
 
-// ========================
-// HTTP SERVER + VITE / STATIC + WEBSOCKETS
-// ========================
-async function startServer() {
+  // ========================
+  // HTTP SERVER + VITE / STATIC + HARDENED WEBSOCKETS
+  // ========================
   const httpServer = http.createServer(app);
   const wssRealtime = new WebSocketServer({ noServer: true });
   const wssLive = new WebSocketServer({ noServer: true });
 
   wssRealtime.on('connection', async (ws, req) => {
-    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-    const token = url.searchParams.get('token') || '';
-    let resolvedUser: { id: number; role: UserRole } | null = null;
-
-    if (token.startsWith('ll_')) {
-      const decoded = verifyAppToken(token);
-      if (decoded) {
-        const u = await getUserById(decoded.userId);
-        if (u) resolvedUser = { id: u.id, role: u.role };
-      }
-    } else if (token) {
-      try {
-        const decodedFirebase = await adminAuth.verifyIdToken(token);
-        const u = await getOrCreateUserByFirebase(
-          decodedFirebase.uid,
-          decodedFirebase.email || `${decodedFirebase.uid}@firebase.user`,
-          decodedFirebase.name || '',
-          Boolean(decodedFirebase.email_verified)
-        );
-        resolvedUser = { id: u.id, role: u.role };
-      } catch {
-        resolvedUser = null;
-      }
-    }
+    const token = extractWsToken(req);
+    const resolvedUser = await resolveUserFromToken(token);
 
     if (!resolvedUser) {
       ws.close(1008, 'Authentication required');
+      return;
+    }
+
+    if (realtimeClients.size >= MAX_REALTIME_TOTAL) {
+      ws.close(1013, 'Realtime server capacity reached');
+      return;
+    }
+    let userSocketCount = 0;
+    for (const c of realtimeClients) {
+      if (c.userId === resolvedUser.id) userSocketCount++;
+    }
+    if (userSocketCount >= MAX_REALTIME_PER_USER) {
+      ws.close(1008, 'Per-user realtime connection limit exceeded');
       return;
     }
 
@@ -1030,32 +1630,100 @@ async function startServer() {
       ws,
       userId: resolvedUser.id,
       role: resolvedUser.role,
+      isAlive: true,
     };
     realtimeClients.add(clientEntry);
-    ws.send(JSON.stringify({ type: 'realtime:connected', role: resolvedUser.role }));
+
+    ws.on('pong', () => {
+      clientEntry.isAlive = true;
+    });
+
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString()) as { type?: string };
+        if (msg.type === 'ping') {
+          clientEntry.isAlive = true;
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
+          }
+        }
+      } catch {
+        // ignore non-JSON frames
+      }
+    });
+
+    ws.send(
+      JSON.stringify({
+        type: 'realtime:connected',
+        role: resolvedUser.role,
+        latestSeq: currentEventSeq,
+      })
+    );
+
+    // Missed-event recovery when reconnecting with ?since=<seq>
+    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    const sinceParam = url.searchParams.get('since');
+    if (sinceParam && /^\d+$/.test(sinceParam)) {
+      const sinceSeq = Number(sinceParam);
+      const isOperator = OPERATOR_ROLES.includes(resolvedUser.role);
+      for (const ev of eventReplayBuffer) {
+        if (ev.seq <= sinceSeq) continue;
+        if (ev.includeOperators && isOperator) {
+          ws.send(JSON.stringify(ev.operatorPayload));
+        } else if (ev.targetUserId === resolvedUser.id) {
+          ws.send(JSON.stringify(ev.userPayload));
+        }
+      }
+    }
 
     ws.on('close', () => {
       realtimeClients.delete(clientEntry);
     });
   });
 
-  wssLive.on('connection', async (clientWs) => {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+  wssLive.on('connection', async (clientWs, req) => {
+    const token = extractWsToken(req);
+    const resolvedUser = await resolveUserFromToken(token);
+    if (!resolvedUser) {
+      clientWs.close(1008, 'Authentication required');
+      return;
+    }
+
+    if (liveClients.size >= MAX_LIVE_TOTAL) {
+      clientWs.close(1013, 'Voice companion capacity reached');
+      return;
+    }
+    let userLiveCount = 0;
+    for (const c of liveClients) {
+      if (c.userId === resolvedUser.id) userLiveCount++;
+    }
+    if (userLiveCount >= MAX_LIVE_PER_USER) {
+      clientWs.close(1008, 'Per-user live voice session limit exceeded');
+      return;
+    }
+
+    const liveEntry = { ws: clientWs, userId: resolvedUser.id, isAlive: true };
+    liveClients.add(liveEntry);
+    clientWs.on('pong', () => {
+      liveEntry.isAlive = true;
+    });
+
+    if (!isGeminiConfigured()) {
       clientWs.send(JSON.stringify({ error: 'Gemini Live API key is not configured on the server.' }));
-      clientWs.close();
+      liveClients.delete(liveEntry);
+      clientWs.close(1008, 'Gemini API key unavailable');
       return;
     }
 
     const ai = new GoogleGenAI({
-      apiKey,
+      apiKey: process.env.GEMINI_API_KEY!,
       httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
     });
 
     let session: Awaited<ReturnType<typeof ai.live.connect>> | null = null;
     try {
       session = await ai.live.connect({
-        model: 'gemini-3.8-live',
+        model: GEMINI_MODELS.live,
         config: {
           responseModalities: [Modality.AUDIO],
           inputAudioTranscription: {},
@@ -1068,6 +1736,7 @@ async function startServer() {
         },
         callbacks: {
           onmessage: (message: LiveServerMessage) => {
+            if (clientWs.readyState !== WebSocket.OPEN) return;
             const content = message.serverContent;
             if (content?.inputTranscription?.text) {
               clientWs.send(JSON.stringify({ inputTranscript: content.inputTranscription.text }));
@@ -1092,10 +1761,15 @@ async function startServer() {
           },
         },
       });
-      clientWs.send(JSON.stringify({ ready: true }));
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(JSON.stringify({ ready: true }));
+      }
     } catch (err) {
       console.error('Failed to connect Gemini Live:', err);
-      clientWs.send(JSON.stringify({ error: 'Unable to open Gemini Live voice session.' }));
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(JSON.stringify({ error: 'Unable to open Gemini Live voice session.' }));
+      }
+      liveClients.delete(liveEntry);
       clientWs.close();
       return;
     }
@@ -1103,20 +1777,25 @@ async function startServer() {
     clientWs.on('message', (raw) => {
       if (!session) return;
       try {
-        const payload = JSON.parse(raw.toString()) as { audio?: string; text?: string };
-        if (payload.audio) {
+        const payload = JSON.parse(raw.toString()) as { type?: string; audio?: string; text?: string };
+        if (payload.type === 'ping') {
+          liveEntry.isAlive = true;
+          return;
+        }
+        if (payload.audio && payload.audio.length <= 2_000_000) {
           session.sendRealtimeInput({
             audio: { data: payload.audio, mimeType: 'audio/pcm;rate=16000' },
           });
         } else if (payload.text) {
-          session.sendRealtimeInput({ text: payload.text });
+          session.sendRealtimeInput({ text: payload.text.slice(0, 1000) });
         }
-      } catch (e) {
-        console.error('Invalid live message:', e);
+      } catch {
+        // ignore invalid live frame
       }
     });
 
     clientWs.on('close', () => {
+      liveClients.delete(liveEntry);
       try {
         session?.close();
       } catch {
@@ -1124,6 +1803,31 @@ async function startServer() {
       }
     });
   });
+
+  const heartbeatInterval = setInterval(() => {
+    for (const client of realtimeClients) {
+      if (!client.isAlive) {
+        realtimeClients.delete(client);
+        client.ws.terminate();
+        continue;
+      }
+      client.isAlive = false;
+      if (client.ws.readyState === WebSocket.OPEN) {
+        client.ws.ping();
+      }
+    }
+    for (const client of liveClients) {
+      if (!client.isAlive) {
+        liveClients.delete(client);
+        client.ws.terminate();
+        continue;
+      }
+      client.isAlive = false;
+      if (client.ws.readyState === WebSocket.OPEN) {
+        client.ws.ping();
+      }
+    }
+  }, WS_HEARTBEAT_INTERVAL_MS);
 
   httpServer.on('upgrade', (request, socket, head) => {
     const pathname = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`).pathname;
@@ -1140,8 +1844,11 @@ async function startServer() {
     }
   });
 
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
+  const enableVite = options?.enableVite ?? process.env.NODE_ENV !== 'production';
+  let viteServer: Awaited<ReturnType<typeof createViteServer>> | null = null;
+
+  if (enableVite) {
+    viteServer = await createViteServer({
       server: { middlewareMode: true, hmr: false, ws: false },
       appType: 'spa',
     });
@@ -1152,7 +1859,7 @@ async function startServer() {
     // opening a socket and import.meta.hot.send() (e.g. vite-plugin-pwa) never throws.
     app.get('/@vite/client', async (_req, res, next) => {
       try {
-        const result = await vite.transformRequest('/@vite/client');
+        const result = await viteServer!.transformRequest('/@vite/client');
         if (!result) return next();
         const patched = result.code.replace(
           /const transport = normalizeModuleRunnerTransport\(\(\(\) => \{[\s\S]*?\}\)\(\)\);/,
@@ -1166,8 +1873,8 @@ async function startServer() {
       }
     });
 
-    app.use(vite.middlewares);
-  } else {
+    app.use(viteServer.middlewares);
+  } else if (process.env.NODE_ENV === 'production') {
     const distDir = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distDir));
     app.get('*', (_req, res) => {
@@ -1175,12 +1882,33 @@ async function startServer() {
     });
   }
 
+  const shutdown = async () => {
+    clearInterval(heartbeatInterval);
+    for (const c of realtimeClients) c.ws.close();
+    for (const c of liveClients) c.ws.close();
+    wssRealtime.close();
+    wssLive.close();
+    if (viteServer) await viteServer.close();
+    await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+  };
+
+  return { app, httpServer, wssRealtime, wssLive, shutdown };
+}
+
+async function startServer() {
+  const PORT = Number(process.env.PORT || 3000);
+  const { httpServer } = await createAppServer();
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`LIFE-LINE AI server listening on http://0.0.0.0:${PORT}`);
   });
 }
 
-startServer().catch((err) => {
-  console.error('Fatal server startup error:', err);
-  process.exit(1);
-});
+const isMainEntry =
+  Boolean(process.argv[1]) && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isMainEntry && process.env.LIFELINE_NO_AUTOSTART !== 'true') {
+  startServer().catch((err) => {
+    console.error('Fatal server startup error:', err);
+    process.exit(1);
+  });
+}
