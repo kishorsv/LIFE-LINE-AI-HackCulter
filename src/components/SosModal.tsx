@@ -8,10 +8,12 @@ import {
   Radio,
   ShieldAlert,
   Square,
+  WifiOff,
   X,
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext.tsx';
 import { EmergencyIncident } from '../types/lifeline.ts';
+import { enqueueOfflineSos, QueuedSosPayload } from '../lib/offlineSosQueue.ts';
 
 interface SosModalProps {
   open: boolean;
@@ -20,7 +22,8 @@ interface SosModalProps {
 
 export function SosModal({ open, onClose }: SosModalProps) {
   const { user, demoMode, contacts, apiFetch, refreshAllData } = useAuth();
-  const [stage, setStage] = useState<'confirm' | 'countdown' | 'active'>('confirm');
+  const [stage, setStage] = useState<'confirm' | 'countdown' | 'active' | 'queued_offline'>('confirm');
+  const [queuedItem, setQueuedItem] = useState<QueuedSosPayload | null>(null);
   const [countdown, setCountdown] = useState(5);
   const [lat, setLat] = useState<number | null>(null);
   const [lng, setLng] = useState<number | null>(null);
@@ -67,31 +70,51 @@ export function SosModal({ open, onClose }: SosModalProps) {
   const triggerSosDispatch = async () => {
     setSubmitting(true);
     setError('');
+    const payload = {
+      title,
+      description,
+      category,
+      priority: 'CRITICAL',
+      latitude: lat,
+      longitude: lng,
+      locationLabel,
+      locationAccuracyMeters: accuracy,
+      isSimulated: simulateAlert,
+    };
+
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      const queued = enqueueOfflineSos(payload);
+      setQueuedItem(queued);
+      setStage('queued_offline');
+      setSubmitting(false);
+      return;
+    }
+
     try {
       const res = await apiFetch<{
         incident: EmergencyIncident;
         deliveryResults: Array<{ recipient: string; channel: string; status: string; provider: string }>;
       }>('/api/incidents/sos', {
         method: 'POST',
-        body: JSON.stringify({
-          title,
-          description,
-          category,
-          priority: 'CRITICAL',
-          latitude: lat,
-          longitude: lng,
-          locationLabel,
-          locationAccuracyMeters: accuracy,
-          isSimulated: simulateAlert,
-        }),
+        body: JSON.stringify(payload),
       });
       setCreatedIncident(res.incident);
       setDeliverySummary(res.deliveryResults || []);
       setStage('active');
       await refreshAllData();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to send SOS alert.');
-      setStage('confirm');
+      const isNetworkFailure =
+        !navigator.onLine ||
+        err instanceof TypeError ||
+        (err instanceof Error && /network|fetch|offline|failed to fetch/i.test(err.message));
+      if (isNetworkFailure) {
+        const queued = enqueueOfflineSos(payload);
+        setQueuedItem(queued);
+        setStage('queued_offline');
+      } else {
+        setError(err instanceof Error ? err.message : 'Failed to send SOS alert.');
+        setStage('confirm');
+      }
     } finally {
       setSubmitting(false);
     }
@@ -413,6 +436,87 @@ export function SosModal({ open, onClose }: SosModalProps) {
                 className="rounded-xl bg-violet-600 px-4 py-2 text-xs font-semibold text-white hover:bg-violet-500"
               >
                 Return to Dashboard
+              </button>
+            </div>
+          </div>
+        )}
+        {stage === 'queued_offline' && queuedItem && (
+          <div className="mt-5 space-y-4">
+            <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-4 flex items-start gap-3">
+              <WifiOff className="h-5 w-5 text-amber-500 shrink-0 mt-0.5" />
+              <div>
+                <div className="text-sm font-bold text-slate-900 dark:text-white">
+                  Temporary Network Interruption — SOS Queued Locally
+                </div>
+                <p className="text-xs text-slate-600 dark:text-slate-300 mt-0.5">
+                  Your SOS report ({queuedItem.locationLabel}) is saved offline and will auto-dispatch as soon as
+                  connectivity returns. Use direct phone calls below if immediate help is needed.
+                </p>
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-rose-500/30 bg-rose-500/5 p-3.5 space-y-2">
+              <div className="text-xs font-semibold text-rose-700 dark:text-rose-300">
+                Direct Cellular / Voice Emergency Numbers
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <a
+                  href="tel:911"
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-rose-600 px-3 py-1.5 text-xs font-bold text-white"
+                >
+                  <PhoneCall className="h-3.5 w-3.5" />
+                  <span>Call 911</span>
+                </a>
+                <a
+                  href="tel:112"
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-rose-500/40 px-3 py-1.5 text-xs font-bold text-rose-700 dark:text-rose-300"
+                >
+                  <PhoneCall className="h-3.5 w-3.5" />
+                  <span>Call 112</span>
+                </a>
+              </div>
+            </div>
+
+            {contacts.length > 0 && (
+              <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3.5 space-y-2">
+                <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">
+                  Cached Trusted Contacts ({contacts.length})
+                </div>
+                {contacts.map((c) => (
+                  <div key={c.id} className="flex items-center justify-between text-xs">
+                    <span className="text-slate-800 dark:text-slate-200">
+                      {c.name} ({c.relationship})
+                    </span>
+                    {c.phone ? (
+                      <a href={`tel:${c.phone}`} className="font-mono font-semibold text-violet-600 dark:text-violet-400 underline">
+                        {c.phone}
+                      </a>
+                    ) : (
+                      <span className="text-slate-500">{c.email}</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={triggerSosDispatch}
+                className="rounded-xl border border-violet-500/40 bg-violet-500/10 px-4 py-2 text-xs font-semibold text-violet-700 dark:text-violet-300"
+              >
+                Retry Dispatch Now
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setStage('confirm');
+                  setQueuedItem(null);
+                  onClose();
+                }}
+                className="rounded-xl bg-violet-600 px-4 py-2 text-xs font-semibold text-white"
+              >
+                Keep Queued & Close
               </button>
             </div>
           </div>

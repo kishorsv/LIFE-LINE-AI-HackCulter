@@ -13,6 +13,7 @@ import {
 import { ActiveView } from '../types/lifeline.ts';
 import { useTheme } from '../contexts/ThemeContext.tsx';
 import { useAuth } from '../contexts/AuthContext.tsx';
+import { PWAInstallButton } from './PWAInstallButton.tsx';
 
 interface NavbarProps {
   activeView: ActiveView;
@@ -144,6 +145,7 @@ export function Navbar({ activeView, onNavigate, onOpenAuth, onOpenSos, onToggle
           </div>
 
           <div className="flex items-center gap-2">
+            <PWAInstallButton />
             <button
               type="button"
               onClick={toggleTheme}

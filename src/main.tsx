@@ -1,5 +1,6 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
+import { registerSW } from 'virtual:pwa-register';
 import App from './App.tsx';
 import './index.css';
 
@@ -16,6 +17,9 @@ console.error = (...args: unknown[]) => {
     window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
   }
 };
+
+// Register Service Worker for offline emergency asset caching & resilience
+registerSW({ immediate: true });
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

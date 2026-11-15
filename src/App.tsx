@@ -13,6 +13,8 @@ import { ProfileSettings } from './components/ProfileSettings.tsx';
 import { AuthModal } from './components/AuthModal.tsx';
 import { SosModal } from './components/SosModal.tsx';
 import { WorkspaceConfirmModal } from './components/WorkspaceConfirmModal.tsx';
+import { OfflineIndicator } from './components/OfflineIndicator.tsx';
+import { getQueuedSosAlerts, removeQueuedSos } from './lib/offlineSosQueue.ts';
 
 function AppShell() {
   const { user, loading, notifications, apiFetch, refreshAllData } = useAuth();
@@ -22,12 +24,45 @@ function AppShell() {
   const [notifDrawerOpen, setNotifDrawerOpen] = useState(false);
   const [workspaceConfirm, setWorkspaceConfirm] = useState<WorkspaceConfirmPayload | null>(null);
   const [mapsQuotaExceeded, setMapsQuotaExceeded] = useState(false);
+  const [queuedSosCount, setQueuedSosCount] = useState(() => getQueuedSosAlerts().length);
 
   useEffect(() => {
     const onQuota = () => setMapsQuotaExceeded(true);
     window.addEventListener('gmp-quota-exceeded', onQuota);
     return () => window.removeEventListener('gmp-quota-exceeded', onQuota);
   }, []);
+
+  useEffect(() => {
+    const syncQueueCount = () => setQueuedSosCount(getQueuedSosAlerts().length);
+    const flushQueue = async () => {
+      if (!user || !navigator.onLine) return;
+      const queued = getQueuedSosAlerts();
+      if (queued.length === 0) return;
+      for (const item of queued) {
+        try {
+          await apiFetch('/api/incidents/sos', {
+            method: 'POST',
+            body: JSON.stringify(item),
+          });
+          removeQueuedSos(item.id);
+        } catch {
+          // keep remaining items queued until connection stabilizes
+          break;
+        }
+      }
+      setQueuedSosCount(getQueuedSosAlerts().length);
+      await refreshAllData();
+    };
+
+    window.addEventListener('lifeline-sos-queue-updated', syncQueueCount);
+    window.addEventListener('online', flushQueue);
+    void flushQueue();
+
+    return () => {
+      window.removeEventListener('lifeline-sos-queue-updated', syncQueueCount);
+      window.removeEventListener('online', flushQueue);
+    };
+  }, [user, apiFetch, refreshAllData]);
 
   const handleMarkNotificationRead = async (id: number) => {
     await apiFetch(`/api/notifications/${id}/read`, { method: 'PATCH' });
@@ -189,6 +224,8 @@ function AppShell() {
       <SosModal open={sosOpen} onClose={() => setSosOpen(false)} />
 
       <WorkspaceConfirmModal payload={workspaceConfirm} onClose={() => setWorkspaceConfirm(null)} />
+
+      <OfflineIndicator queuedCount={queuedSosCount} />
     </div>
   );
 }
