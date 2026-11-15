@@ -18,6 +18,7 @@ import {
   Users,
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext.tsx';
+import { formatGoogleAuthError } from '../lib/firebaseAuthErrors.ts';
 import { ActiveView, AiRecommendationItem, SupportResource, WorkspaceConfirmPayload } from '../types/lifeline.ts';
 import {
   createSafetyActionTask,
@@ -155,8 +156,18 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
 
   const ensureWorkspaceToken = async (): Promise<string | null> => {
     if (googleAccessToken) return googleAccessToken;
-    const tok = await connectWorkspaceOAuth();
-    return tok;
+    setWorkspaceError('');
+    try {
+      const tok = await connectWorkspaceOAuth();
+      if (!tok) {
+        setWorkspaceError('Google Workspace did not return an OAuth access token. Ensure test-user access is approved and try again.');
+      }
+      return tok;
+    } catch (err) {
+      const formatted = formatGoogleAuthError(err, { mode: 'workspace' });
+      setWorkspaceError(`${formatted.title}: ${formatted.message} ${formatted.recoveryHint}`);
+      return null;
+    }
   };
 
   const handleImportGoogleContacts = async () => {
@@ -604,7 +615,9 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
           {!googleAccessToken ? (
             <button
               type="button"
-              onClick={connectWorkspaceOAuth}
+              onClick={() => {
+                void ensureWorkspaceToken();
+              }}
               className="rounded-xl bg-violet-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-violet-500"
             >
               Connect Google Workspace

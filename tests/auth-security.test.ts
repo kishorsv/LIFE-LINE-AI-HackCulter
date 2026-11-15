@@ -25,7 +25,30 @@ describe('Authentication, RBAC & Security Hardening', () => {
     rateLimitMod = await import('../src/middleware/rateLimit.ts');
     const serverMod = await import('../server.ts');
 
-    const srv = await serverMod.createAppServer({ enableVite: false });
+    const srv = await serverMod.createAppServer({
+      enableVite: false,
+      firebaseVerifier: {
+        verifyIdToken: async (token: string) => {
+          if (token === 'valid-firebase-id-token-0123456789') {
+            return {
+              uid: 'fb-uid-verified-1',
+              email: 'google.verified@example.com',
+              name: 'Google Verified User',
+              email_verified: true,
+            };
+          }
+          if (token === 'unverified-firebase-token-0123456789') {
+            return {
+              uid: 'fb-uid-unverified-2',
+              email: 'citizen@example.com',
+              name: 'Spoof Attempt',
+              email_verified: false,
+            };
+          }
+          throw new Error('Invalid Firebase ID token');
+        },
+      },
+    });
     shutdown = srv.shutdown;
     await new Promise<void>((resolve) => {
       srv.httpServer.listen(0, '127.0.0.1', () => {
@@ -268,5 +291,85 @@ describe('Authentication, RBAC & Security Hardening', () => {
     assert.equal(lastStatus, 429);
     assert.ok(Number(retryAfter) >= 1);
     rateLimitMod.resetRateLimits();
+  });
+
+  it('exchanges verified Firebase ID tokens via /api/auth/firebase, blocks unverified email hijacking, and exposes non-secret googleAuth status', async () => {
+    rateLimitMod.resetRateLimits();
+
+    // Non-secret public config reports googleAuth readiness without exposing apiKey or secrets
+    const cfgResp = await fetch(`${baseUrl}/api/config/public`);
+    assert.equal(cfgResp.status, 200);
+    const cfgData = (await cfgResp.json()) as {
+      googleAuth?: { configured?: boolean; authDomain?: string; oAuthClientConfigured?: boolean };
+      apiKey?: unknown;
+      oAuthClientSecret?: unknown;
+    };
+    assert.equal(cfgData.googleAuth?.configured, true);
+    assert.ok(cfgData.googleAuth?.authDomain?.includes('firebaseapp.com'));
+    assert.equal(cfgData.googleAuth?.oAuthClientConfigured, true);
+    assert.equal(cfgData.apiKey, undefined);
+    assert.equal(cfgData.oAuthClientSecret, undefined);
+
+    // Valid Firebase ID token exchanges for a 7-day ll_ session token with regular_user role
+    const fbResp = await fetch(`${baseUrl}/api/auth/firebase`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ idToken: 'valid-firebase-id-token-0123456789' }),
+    });
+    assert.equal(fbResp.status, 200);
+    const fbData = (await fbResp.json()) as { token: string; user: { role: string; email: string; emailVerified: boolean } };
+    assert.ok(fbData.token.startsWith('ll_'));
+    assert.equal(fbData.user.role, 'regular_user');
+    assert.equal(fbData.user.email, 'google.verified@example.com');
+    assert.equal(fbData.user.emailVerified, true);
+
+    // Unverified Firebase email cannot overwrite/link an existing email-registered account
+    const hijackResp = await fetch(`${baseUrl}/api/auth/firebase`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ idToken: 'unverified-firebase-token-0123456789' }),
+    });
+    assert.equal(hijackResp.status, 401);
+
+    // Invalid token rejected cleanly
+    const badResp = await fetch(`${baseUrl}/api/auth/firebase`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ idToken: 'bad-firebase-token-0123456789' }),
+    });
+    assert.equal(badResp.status, 401);
+  });
+
+  it('formats Google OAuth 403 access_denied and Firebase auth error codes clearly', async () => {
+    const errMod = await import('../src/lib/firebaseAuthErrors.ts');
+
+    const accessDenied = errMod.formatGoogleAuthError(
+      new Error('Error 403: access_denied - Google verification incomplete for test users'),
+      { mode: 'login', currentHost: 'ais-dev-example.run.app' }
+    );
+    assert.equal(accessDenied.code, 'google_access_denied');
+    assert.match(accessDenied.title, /403 access_denied/i);
+    assert.match(accessDenied.recoveryHint, /Email & Password|Demo Sandbox/i);
+
+    const workspaceDenied = errMod.formatGoogleAuthError(
+      { code: 'auth/internal-error', customData: { _tokenResponse: { error: { message: 'access_denied' } } } },
+      { mode: 'workspace' }
+    );
+    assert.equal(workspaceDenied.code, 'google_access_denied');
+    assert.match(workspaceDenied.message, /Workspace scopes/i);
+
+    const badDomain = errMod.formatGoogleAuthError(
+      { code: 'auth/unauthorized-domain', message: 'Firebase: Error (auth/unauthorized-domain).' },
+      { currentHost: 'custom-preview.example.com' }
+    );
+    assert.equal(badDomain.code, 'unauthorized_domain');
+    assert.match(badDomain.message, /custom-preview\.example\.com/);
+
+    const popupBlocked = errMod.formatGoogleAuthError({ code: 'auth/popup-blocked' });
+    assert.equal(popupBlocked.code, 'popup_blocked');
+
+    const popupClosed = errMod.formatGoogleAuthError({ code: 'auth/popup-closed-by-user' });
+    assert.equal(popupClosed.code, 'popup_closed');
+    assert.match(popupClosed.message, /403/);
   });
 });

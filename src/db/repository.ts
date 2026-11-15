@@ -565,12 +565,15 @@ export async function getOrCreateUserByFirebase(
 
     const byEmail = await db.select().from(users).where(eq(users.email, normalizedEmail)).limit(1);
     if (byEmail[0]) {
+      if (!emailVerified) {
+        throw new Error('Google account email must be verified before linking to an existing LIFE-LINE AI account.');
+      }
       const updated = await db
         .update(users)
         .set({
           uid,
           displayName: displayName || byEmail[0].displayName,
-          emailVerified,
+          emailVerified: true,
           updatedAt: new Date(),
         })
         .where(eq(users.id, byEmail[0].id))
@@ -604,11 +607,14 @@ export async function getOrCreateUserByFirebase(
     | Record<string, unknown>
     | undefined;
   if (byEmail) {
+    if (!emailVerified) {
+      throw new Error('Google account email must be verified before linking to an existing LIFE-LINE AI account.');
+    }
     sqlite
       .prepare(
-        "UPDATE users SET uid = ?, display_name = COALESCE(NULLIF(?, ''), display_name), email_verified = ?, updated_at = datetime('now') WHERE id = ?"
+        "UPDATE users SET uid = ?, display_name = COALESCE(NULLIF(?, ''), display_name), email_verified = 1, updated_at = datetime('now') WHERE id = ?"
       )
-      .run(uid, displayName, emailVerified ? 1 : 0, Number(byEmail.id));
+      .run(uid, displayName, Number(byEmail.id));
     const updated = sqlite.prepare('SELECT * FROM users WHERE id = ?').get(Number(byEmail.id)) as Record<string, unknown>;
     return mapSqliteUser(updated);
   }

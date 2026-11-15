@@ -11,6 +11,7 @@ import {
 import {
   clearInMemoryGoogleToken,
   getInMemoryGoogleToken,
+  signInWithGoogleBasic,
   signInWithGoogleWorkspace,
   signOutFirebase,
 } from '../lib/firebase.ts';
@@ -343,9 +344,23 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const loginWithGoogle = async () => {
-    const result = await signInWithGoogleWorkspace();
-    setGoogleAccessToken(result.accessToken);
-    persistToken(result.idToken);
+    const result = await signInWithGoogleBasic();
+    const res = await fetch('/api/auth/firebase', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ idToken: result.idToken }),
+    });
+    const data = (await res.json().catch(() => ({}))) as {
+      token?: string;
+      user?: AppUser;
+      error?: string;
+    };
+    if (!res.ok || !data.token || !data.user) {
+      await signOutFirebase().catch(() => {});
+      throw new Error(data.error || 'Server verification of Google session failed.');
+    }
+    persistToken(data.token);
+    setUser(data.user);
   };
 
   const connectWorkspaceOAuth = async (): Promise<string | null> => {

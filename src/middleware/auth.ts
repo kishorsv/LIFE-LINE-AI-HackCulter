@@ -114,6 +114,29 @@ export function verifyAppToken(
   }
 }
 
+export interface FirebaseTokenVerifier {
+  verifyIdToken: (
+    token: string
+  ) => Promise<{ uid: string; email?: string; name?: string; email_verified?: boolean }>;
+}
+
+export async function verifyAndSyncFirebaseUser(
+  token: string,
+  verifier: FirebaseTokenVerifier = adminAuth
+): Promise<AppUser> {
+  if (!token || token.startsWith('ll_')) {
+    throw new Error('A valid Firebase ID token is required.');
+  }
+  const decodedFirebase = await verifier.verifyIdToken(token);
+  const email = decodedFirebase.email || `${decodedFirebase.uid}@firebase.user`;
+  return await getOrCreateUserByFirebase(
+    decodedFirebase.uid,
+    email,
+    decodedFirebase.name || '',
+    Boolean(decodedFirebase.email_verified)
+  );
+}
+
 export async function resolveUserFromToken(token: string): Promise<AppUser | null> {
   if (!token) return null;
   if (token.startsWith('ll_')) {
@@ -125,14 +148,7 @@ export async function resolveUserFromToken(token: string): Promise<AppUser | nul
   }
 
   try {
-    const decodedFirebase = await adminAuth.verifyIdToken(token);
-    const email = decodedFirebase.email || `${decodedFirebase.uid}@firebase.user`;
-    return await getOrCreateUserByFirebase(
-      decodedFirebase.uid,
-      email,
-      decodedFirebase.name || '',
-      Boolean(decodedFirebase.email_verified)
-    );
+    return await verifyAndSyncFirebaseUser(token);
   } catch {
     return null;
   }

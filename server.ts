@@ -44,13 +44,16 @@ import {
   verifyUserEmailCode,
   writeAuditLog,
 } from './src/db/repository.ts';
+import firebaseConfig from './firebase-applet-config.json';
 import {
   AuthRequest,
+  FirebaseTokenVerifier,
   requireAuth,
   requireRole,
   resolveSessionSecret,
   resolveUserFromToken,
   signAppToken,
+  verifyAndSyncFirebaseUser,
 } from './src/middleware/auth.ts';
 import { createRateLimiter } from './src/middleware/rateLimit.ts';
 import {
@@ -133,7 +136,10 @@ function extractWsToken(req: http.IncomingMessage): string {
   return '';
 }
 
-export async function createAppServer(options?: { enableVite?: boolean }) {
+export async function createAppServer(options?: {
+  enableVite?: boolean;
+  firebaseVerifier?: FirebaseTokenVerifier;
+}) {
   // Enforce strong SESSION_SECRET and lock authoritative DB before serving requests
   resolveSessionSecret();
   await initializeDatabase();
@@ -288,10 +294,22 @@ export async function createAppServer(options?: { enableVite?: boolean }) {
   });
 
   app.get('/api/config/public', (_req, res) => {
+    const fb = firebaseConfig as {
+      projectId?: string;
+      authDomain?: string;
+      appId?: string;
+      apiKey?: string;
+      oAuthClientId?: string;
+    };
     res.json({
       mapsApiKey: getPublicClientMapsApiKey(),
       appUrl: process.env.APP_URL || '',
       demoSandboxEnabled: isDemoLoginAllowed(),
+      googleAuth: {
+        configured: Boolean(fb.projectId && fb.authDomain && fb.appId && fb.apiKey),
+        authDomain: fb.authDomain || '',
+        oAuthClientConfigured: Boolean(fb.oAuthClientId && fb.oAuthClientId.includes('.apps.googleusercontent.com')),
+      },
     });
   });
 
@@ -388,6 +406,37 @@ export async function createAppServer(options?: { enableVite?: boolean }) {
         ipAddress: req.ip,
       }).catch(() => {});
       res.status(401).json({ error: err instanceof Error ? err.message : 'Invalid credentials.' });
+    }
+  });
+
+  app.post('/api/auth/firebase', loginLimiter, async (req, res) => {
+    try {
+      const { idToken } = req.body as { idToken?: unknown };
+      if (typeof idToken !== 'string' || idToken.trim().length < 20) {
+        return res.status(400).json({ error: 'A valid Firebase ID token is required.' });
+      }
+      const user = await verifyAndSyncFirebaseUser(idToken.trim(), options?.firebaseVerifier);
+      const token = signAppToken(user);
+      await writeAuditLog({
+        actorUserId: user.id,
+        actorEmail: user.email,
+        actorRole: user.role,
+        action: 'USER_GOOGLE_LOGIN',
+        resourceType: 'user',
+        resourceId: String(user.id),
+        ipAddress: req.ip,
+      });
+      res.json({ user, token });
+    } catch (err) {
+      await writeAuditLog({
+        actorEmail: 'firebase_oauth',
+        actorRole: 'public',
+        action: 'USER_GOOGLE_LOGIN_FAILED',
+        resourceType: 'user',
+        ipAddress: req.ip,
+      }).catch(() => {});
+      const message = err instanceof Error ? err.message : 'Firebase token verification failed.';
+      res.status(401).json({ error: message });
     }
   });
 
