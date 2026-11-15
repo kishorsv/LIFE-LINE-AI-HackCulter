@@ -1,0 +1,423 @@
+import React, { useEffect, useRef, useState } from 'react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  MapPin,
+  Mic,
+  PhoneCall,
+  Radio,
+  ShieldAlert,
+  Square,
+  X,
+} from 'lucide-react';
+import { useAuth } from '../contexts/AuthContext.tsx';
+import { EmergencyIncident } from '../types/lifeline.ts';
+
+interface SosModalProps {
+  open: boolean;
+  onClose: () => void;
+}
+
+export function SosModal({ open, onClose }: SosModalProps) {
+  const { user, demoMode, contacts, apiFetch, refreshAllData } = useAuth();
+  const [stage, setStage] = useState<'confirm' | 'countdown' | 'active'>('confirm');
+  const [countdown, setCountdown] = useState(5);
+  const [lat, setLat] = useState<number | null>(null);
+  const [lng, setLng] = useState<number | null>(null);
+  const [accuracy, setAccuracy] = useState<number | null>(null);
+  const [locationLabel, setLocationLabel] = useState('Detecting current coordinates...');
+  const [title, setTitle] = useState('Urgent Personal Safety SOS');
+  const [description, setDescription] = useState('');
+  const [category, setCategory] = useState('Personal Safety');
+  const [simulateAlert, setSimulateAlert] = useState<boolean>(demoMode || Boolean(user?.isDemoAccount));
+  const [submitting, setSubmitting] = useState(false);
+  const [createdIncident, setCreatedIncident] = useState<EmergencyIncident | null>(null);
+  const [deliverySummary, setDeliverySummary] = useState<
+    Array<{ recipient: string; channel: string; status: string; provider: string }>
+  >([]);
+  const [recording, setRecording] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
+  const [error, setError] = useState('');
+
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+
+  useEffect(() => {
+    if (!open) return;
+    setSimulateAlert(demoMode || Boolean(user?.isDemoAccount));
+    setError('');
+    if ('geolocation' in navigator) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          setLat(pos.coords.latitude);
+          setLng(pos.coords.longitude);
+          setAccuracy(Math.round(pos.coords.accuracy));
+          setLocationLabel(`GPS ${pos.coords.latitude.toFixed(5)}, ${pos.coords.longitude.toFixed(5)}`);
+        },
+        () => {
+          setLocationLabel('Location permission declined — enter address or landmark manually');
+        },
+        { enableHighAccuracy: true, timeout: 8000 }
+      );
+    } else {
+      setLocationLabel('Browser geolocation unavailable — enter landmark manually');
+    }
+  }, [open, demoMode, user?.isDemoAccount]);
+
+  const triggerSosDispatch = async () => {
+    setSubmitting(true);
+    setError('');
+    try {
+      const res = await apiFetch<{
+        incident: EmergencyIncident;
+        deliveryResults: Array<{ recipient: string; channel: string; status: string; provider: string }>;
+      }>('/api/incidents/sos', {
+        method: 'POST',
+        body: JSON.stringify({
+          title,
+          description,
+          category,
+          priority: 'CRITICAL',
+          latitude: lat,
+          longitude: lng,
+          locationLabel,
+          locationAccuracyMeters: accuracy,
+          isSimulated: simulateAlert,
+        }),
+      });
+      setCreatedIncident(res.incident);
+      setDeliverySummary(res.deliveryResults || []);
+      setStage('active');
+      await refreshAllData();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to send SOS alert.');
+      setStage('confirm');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  useEffect(() => {
+    if (stage !== 'countdown') return;
+    if (countdown <= 0) {
+      void triggerSosDispatch();
+      return;
+    }
+    const timer = setTimeout(() => setCountdown((c) => c - 1), 1000);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stage, countdown]);
+
+  const startVoiceNote = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      audioChunksRef.current = [];
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data);
+      };
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        const blob = new Blob(audioChunksRef.current, { type: recorder.mimeType || 'audio/webm' });
+        setTranscribing(true);
+        try {
+          const reader = new FileReader();
+          reader.onloadend = async () => {
+            const base64 = String(reader.result || '').split(',')[1] || '';
+            const res = await apiFetch<{ transcript: string }>('/api/ai/transcribe', {
+              method: 'POST',
+              body: JSON.stringify({ audioBase64: base64, mimeType: blob.type || 'audio/webm' }),
+            });
+            if (res.transcript) {
+              setDescription((prev) => (prev ? `${prev}\n${res.transcript}` : res.transcript));
+            }
+            setTranscribing(false);
+          };
+          reader.readAsDataURL(blob);
+        } catch {
+          setTranscribing(false);
+        }
+      };
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+      setRecording(true);
+    } catch {
+      setError('Microphone permission unavailable for voice note transcription.');
+    }
+  };
+
+  const stopVoiceNote = () => {
+    mediaRecorderRef.current?.stop();
+    setRecording(false);
+  };
+
+  const handleCancelActiveSos = async () => {
+    if (!createdIncident) return;
+    await apiFetch(`/api/incidents/${createdIncident.id}/status`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status: 'Cancelled', note: 'User cancelled alert and confirmed safe.' }),
+    });
+    await refreshAllData();
+    setStage('confirm');
+    setCreatedIncident(null);
+    onClose();
+  };
+
+  if (!open) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-md p-4 overflow-y-auto">
+      <div className="w-full max-w-xl rounded-2xl border border-rose-500/40 bg-white dark:bg-[#0B0F1F] p-6 shadow-2xl">
+        <div className="flex items-start justify-between gap-3 border-b border-slate-200 dark:border-slate-800 pb-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-rose-600 text-white shadow-lg shadow-rose-600/30">
+              <ShieldAlert className="h-6 w-6" />
+            </div>
+            <div>
+              <h2 className="font-display text-lg font-bold text-slate-900 dark:text-white">
+                LIFE-LINE AI Emergency SOS
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Alerts your trusted contacts & platform operators — does not dial 911/112 automatically
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              setStage('confirm');
+              setCreatedIncident(null);
+              onClose();
+            }}
+            className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
+          >
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        {/* Truthful Emergency Disclaimer */}
+        <div className="mt-4 flex items-start gap-2.5 rounded-xl border border-amber-500/35 bg-amber-500/10 p-3 text-xs text-amber-800 dark:text-amber-200">
+          <PhoneCall className="h-4 w-4 shrink-0 mt-0.5 text-amber-500" />
+          <div>
+            <strong>Important Safety Disclosure:</strong> LIFE-LINE AI coordinates trusted contacts and authorized
+            platform operators. It is <strong>not</strong> connected to municipal 911/112/999 dispatch. If you face
+            immediate physical danger, call official emergency services directly.
+          </div>
+        </div>
+
+        {error && (
+          <div className="mt-3 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-600 dark:text-rose-300">
+            {error}
+          </div>
+        )}
+
+        {stage === 'confirm' && (
+          <div className="mt-4 space-y-4">
+            <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/60 p-3">
+              <div className="flex items-center justify-between text-xs font-medium text-slate-600 dark:text-slate-300 mb-1.5">
+                <span className="inline-flex items-center gap-1.5">
+                  <MapPin className="h-3.5 w-3.5 text-violet-500" />
+                  Captured Location Context
+                </span>
+                {accuracy !== null && <span className="tabular-nums text-[11px] text-slate-500">±{accuracy}m accuracy</span>}
+              </div>
+              <input
+                type="text"
+                value={locationLabel}
+                onChange={(e) => setLocationLabel(e.target.value)}
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-1.5 text-xs text-slate-900 dark:text-white"
+              />
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">Incident Title</label>
+                <input
+                  type="text"
+                  value={title}
+                  onChange={(e) => setTitle(e.target.value)}
+                  className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900/70 px-3 py-2 text-sm text-slate-900 dark:text-white"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">Category</label>
+                <select
+                  value={category}
+                  onChange={(e) => setCategory(e.target.value)}
+                  className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900/70 px-3 py-2 text-sm text-slate-900 dark:text-white"
+                >
+                  <option value="Personal Safety">Personal Safety / Harassment</option>
+                  <option value="Medical Urgency">Medical Urgency</option>
+                  <option value="Safe Transit">Unsafe Commute / Transit</option>
+                  <option value="Domestic / Shelter">Domestic Support / Safe Shelter</option>
+                  <option value="Youth Support">Youth Crisis Assistance</option>
+                </select>
+              </div>
+            </div>
+
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-xs font-medium text-slate-700 dark:text-slate-300">Situation Details (Optional)</label>
+                <button
+                  type="button"
+                  onClick={recording ? stopVoiceNote : startVoiceNote}
+                  disabled={transcribing}
+                  className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium ${
+                    recording
+                      ? 'bg-rose-600 text-white'
+                      : 'border border-violet-500/40 bg-violet-500/10 text-violet-700 dark:text-violet-300'
+                  }`}
+                >
+                  {recording ? <Square className="h-3 w-3" /> : <Mic className="h-3 w-3" />}
+                  <span>{transcribing ? 'Transcribing...' : recording ? 'Stop Recording' : 'Voice Note (AI Transcribe)'}</span>
+                </button>
+              </div>
+              <textarea
+                rows={3}
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder="Describe landmarks, clothing, vehicle info, or what support you need..."
+                className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900/70 px-3 py-2 text-sm text-slate-900 dark:text-white"
+              />
+            </div>
+
+            <div className="flex items-center justify-between rounded-xl border border-slate-200 dark:border-slate-800 px-3.5 py-2.5 text-xs">
+              <div>
+                <div className="font-semibold text-slate-800 dark:text-slate-200">
+                  Trusted Contacts Queued: <span className="tabular-nums text-violet-600 dark:text-violet-400">{contacts.length}</span>
+                </div>
+                <div className="text-slate-500 dark:text-slate-400">Plus all active LIFE-LINE AI operators</div>
+              </div>
+              <label className="inline-flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={simulateAlert}
+                  onChange={(e) => setSimulateAlert(e.target.checked)}
+                  className="rounded border-slate-400 text-violet-600 focus:ring-violet-500"
+                />
+                <span className="font-medium text-amber-700 dark:text-amber-300">Simulated Sandbox Alert</span>
+              </label>
+            </div>
+
+            <div className="flex items-center justify-end gap-3 pt-2">
+              <button
+                type="button"
+                onClick={onClose}
+                className="rounded-xl border border-slate-300 dark:border-slate-700 px-4 py-2.5 text-sm font-medium text-slate-700 dark:text-slate-300"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setCountdown(5);
+                  setStage('countdown');
+                }}
+                className="rounded-xl bg-rose-600 px-5 py-2.5 text-sm font-bold text-white shadow-lg shadow-rose-600/30 hover:bg-rose-500"
+              >
+                Start 5s SOS Dispatch
+              </button>
+            </div>
+          </div>
+        )}
+
+        {stage === 'countdown' && (
+          <div className="mt-6 text-center py-6 space-y-5">
+            <div className="mx-auto flex h-24 w-24 items-center justify-center rounded-full border-4 border-rose-500 bg-rose-500/15 font-display text-4xl font-bold tabular-nums text-rose-600 dark:text-rose-400">
+              {submitting ? '...' : countdown}
+            </div>
+            <div>
+              <h3 className="font-display text-lg font-bold text-slate-900 dark:text-white">
+                {submitting ? 'Dispatching SOS Alert...' : 'Confirming SOS Activation'}
+              </h3>
+              <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                Cancel immediately if triggered accidentally.
+              </p>
+            </div>
+            <div className="flex items-center justify-center gap-3">
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={() => setStage('confirm')}
+                className="rounded-xl border border-slate-300 dark:border-slate-700 px-5 py-2.5 text-sm font-semibold text-slate-700 dark:text-slate-200"
+              >
+                Cancel Accidental Alert
+              </button>
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={triggerSosDispatch}
+                className="rounded-xl bg-rose-600 px-5 py-2.5 text-sm font-bold text-white hover:bg-rose-500"
+              >
+                Send Immediately
+              </button>
+            </div>
+          </div>
+        )}
+
+        {stage === 'active' && createdIncident && (
+          <div className="mt-5 space-y-4">
+            <div className="rounded-xl border border-emerald-500/35 bg-emerald-500/10 p-4 flex items-start gap-3">
+              <CheckCircle2 className="h-5 w-5 text-emerald-500 shrink-0 mt-0.5" />
+              <div>
+                <div className="text-sm font-bold text-slate-900 dark:text-white">
+                  Incident #{createdIncident.id} — Status: {createdIncident.status}
+                </div>
+                <p className="text-xs text-slate-600 dark:text-slate-300 mt-0.5">
+                  Real-time operator synchronization active. Operators see your incident immediately.
+                </p>
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3.5 space-y-2">
+              <div className="flex items-center gap-2 text-xs font-semibold text-slate-700 dark:text-slate-200">
+                <Radio className="h-4 w-4 text-violet-500" />
+                <span>Alert Delivery Audit</span>
+              </div>
+              {deliverySummary.length === 0 ? (
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  In-app operator alert delivered. Add trusted contacts on your Dashboard for multi-channel notifications.
+                </p>
+              ) : (
+                <div className="space-y-1.5">
+                  {deliverySummary.map((d, idx) => (
+                    <div key={idx} className="flex items-center justify-between text-xs border-b border-slate-100 dark:border-slate-800/80 pb-1 last:border-0">
+                      <span className="text-slate-700 dark:text-slate-300">
+                        {d.recipient} ({d.channel})
+                      </span>
+                      <span className="rounded bg-slate-100 dark:bg-slate-800 px-2 py-0.5 font-mono text-[11px] text-slate-700 dark:text-slate-300">
+                        {d.status} · {d.provider}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center justify-between pt-2">
+              <button
+                type="button"
+                onClick={handleCancelActiveSos}
+                className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 dark:border-slate-700 px-4 py-2 text-xs font-semibold text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+              >
+                <AlertTriangle className="h-3.5 w-3.5" />
+                <span>Mark Safe / Cancel SOS</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setStage('confirm');
+                  setCreatedIncident(null);
+                  onClose();
+                }}
+                className="rounded-xl bg-violet-600 px-4 py-2 text-xs font-semibold text-white hover:bg-violet-500"
+              >
+                Return to Dashboard
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

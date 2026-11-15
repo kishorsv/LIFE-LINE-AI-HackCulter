@@ -1,0 +1,6 @@
+{
+  "name": "LIFE-LINE AI",
+  "description": "Agentic Safety & Emergency Response Intelligence Platform for Youth and Women — real-time SOS orchestration, live Google Maps safety routing, trusted contacts, multi-agent AI triage, and operator coordination.",
+  "requestFramePermissions": ["geolocation", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
