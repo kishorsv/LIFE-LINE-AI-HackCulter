@@ -313,3 +313,36 @@ export interface WorkspaceConfirmPayload {
   onConfirm: () => Promise<void>;
 }
 
+export interface SosIncidentCluster {
+  id: string;
+  lat: number;
+  lng: number;
+  totalCount: number;
+  verifiedSosCount: number;
+  communityReportCount: number;
+  simulatedCount: number;
+  highSeverityCount: number;
+  dominantCategory: string;
+  latestAt: string;
+  radiusMeters: number;
+  dataOrigin: 'verified' | 'simulated' | 'mixed';
+  severityScore: number;
+}
+
+export interface SosClusterHourlyBucket {
+  hour: number;
+  verifiedCount: number;
+  simulatedCount: number;
+}
+
+export interface SosClusterAnalyticsResponse {
+  evaluatedAt: string;
+  windowDays: number;
+  radiusKm: number;
+  center: { lat: number; lng: number } | null;
+  totalVerifiedRecords: number;
+  totalSimulatedRecords: number;
+  clusters: SosIncidentCluster[];
+  hourlyDistribution: SosClusterHourlyBucket[];
+  privacyNotice: string;
+}

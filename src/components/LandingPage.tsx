@@ -745,8 +745,9 @@ export function LandingPage({ onNavigate, onOpenAuth, onOpenSos }: LandingPagePr
                     <GoogleMap
                       defaultCenter={{ lat: 37.7749, lng: -122.4194 }}
                       defaultZoom={13}
-                      mapId="lifeline-homepage-saferoute"
+                      mapId="DEMO_MAP_ID"
                       colorScheme="DARK"
+                      internalUsageAttributionIds={['gmp_mcp_codeassist_v1_aistudio']}
                       disableDefaultUI={false}
                       className="h-full w-full min-h-[420px] sm:min-h-[470px]"
                     >

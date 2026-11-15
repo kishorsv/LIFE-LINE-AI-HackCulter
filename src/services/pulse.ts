@@ -692,3 +692,222 @@ export async function computeSafeRoutesWithGoogle(
     };
   }
 }
+
+export interface SosClusterPointSummary {
+  id: string;
+  lat: number;
+  lng: number;
+  totalCount: number;
+  verifiedSosCount: number;
+  communityReportCount: number;
+  simulatedCount: number;
+  highSeverityCount: number;
+  dominantCategory: string;
+  latestAt: string;
+  radiusMeters: number;
+  dataOrigin: 'verified' | 'simulated' | 'mixed';
+  severityScore: number;
+}
+
+export interface SosClusterBuildResult {
+  evaluatedAt: string;
+  windowDays: number;
+  radiusKm: number;
+  center: { lat: number; lng: number } | null;
+  totalVerifiedRecords: number;
+  totalSimulatedRecords: number;
+  clusters: SosClusterPointSummary[];
+  hourlyDistribution: Array<{ hour: number; verifiedCount: number; simulatedCount: number }>;
+  privacyNotice: string;
+}
+
+export function buildSosIncidentClusters(input: {
+  incidents: NearbyIncidentInput[];
+  reports: NearbyReportInput[];
+  centerLat?: number;
+  centerLng?: number;
+  radiusKm?: number;
+  windowDays?: number;
+  includeSimulated?: boolean;
+}): SosClusterBuildResult {
+  const evaluatedAt = new Date().toISOString();
+  const windowDays = Math.min(365, Math.max(1, Math.round(input.windowDays ?? 30)));
+  const radiusKm = Math.min(250, Math.max(1, input.radiusKm ?? 30));
+  const includeSimulated = input.includeSimulated ?? true;
+  const hasCenter =
+    typeof input.centerLat === 'number' &&
+    Number.isFinite(input.centerLat) &&
+    typeof input.centerLng === 'number' &&
+    Number.isFinite(input.centerLng);
+  const center = hasCenter ? { lat: input.centerLat!, lng: input.centerLng! } : null;
+  const cutoffMs = Date.now() - windowDays * 24 * 60 * 60 * 1000;
+
+  interface RawSpatialSignal {
+    lat: number;
+    lng: number;
+    category: string;
+    isHighSeverity: boolean;
+    isSimulated: boolean;
+    kind: 'sos' | 'report';
+    createdAt: string;
+  }
+
+  const signals: RawSpatialSignal[] = [];
+
+  for (const inc of input.incidents) {
+    if (inc.status === 'Cancelled') continue;
+    if (inc.latitude == null || inc.longitude == null) continue;
+    if (!Number.isFinite(inc.latitude) || !Number.isFinite(inc.longitude)) continue;
+    const ts = Date.parse(inc.createdAt);
+    if (Number.isFinite(ts) && ts < cutoffMs) continue;
+    if (center && haversineDistanceKm(center, { lat: inc.latitude, lng: inc.longitude }) > radiusKm) continue;
+    signals.push({
+      lat: inc.latitude,
+      lng: inc.longitude,
+      category: inc.category || 'Personal Safety',
+      isHighSeverity: inc.priority === 'CRITICAL' || inc.priority === 'HIGH',
+      isSimulated: Boolean(inc.isSimulated),
+      kind: 'sos',
+      createdAt: inc.createdAt,
+    });
+  }
+
+  for (const rep of input.reports) {
+    if (!Number.isFinite(rep.latitude) || !Number.isFinite(rep.longitude)) continue;
+    const ts = Date.parse(rep.createdAt);
+    if (Number.isFinite(ts) && ts < cutoffMs) continue;
+    if (center && haversineDistanceKm(center, { lat: rep.latitude, lng: rep.longitude }) > radiusKm) continue;
+    signals.push({
+      lat: rep.latitude,
+      lng: rep.longitude,
+      category: rep.category || 'Safety Report',
+      isHighSeverity: rep.severity === 'HIGH',
+      isSimulated: Boolean(rep.isSimulated),
+      kind: 'report',
+      createdAt: rep.createdAt,
+    });
+  }
+
+  const hourly = Array.from({ length: 24 }, (_, hour) => ({
+    hour,
+    verifiedCount: 0,
+    simulatedCount: 0,
+  }));
+
+  let totalVerifiedRecords = 0;
+  let totalSimulatedRecords = 0;
+
+  // Spatial bucket grid (~550m grid cells) for privacy-safe clustering
+  const GRID_STEP = 0.0055;
+  const buckets: Record<
+    string,
+    {
+      latSum: number;
+      lngSum: number;
+      items: RawSpatialSignal[];
+      catCounts: Record<string, number>;
+    }
+  > = {};
+
+  for (const s of signals) {
+    if (s.isSimulated) {
+      totalSimulatedRecords += 1;
+      if (!includeSimulated) continue;
+    } else {
+      totalVerifiedRecords += 1;
+    }
+
+    const parsed = new Date(s.createdAt);
+    if (!Number.isNaN(parsed.getTime())) {
+      const hr = parsed.getUTCHours();
+      if (s.isSimulated) hourly[hr].simulatedCount += 1;
+      else hourly[hr].verifiedCount += 1;
+    }
+
+    const qLat = Math.round(s.lat / GRID_STEP) * GRID_STEP;
+    const qLng = Math.round(s.lng / GRID_STEP) * GRID_STEP;
+    const key = `cell_${qLat.toFixed(3)}_${qLng.toFixed(3)}`;
+    if (!buckets[key]) {
+      buckets[key] = { latSum: 0, lngSum: 0, items: [], catCounts: {} };
+    }
+    const b = buckets[key];
+    b.latSum += s.lat;
+    b.lngSum += s.lng;
+    b.items.push(s);
+    b.catCounts[s.category] = (b.catCounts[s.category] || 0) + 1;
+  }
+
+  const clusters: SosClusterPointSummary[] = Object.entries(buckets).map(([id, b]) => {
+    const count = b.items.length;
+    // Generalize centroid to 3 decimal places (~110m minimum privacy anonymization)
+    const centroidLat = Number((b.latSum / count).toFixed(3));
+    const centroidLng = Number((b.lngSum / count).toFixed(3));
+
+    let verifiedSosCount = 0;
+    let communityReportCount = 0;
+    let simulatedCount = 0;
+    let highSeverityCount = 0;
+    let latestAt = b.items[0].createdAt;
+    let maxDistKm = 0.25;
+
+    for (const item of b.items) {
+      if (item.isSimulated) simulatedCount += 1;
+      else if (item.kind === 'sos') verifiedSosCount += 1;
+      else communityReportCount += 1;
+
+      if (item.isHighSeverity) highSeverityCount += 1;
+      if (Date.parse(item.createdAt) > Date.parse(latestAt)) latestAt = item.createdAt;
+
+      const dKm = haversineDistanceKm({ lat: centroidLat, lng: centroidLng }, { lat: item.lat, lng: item.lng });
+      if (dKm > maxDistKm) maxDistKm = dKm;
+    }
+
+    const dominantCategory =
+      Object.entries(b.catCounts).sort((a, bCat) => bCat[1] - a[1])[0]?.[0] || 'Personal Safety';
+
+    const verifiedTotal = verifiedSosCount + communityReportCount;
+    const dataOrigin: SosClusterPointSummary['dataOrigin'] =
+      verifiedTotal > 0 && simulatedCount > 0
+        ? 'mixed'
+        : verifiedTotal > 0
+        ? 'verified'
+        : 'simulated';
+
+    const severityScore = Math.min(
+      100,
+      Math.round(verifiedSosCount * 24 + communityReportCount * 14 + highSeverityCount * 15 + simulatedCount * 10)
+    );
+
+    return {
+      id,
+      lat: centroidLat,
+      lng: centroidLng,
+      totalCount: count,
+      verifiedSosCount,
+      communityReportCount,
+      simulatedCount,
+      highSeverityCount,
+      dominantCategory,
+      latestAt,
+      radiusMeters: Math.round(Math.min(1200, Math.max(220, maxDistKm * 1000 + 180))),
+      dataOrigin,
+      severityScore,
+    };
+  });
+
+  clusters.sort((a, b) => b.totalCount - a.totalCount || b.severityScore - a.severityScore);
+
+  return {
+    evaluatedAt,
+    windowDays,
+    radiusKm,
+    center,
+    totalVerifiedRecords,
+    totalSimulatedRecords,
+    clusters,
+    hourlyDistribution: hourly,
+    privacyNotice:
+      'Clusters generalize coordinates to ~550m spatial cells and omit all user identifiers. Historical cluster density is an informational awareness aid only and does not guarantee corridor safety or predict crime.',
+  };
+}
+

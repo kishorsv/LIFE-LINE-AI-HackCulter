@@ -116,6 +116,7 @@ import {
 } from './src/services/gemini.ts';
 import { dispatchEmergencyNotifications, DispatchSummary } from './src/services/notifications.ts';
 import {
+  buildSosIncidentClusters,
   computePredictiveRisk,
   computeSafeRoutesWithGoogle,
   fetchOpenMeteoWeather,
@@ -1594,6 +1595,46 @@ export async function createAppServer(options?: {
       res.status(201).json({ report });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to submit safety report.' });
+    }
+  });
+
+  app.get('/api/maps/sos-clusters', mapsLimiter, async (req, res) => {
+    try {
+      const latRaw = req.query.lat !== undefined ? Number(req.query.lat) : undefined;
+      const lngRaw = req.query.lng !== undefined ? Number(req.query.lng) : undefined;
+      if (
+        (latRaw !== undefined && !isValidLatitude(latRaw)) ||
+        (lngRaw !== undefined && !isValidLongitude(lngRaw))
+      ) {
+        return res.status(400).json({ error: 'Invalid latitude or longitude query parameters.' });
+      }
+      const radiusKm = req.query.radiusKm !== undefined ? Number(req.query.radiusKm) : 35;
+      if (!Number.isFinite(radiusKm) || radiusKm < 1 || radiusKm > 250) {
+        return res.status(400).json({ error: 'radiusKm must be between 1 and 250.' });
+      }
+      const windowDays = req.query.windowDays !== undefined ? Number(req.query.windowDays) : 30;
+      if (!Number.isFinite(windowDays) || windowDays < 1 || windowDays > 365) {
+        return res.status(400).json({ error: 'windowDays must be between 1 and 365.' });
+      }
+      const includeSimulated = req.query.includeSimulated !== 'false';
+
+      const [incidents, reports] = await Promise.all([
+        listIncidentsForPulse(400),
+        listSafetyReportsForPulse(200),
+      ]);
+
+      const result = buildSosIncidentClusters({
+        incidents,
+        reports,
+        centerLat: latRaw,
+        centerLng: lngRaw,
+        radiusKm,
+        windowDays,
+        includeSimulated,
+      });
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to compute SOS clusters.' });
     }
   });
 
