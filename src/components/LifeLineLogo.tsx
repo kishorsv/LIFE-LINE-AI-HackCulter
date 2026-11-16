@@ -1,4 +1,4 @@
-import React, { useId } from 'react';
+import { useId } from 'react';
 
 export interface LifeLineLogoProps {
   /** 'full' = icon + wordmark (+ optional subtitle); 'compact' = icon + concise wordmark; 'mark' = shield icon only */

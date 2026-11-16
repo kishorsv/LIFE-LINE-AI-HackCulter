@@ -12,8 +12,6 @@ import {
   notifications,
   safetyJourneys,
   safetyReports,
-  supportLocations,
-  supportOrganizations,
   trustedContacts,
   userPreferences,
   userProfiles,

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { AlertTriangle, Check, Copy, Mail, RefreshCw, ShieldAlert, X } from 'lucide-react';
 import {
   buildAccessRequestMessage,

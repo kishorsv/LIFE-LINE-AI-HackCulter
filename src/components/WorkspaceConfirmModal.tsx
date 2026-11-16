@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { ShieldAlert, CheckCircle2, X } from 'lucide-react';
 import { WorkspaceConfirmPayload } from '../types/lifeline.ts';
 
