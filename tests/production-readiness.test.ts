@@ -208,4 +208,23 @@ describe('Production Readiness & Scalability Hardening', () => {
     assert.equal('fallbackReason' in fastFallback ? fastFallback.fallbackReason : undefined, 'unavailable');
     geminiMod.resetAiRuntimeForTests();
   });
+
+  it('resolves Cloud SQL Unix socket directories when project slug differs from proxy socket ID', async () => {
+    const dbIdxMod = await import('../src/db/index.ts');
+    const mockCloudSqlRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'lifeline-cloudsql-sock-'));
+    try {
+      const mountedDir = path.join(mockCloudSqlRoot, 'project-8a8b6a99-4e2f-40ea-a51:us-west1:ai-studio-07a648a4');
+      fs.mkdirSync(mountedDir, { recursive: true });
+      fs.writeFileSync(path.join(mountedDir, '.s.PGSQL.5432'), '');
+
+      const staleHost = path.join(mockCloudSqlRoot, 'savvy-yucca-r4dh4:us-west1:ai-studio-07a648a4');
+      const resolved = dbIdxMod.resolvePostgresHost(staleHost, [mockCloudSqlRoot]);
+      assert.equal(resolved, mountedDir);
+
+      // TCP hostnames should remain untouched
+      assert.equal(dbIdxMod.resolvePostgresHost('127.0.0.1', [mockCloudSqlRoot]), '127.0.0.1');
+    } finally {
+      fs.rmSync(mockCloudSqlRoot, { recursive: true, force: true });
+    }
+  });
 });

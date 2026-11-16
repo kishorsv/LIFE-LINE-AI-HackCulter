@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { and, asc, desc, eq, sql } from 'drizzle-orm';
-import { db, hasPostgresConfig, pool, queryWithRetry } from './index.ts';
+import { db, hasPostgresConfig, pool, queryWithRetry, refreshPostgresPoolHost } from './index.ts';
 import {
   aiAssessments,
   aiRecommendations,
@@ -509,21 +509,32 @@ export async function initializeDatabase(): Promise<DatabaseDialect> {
 
     const pgConfigured = hasPostgresConfig();
     if (requestedDriver === 'postgres' || pgConfigured) {
-      try {
-        await pool.query('SELECT 1');
-        await runPostgresMigrations();
-        activeDialect = 'postgres';
-        console.log('[db] Authoritative PostgreSQL database connected and verified.');
-        return activeDialect;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (requestedDriver === 'postgres' || (isProd && requestedDriver !== 'sqlite')) {
-          throw new Error(
-            `FATAL DATABASE ERROR: PostgreSQL is required (${requestedDriver}, NODE_ENV=${process.env.NODE_ENV}) but unreachable: ${msg}`
-          );
+      const maxProbeAttempts = isProd ? 3 : 1;
+      let lastPgErrMsg = '';
+      for (let attempt = 0; attempt < maxProbeAttempts; attempt++) {
+        refreshPostgresPoolHost();
+        try {
+          await pool.query('SELECT 1');
+          await runPostgresMigrations();
+          activeDialect = 'postgres';
+          console.log('[db] Authoritative PostgreSQL database connected and verified.');
+          return activeDialect;
+        } catch (err) {
+          lastPgErrMsg = err instanceof Error ? err.message : String(err);
+          if (attempt + 1 < maxProbeAttempts) {
+            await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+          }
         }
-        console.warn(`[db] PostgreSQL unreachable in dev/auto mode (${msg}); locking authoritative SQLite store.`);
       }
+
+      if (requestedDriver === 'postgres') {
+        throw new Error(
+          `FATAL DATABASE ERROR: PostgreSQL is required (DB_DRIVER=postgres, NODE_ENV=${process.env.NODE_ENV}) but unreachable: ${lastPgErrMsg}`
+        );
+      }
+      console.warn(
+        `[db] PostgreSQL unreachable (${lastPgErrMsg}); activating embedded SQLite store so service remains available.`
+      );
     }
 
     runSqliteMigrations();

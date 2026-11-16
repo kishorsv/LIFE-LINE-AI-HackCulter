@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { Pool, QueryResult, QueryResultRow } from 'pg';
 import * as schema from './schema.ts';
@@ -19,20 +21,71 @@ export function hasPostgresConfig(env: NodeJS.ProcessEnv = process.env): boolean
   );
 }
 
+/**
+ * Resolves Cloud SQL Unix domain socket paths when the injected SQL_HOST uses a
+ * GCP project alias/slug (e.g. savvy-yucca-r4dh4:region:instance) while the
+ * cloud-sql-proxy sidecar mounted the socket under the project ID (project-...:region:instance).
+ */
+export function resolvePostgresHost(
+  rawHost: string | undefined = process.env.SQL_HOST,
+  searchRoots: string[] = ['/app/cloudsql', '/cloudsql']
+): string | undefined {
+  if (!rawHost) return undefined;
+  const trimmed = rawHost.trim();
+  if (!trimmed.startsWith('/')) return trimmed;
+
+  if (fs.existsSync(path.join(trimmed, '.s.PGSQL.5432'))) {
+    return trimmed;
+  }
+
+  const baseName = path.basename(trimmed);
+  const firstColon = baseName.indexOf(':');
+  const instanceSuffix = firstColon >= 0 ? baseName.slice(firstColon) : '';
+  const candidateParents = Array.from(new Set([path.dirname(trimmed), ...searchRoots]));
+
+  const allSocketDirs: string[] = [];
+  for (const parent of candidateParents) {
+    try {
+      if (!fs.existsSync(parent)) continue;
+      const entries = fs.readdirSync(parent, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const candidateDir = path.join(parent, entry.name);
+        if (!fs.existsSync(path.join(candidateDir, '.s.PGSQL.5432'))) continue;
+        if (instanceSuffix && entry.name.endsWith(instanceSuffix)) {
+          return candidateDir;
+        }
+        allSocketDirs.push(candidateDir);
+      }
+    } catch {
+      // Ignore unreadable parent directories
+    }
+  }
+
+  if (allSocketDirs.length === 1) {
+    return allSocketDirs[0];
+  }
+
+  return trimmed;
+}
+
 const PG_POOL_MAX = Math.min(100, Math.max(5, Number(process.env.PG_POOL_MAX || 15)));
 const DB_STATEMENT_TIMEOUT_MS = Math.min(30_000, Math.max(1000, Number(process.env.DB_STATEMENT_TIMEOUT_MS || 8000)));
 
+let activePoolHost: string | undefined;
+
 export const createPool = () => {
   if (!global._postgresPool) {
+    activePoolHost = resolvePostgresHost(process.env.SQL_HOST);
     global._postgresPool = new Pool({
-      host: process.env.SQL_HOST,
+      host: activePoolHost,
       user: process.env.SQL_USER,
       password: process.env.SQL_PASSWORD,
       database: process.env.SQL_DB_NAME,
       max: PG_POOL_MAX,
-      min: 2,
+      min: 0,
       idleTimeoutMillis: 30_000,
-      connectionTimeoutMillis: 5_000,
+      connectionTimeoutMillis: 15_000,
       statement_timeout: DB_STATEMENT_TIMEOUT_MS,
       query_timeout: DB_STATEMENT_TIMEOUT_MS + 2000,
       allowExitOnIdle: false,
@@ -45,9 +98,24 @@ export const createPool = () => {
   return global._postgresPool;
 };
 
-const pool = createPool();
-export const db = drizzle(pool, { schema });
-export { pool };
+export let pool = createPool();
+export let db = drizzle(pool, { schema });
+
+export function refreshPostgresPoolHost(): boolean {
+  const nextHost = resolvePostgresHost(process.env.SQL_HOST);
+  if (!nextHost || nextHost === activePoolHost) {
+    return false;
+  }
+  console.log(`[db] Resolved Cloud SQL Unix socket host from ${activePoolHost || '(unset)'} to ${nextHost}`);
+  const prevPool = global._postgresPool;
+  global._postgresPool = undefined;
+  if (prevPool) {
+    void prevPool.end().catch(() => {});
+  }
+  pool = createPool();
+  db = drizzle(pool, { schema });
+  return true;
+}
 
 export function getPoolStats() {
   return {
