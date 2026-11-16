@@ -90,6 +90,7 @@ describe('Database Integrity, Safe Migrations & Authoritative Persistence', () =
       'v2_auth_code_security_columns',
       'v3_sos_idempotency_and_delivery',
       'v4_pulse_journeys_reports_responders',
+      'v5_scalability_indexes',
     ]);
 
     // Verify legacy row preserved and legacy plaintext codes hashed into verification_code_hash
@@ -110,7 +111,7 @@ describe('Database Integrity, Safe Migrations & Authoritative Persistence', () =
     assert.equal(healthBody.status, 'ok');
     assert.equal(healthBody.database.ok, true);
     assert.equal(healthBody.database.dialect, 'sqlite');
-    assert.equal(healthBody.database.migrationVersion, 'v4_pulse_journeys_reports_responders');
+    assert.equal(healthBody.database.migrationVersion, 'v5_scalability_indexes');
     assert.ok(healthBody.database.tablesVerified >= 13);
 
     // Verify full persistence roundtrip for user, profile, contact, SOS, notification, and audit log

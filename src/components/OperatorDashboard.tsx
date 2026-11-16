@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { APIProvider, AdvancedMarker, Map as GoogleMap, Pin } from '@vis.gl/react-google-maps';
 import { Bar, BarChart, CartesianGrid, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
-import { CheckCircle2, ClipboardList, Lock, Radio, ShieldCheck, UserCheck, Users } from 'lucide-react';
+import { Activity, AlertTriangle, CheckCircle2, ClipboardList, Cpu, Database, Lock, Radio, RefreshCw, ShieldCheck, UserCheck, Users } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext.tsx';
 import { LifeLineLogo } from './LifeLineLogo.tsx';
 import {
@@ -9,18 +9,21 @@ import {
   AppUser,
   AuditLogEntry,
   EmergencyIncident,
+  MonitoringSnapshot,
   ResponderInfo,
   UserRole,
 } from '../types/lifeline.ts';
 
 export function OperatorDashboard() {
   const { user, operatorIncidents, demoMode, loginDemoRole, mapsApiKey, apiFetch, refreshAllData } = useAuth();
-  const [tab, setTab] = useState<'queue' | 'analytics' | 'audit' | 'roles'>('queue');
+  const [tab, setTab] = useState<'queue' | 'analytics' | 'monitoring' | 'audit' | 'roles'>('queue');
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [noteText, setNoteText] = useState('');
   const [isInternalNote, setIsInternalNote] = useState(false);
   const [priorityFilter, setPriorityFilter] = useState('ALL');
   const [analytics, setAnalytics] = useState<AnalyticsSummary | null>(null);
+  const [monitoring, setMonitoring] = useState<MonitoringSnapshot | null>(null);
+  const [monitoringAutoRefresh, setMonitoringAutoRefresh] = useState(true);
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
   const [auditPage, setAuditPage] = useState(1);
   const [auditTotalPages, setAuditTotalPages] = useState(1);
@@ -37,6 +40,7 @@ export function OperatorDashboard() {
   const isAuthorized = Boolean(
     user && ['emergency_operator', 'support_organization', 'administrator'].includes(user.role)
   );
+  const canViewMonitoring = Boolean(user && ['administrator', 'emergency_operator'].includes(user.role));
 
   const loadOperatorResources = useCallback(async () => {
     if (!isAuthorized || !user) return;
@@ -70,6 +74,9 @@ export function OperatorDashboard() {
           if (d.pagination?.totalPages) setAuditTotalPages(d.pagination.totalPages);
         })
         .catch(() => {});
+      apiFetch<MonitoringSnapshot>('/api/admin/monitoring')
+        .then(setMonitoring)
+        .catch(() => {});
     }
     if (user.role === 'administrator') {
       apiFetch<{ users: AppUser[] }>('/api/admin/users')
@@ -81,6 +88,14 @@ export function OperatorDashboard() {
   useEffect(() => {
     void loadOperatorResources();
   }, [loadOperatorResources, operatorIncidents.length]);
+
+  useEffect(() => {
+    if (tab !== 'monitoring' || !canViewMonitoring || !monitoringAutoRefresh) return;
+    const timer = setInterval(() => {
+      apiFetch<MonitoringSnapshot>('/api/admin/monitoring').then(setMonitoring).catch(() => {});
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [tab, canViewMonitoring, monitoringAutoRefresh, apiFetch]);
 
   if (!isAuthorized) {
     return (
@@ -241,6 +256,23 @@ export function OperatorDashboard() {
           >
             Analytics Dashboard
           </button>
+          {canViewMonitoring && (
+            <button
+              type="button"
+              onClick={() => setTab('monitoring')}
+              className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-semibold ${
+                tab === 'monitoring' ? 'bg-violet-600 text-white' : 'border border-slate-300 dark:border-slate-700'
+              }`}
+            >
+              <Activity className="h-3.5 w-3.5" />
+              <span>System Health</span>
+              {monitoring && monitoring.alerts.length > 0 && (
+                <span className="rounded-full bg-rose-500 px-1.5 py-0.5 text-[10px] font-bold text-white">
+                  {monitoring.alerts.length}
+                </span>
+              )}
+            </button>
+          )}
           {['administrator', 'emergency_operator'].includes(user!.role) && (
             <button
               type="button"
@@ -659,6 +691,260 @@ export function OperatorDashboard() {
               </div>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Operator / Admin-Only System Health & Performance Monitoring Dashboard */}
+      {tab === 'monitoring' && canViewMonitoring && (
+        <div className="space-y-5">
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] px-5 py-3.5">
+            <div className="flex items-center gap-2.5">
+              <Cpu className="h-5 w-5 text-violet-500" />
+              <div>
+                <h2 className="font-display text-base font-bold text-slate-900 dark:text-white">
+                  Server Health &amp; Scalability Telemetry
+                </h2>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                  Restricted to Authorized Operators &amp; Administrators · Uptime:{' '}
+                  {monitoring ? `${Math.floor(monitoring.uptimeSeconds / 60)}m ${monitoring.uptimeSeconds % 60}s` : '—'}
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <label className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 dark:border-slate-700 px-2.5 py-1.5 text-xs">
+                <input
+                  type="checkbox"
+                  checked={monitoringAutoRefresh}
+                  onChange={(e) => setMonitoringAutoRefresh(e.target.checked)}
+                />
+                <span>Live 5s Polling</span>
+              </label>
+              <button
+                type="button"
+                onClick={() => {
+                  apiFetch<MonitoringSnapshot>('/api/admin/monitoring').then(setMonitoring).catch(() => {});
+                }}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-violet-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-violet-500"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+                <span>Refresh</span>
+              </button>
+            </div>
+          </div>
+
+          {monitoring ? (
+            <>
+              {monitoring.alerts.length > 0 && (
+                <div className="space-y-2">
+                  {monitoring.alerts.map((alert) => (
+                    <div
+                      key={alert.id}
+                      className={`flex flex-wrap items-center justify-between gap-2 rounded-xl border px-4 py-2.5 text-xs ${
+                        alert.severity === 'critical'
+                          ? 'border-rose-500/50 bg-rose-500/10 text-rose-700 dark:text-rose-200'
+                          : 'border-amber-500/50 bg-amber-500/10 text-amber-800 dark:text-amber-200'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <AlertTriangle className="h-4 w-4 shrink-0" />
+                        <span>
+                          <strong>{alert.title}:</strong> {alert.message}
+                        </span>
+                      </div>
+                      <span className="font-mono text-[11px]">
+                        Current: {alert.value} (Target: {alert.threshold})
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+                {/* HTTP Traffic & Latency */}
+                <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-5 space-y-2.5">
+                  <div className="text-xs font-bold uppercase tracking-wider text-slate-500">HTTP API Performance</div>
+                  <div className="grid grid-cols-2 gap-2 text-xs">
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                      <div className="text-[11px] text-slate-500">Requests/sec</div>
+                      <div className="font-display text-xl font-bold tabular-nums">{monitoring.http.rpsLast60s}</div>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                      <div className="text-[11px] text-slate-500">In-Flight</div>
+                      <div className="font-display text-xl font-bold tabular-nums">{monitoring.http.inFlight}</div>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                      <div className="text-[11px] text-slate-500">p50 / p95 / p99</div>
+                      <div className="font-mono text-xs font-bold">
+                        {monitoring.http.p50LatencyMs} / {monitoring.http.p95LatencyMs} / {monitoring.http.p99LatencyMs} ms
+                      </div>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                      <div className="text-[11px] text-slate-500">5xx Rate / 429</div>
+                      <div className="font-mono text-xs font-bold">
+                        {monitoring.http.errorRatePercent}% · {monitoring.http.rateLimited429Count} throttled
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Compute & Event Loop */}
+                <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-5 space-y-2.5">
+                  <div className="text-xs font-bold uppercase tracking-wider text-slate-500">Compute &amp; Event Loop</div>
+                  <div className="grid grid-cols-2 gap-2 text-xs">
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                      <div className="text-[11px] text-slate-500">Process CPU</div>
+                      <div className="font-display text-xl font-bold tabular-nums">{monitoring.process.cpuPercent}%</div>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                      <div className="text-[11px] text-slate-500">Event Loop Lag</div>
+                      <div className="font-display text-xl font-bold tabular-nums">{monitoring.process.eventLoopLagMs} ms</div>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                      <div className="text-[11px] text-slate-500">RSS Memory</div>
+                      <div className="font-mono text-xs font-bold">{monitoring.process.rssMb} MB</div>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                      <div className="text-[11px] text-slate-500">Heap Used</div>
+                      <div className="font-mono text-xs font-bold">
+                        {monitoring.process.heapUsedMb} / {monitoring.process.heapTotalMb} MB
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Database Pool & Latency */}
+                <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-5 space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold uppercase tracking-wider text-slate-500">Database Engine</span>
+                    <span
+                      className={`rounded px-2 py-0.5 font-mono text-[10px] font-bold ${
+                        monitoring.database.ok
+                          ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                          : 'bg-rose-500/15 text-rose-700 dark:text-rose-300'
+                      }`}
+                    >
+                      {monitoring.database.dialect.toUpperCase()} · {monitoring.database.ok ? 'HEALTHY' : 'DOWN'}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 text-xs">
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                      <div className="text-[11px] text-slate-500">Health Ping</div>
+                      <div className="font-display text-xl font-bold tabular-nums">
+                        {monitoring.database.healthLatencyMs} ms
+                      </div>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                      <div className="text-[11px] text-slate-500">Pool Connections</div>
+                      <div className="font-mono text-xs font-bold">
+                        {monitoring.database.pool.totalCount} / {monitoring.database.pool.maxConnections} (wait:{' '}
+                        {monitoring.database.pool.waitingCount})
+                      </div>
+                    </div>
+                  </div>
+                  <div className="text-[11px] text-slate-500 flex items-center gap-1.5">
+                    <Database className="h-3.5 w-3.5" />
+                    <span>
+                      Avg query: {monitoring.database.avgQueryLatencyMs} ms · p95:{' '}
+                      {monitoring.database.p95QueryLatencyMs} ms
+                    </span>
+                  </div>
+                </div>
+
+                {/* WebSockets & Pub/Sub */}
+                <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-5 space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold uppercase tracking-wider text-slate-500">WebSockets &amp; Bus</span>
+                    <span className="rounded bg-sky-500/15 px-2 py-0.5 font-mono text-[10px] font-bold text-sky-700 dark:text-sky-300">
+                      PUBSUB: {monitoring.websockets.pubsubMode.toUpperCase()}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 text-xs">
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                      <div className="text-[11px] text-slate-500">Realtime Sockets</div>
+                      <div className="font-mono text-sm font-bold">
+                        {monitoring.websockets.realtimeActive} / {monitoring.websockets.maxRealtimeCapacity}
+                      </div>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                      <div className="text-[11px] text-slate-500">Voice Live Sockets</div>
+                      <div className="font-mono text-sm font-bold">
+                        {monitoring.websockets.liveVoiceActive} / {monitoring.websockets.maxLiveCapacity}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="text-[11px] text-slate-500">
+                    WS Rate-Limited Frames: {monitoring.websockets.rateLimitedMessages}
+                  </div>
+                </div>
+
+                {/* Cache & Retry Queue */}
+                <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-5 space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold uppercase tracking-wider text-slate-500">Cache &amp; Job Queue</span>
+                    <span className="rounded bg-violet-500/15 px-2 py-0.5 font-mono text-[10px] font-bold text-violet-700 dark:text-violet-300">
+                      {monitoring.cacheAndQueue.backend.toUpperCase()}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 text-xs">
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                      <div className="text-[11px] text-slate-500">Cache Hit Rate</div>
+                      <div className="font-display text-xl font-bold tabular-nums">
+                        {monitoring.cacheAndQueue.cacheHitRatePercent}%
+                      </div>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                      <div className="text-[11px] text-slate-500">Retry Queue Depth</div>
+                      <div className="font-display text-xl font-bold tabular-nums">
+                        {monitoring.cacheAndQueue.queueDepth}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="text-[11px] text-slate-500">
+                    Jobs: {monitoring.cacheAndQueue.completedJobs} ok · {monitoring.cacheAndQueue.retriedJobs} retried ·{' '}
+                    {monitoring.cacheAndQueue.failedJobs} failed
+                  </div>
+                </div>
+
+                {/* Gemini AI & SOS Delivery */}
+                <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-5 space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold uppercase tracking-wider text-slate-500">AI Circuit &amp; SOS</span>
+                    <span
+                      className={`rounded px-2 py-0.5 font-mono text-[10px] font-bold ${
+                        monitoring.ai.circuitState === 'closed'
+                          ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                          : 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                      }`}
+                    >
+                      CIRCUIT: {monitoring.ai.circuitState.toUpperCase()}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 text-xs">
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                      <div className="text-[11px] text-slate-500">AI Concurrency</div>
+                      <div className="font-mono text-sm font-bold">
+                        {monitoring.ai.inFlight} / {monitoring.ai.maxConcurrency}
+                      </div>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                      <div className="text-[11px] text-slate-500">SOS Dispatches</div>
+                      <div className="font-mono text-sm font-bold">
+                        {monitoring.sos.totalCreated} new ({monitoring.sos.deduplicatedCount} dedup)
+                      </div>
+                    </div>
+                  </div>
+                  <div className="text-[11px] text-slate-500">
+                    External SOS: {monitoring.sos.externalConfirmed} delivered · {monitoring.sos.externalFailed} failed ·
+                    AI Fallbacks: {monitoring.ai.fallbackCalls}
+                  </div>
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-8 text-center text-xs text-slate-500">
+              Loading live telemetry...
+            </div>
+          )}
         </div>
       )}
 

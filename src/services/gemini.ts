@@ -1,4 +1,6 @@
 import { FunctionDeclaration, GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import { cacheQueue } from './cacheQueue.ts';
+import { metrics } from './metrics.ts';
 
 export const GEMINI_MODELS = {
   reasoning: 'gemini-4-hydrogen',
@@ -35,6 +37,98 @@ export function isGeminiConfigured(env: NodeJS.ProcessEnv = process.env): boolea
   return Boolean(key && key !== 'MY_GEMINI_API_KEY');
 }
 
+// Runtime Concurrency Semaphore + Circuit Breaker + In-Flight Deduplication
+const AI_MAX_CONCURRENCY = Math.min(32, Math.max(1, Number(process.env.AI_MAX_CONCURRENCY || 8)));
+const CIRCUIT_FAILURE_THRESHOLD = 5;
+const CIRCUIT_COOLDOWN_MS = 30_000;
+
+let aiInFlight = 0;
+const aiWaiters: Array<() => void> = [];
+let circuitState: 'closed' | 'open' | 'half-open' = 'closed';
+let consecutiveFailures = 0;
+let circuitOpenedAt = 0;
+const inFlightDedupe = new Map<string, Promise<unknown>>();
+
+export function getAiRuntimeStatus() {
+  if (circuitState === 'open' && Date.now() - circuitOpenedAt >= CIRCUIT_COOLDOWN_MS) {
+    circuitState = 'half-open';
+  }
+  return {
+    configured: isGeminiConfigured(),
+    circuitState,
+    inFlight: aiInFlight,
+    maxConcurrency: AI_MAX_CONCURRENCY,
+  };
+}
+
+export function resetAiRuntimeForTests() {
+  aiInFlight = 0;
+  aiWaiters.splice(0, aiWaiters.length);
+  circuitState = 'closed';
+  consecutiveFailures = 0;
+  circuitOpenedAt = 0;
+  inFlightDedupe.clear();
+}
+
+async function acquireAiSlot(waitTimeoutMs = 5000): Promise<void> {
+  if (aiInFlight < AI_MAX_CONCURRENCY) {
+    aiInFlight++;
+    return;
+  }
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const onGranted = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      aiInFlight++;
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      const idx = aiWaiters.indexOf(onGranted);
+      if (idx >= 0) aiWaiters.splice(idx, 1);
+      reject(new Error('AI concurrency queue saturated'));
+    }, waitTimeoutMs);
+    aiWaiters.push(onGranted);
+  });
+}
+
+function releaseAiSlot() {
+  aiInFlight = Math.max(0, aiInFlight - 1);
+  const next = aiWaiters.shift();
+  if (next) next();
+}
+
+function checkCircuitBeforeCall() {
+  if (circuitState === 'open') {
+    if (Date.now() - circuitOpenedAt >= CIRCUIT_COOLDOWN_MS) {
+      circuitState = 'half-open';
+    } else {
+      throw new GeminiServiceError(
+        'AI circuit breaker is temporarily open to protect server capacity. Showing deterministic safety fallback.',
+        503,
+        'unavailable'
+      );
+    }
+  }
+}
+
+function recordCircuitSuccess() {
+  consecutiveFailures = 0;
+  circuitState = 'closed';
+}
+
+function recordCircuitFailure(reason: AiFallbackReason) {
+  if (reason === 'malformed_response') return;
+  consecutiveFailures++;
+  if (consecutiveFailures >= CIRCUIT_FAILURE_THRESHOLD || circuitState === 'half-open') {
+    circuitState = 'open';
+    circuitOpenedAt = Date.now();
+  }
+}
+
 function getAiClient(clientOverride?: GoogleGenAI | null): GoogleGenAI | null {
   if (clientOverride !== undefined) return clientOverride;
   if (!isGeminiConfigured()) return null;
@@ -54,6 +148,14 @@ export function classifyGeminiError(err: unknown): {
   retryable: boolean;
   publicMessage: string;
 } {
+  if (err instanceof GeminiServiceError) {
+    return {
+      reason: err.reason,
+      statusCode: err.statusCode,
+      retryable: err.reason === 'timeout' || err.reason === 'malformed_response',
+      publicMessage: err.message,
+    };
+  }
   const msg = err instanceof Error ? err.message : String(err);
   const lower = msg.toLowerCase();
 
@@ -103,19 +205,58 @@ export async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, lab
   }
 }
 
-async function withRetryAndTimeout<T>(fn: () => Promise<T>, timeoutMs = 20000, maxAttempts = 2, label = 'Gemini API'): Promise<T> {
-  let lastErr: unknown;
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      return await withTimeout(fn(), timeoutMs, label);
-    } catch (err) {
-      lastErr = err;
-      const classified = classifyGeminiError(err);
-      if (!classified.retryable || i + 1 >= maxAttempts) break;
-      await new Promise((r) => setTimeout(r, 400 * (i + 1)));
-    }
+async function withRetryAndTimeout<T>(
+  fn: () => Promise<T>,
+  timeoutMs = 20000,
+  maxAttempts = 2,
+  label = 'Gemini API',
+  dedupeKey?: string
+): Promise<T> {
+  if (dedupeKey && inFlightDedupe.has(dedupeKey)) {
+    return inFlightDedupe.get(dedupeKey) as Promise<T>;
   }
-  throw lastErr;
+
+  const run = async (): Promise<T> => {
+    checkCircuitBeforeCall();
+    await acquireAiSlot();
+    const t0 = performance.now();
+    try {
+      let lastErr: unknown;
+      for (let i = 0; i < maxAttempts; i++) {
+        try {
+          const out = await withTimeout(fn(), timeoutMs, label);
+          recordCircuitSuccess();
+          metrics.recordAiCall({ durationMs: performance.now() - t0, fallback: false });
+          return out;
+        } catch (err) {
+          lastErr = err;
+          const classified = classifyGeminiError(err);
+          if (!classified.retryable || i + 1 >= maxAttempts) {
+            recordCircuitFailure(classified.reason);
+            metrics.recordAiCall({
+              durationMs: performance.now() - t0,
+              fallback: true,
+              quotaExceeded: classified.reason === 'quota_exceeded',
+            });
+            break;
+          }
+          const jitter = Math.round(Math.random() * 200);
+          await new Promise((r) => setTimeout(r, 350 * Math.pow(2, i) + jitter));
+        }
+      }
+      throw lastErr;
+    } finally {
+      releaseAiSlot();
+    }
+  };
+
+  if (!dedupeKey) return run();
+
+  const promise = run().finally(() => {
+    inFlightDedupe.delete(dedupeKey);
+  });
+  inFlightDedupe.set(dedupeKey, promise);
+  return promise;
 }
 
 export function safeParseJsonObject(rawText: string | undefined | null): Record<string, unknown> | null {
@@ -507,6 +648,22 @@ export async function runResourceDiscoveryAgent(
     typeof input.longitude === 'number' &&
     Number.isFinite(input.longitude);
 
+  const cacheKey = `ai:discovery:${input.query.trim().toLowerCase()}:${
+    hasCoords ? `${input.latitude!.toFixed(2)}:${input.longitude!.toFixed(2)}` : 'global'
+  }`;
+
+  if (options?.client === undefined) {
+    const cached = await cacheQueue.getCachedJson<{
+      modelUsed: string;
+      aiAvailable: boolean;
+      isAiAdvisory: boolean;
+      advisoryNotice: string;
+      summary: string;
+      mapsLinks: Array<{ title: string; uri: string }>;
+    }>(cacheKey);
+    if (cached) return cached;
+  }
+
   try {
     const response = await withRetryAndTimeout(
       () =>
@@ -533,7 +690,8 @@ export async function runResourceDiscoveryAgent(
         }),
       options?.timeoutMs ?? 20000,
       2,
-      'Resource Discovery Agent'
+      'Resource Discovery Agent',
+      options?.client === undefined ? cacheKey : undefined
     );
 
     const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
@@ -548,7 +706,7 @@ export async function runResourceDiscoveryAgent(
       })
       .filter((x): x is { title: string; uri: string } => Boolean(x));
 
-    return {
+    const payload = {
       modelUsed: `${GEMINI_MODELS.reasoning} (Google Maps Grounded)`,
       aiAvailable: true,
       isAiAdvisory: true,
@@ -556,6 +714,11 @@ export async function runResourceDiscoveryAgent(
       summary: response.text || 'Review the grounded Google Maps resources below.',
       mapsLinks,
     };
+
+    if (options?.client === undefined) {
+      await cacheQueue.setCachedJson(cacheKey, payload, 60);
+    }
+    return payload;
   } catch (err) {
     const classified = classifyGeminiError(err);
     return {

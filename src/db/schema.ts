@@ -410,6 +410,28 @@ export const safetyReports = pgTable(
   ]
 );
 
+// 17. system_runtime_config (Shared CSPRNG cluster configuration)
+export const systemRuntimeConfig = pgTable('system_runtime_config', {
+  key: text('key').primaryKey(),
+  value: text('value').notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+// 18. realtime_events (Persistent cross-instance WebSocket replay log)
+export const realtimeEvents = pgTable(
+  'realtime_events',
+  {
+    id: serial('id').primaryKey(),
+    eventId: text('event_id').notNull().unique(),
+    targetUserId: integer('target_user_id'),
+    includeOperators: boolean('include_operators').notNull().default(false),
+    userPayload: jsonb('user_payload').$type<Record<string, unknown>>().notNull(),
+    operatorPayload: jsonb('operator_payload').$type<Record<string, unknown>>().notNull(),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => [index('realtime_events_target_idx').on(table.targetUserId, table.id)]
+);
+
 // Drizzle Relations
 export const usersRelations = relations(users, ({ one, many }) => ({
   profile: one(userProfiles, { fields: [users.id], references: [userProfiles.userId] }),

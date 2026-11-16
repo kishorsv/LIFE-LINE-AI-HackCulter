@@ -1,11 +1,14 @@
 import 'dotenv/config';
+import crypto from 'node:crypto';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import compression from 'compression';
 import express from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
+import { closePool, getPoolStats } from './src/db/index.ts';
 import {
   addTrustedContact,
   assignIncidentToOperator,
@@ -24,10 +27,11 @@ import {
   deleteUserAccount,
   getDemoAccounts,
   getIncidentById,
+  getLatestRealtimeEventSeq,
   getOperationalAnalytics,
+  getOrInitSharedRuntimeSessionSecret,
   getSafetyJourneyById,
   getUserProfile,
-  IncidentRecord,
   initializeDatabase,
   initiatePasswordReset,
   listAllIncidentsForOperator,
@@ -38,6 +42,7 @@ import {
   listIncidentsForUser,
   listNotificationsForUser,
   listOperatorUserIds,
+  listRealtimeEventsSince,
   listRespondersWithAvailability,
   listSafetyJourneysForUser,
   listSafetyReportsForPulse,
@@ -46,6 +51,7 @@ import {
   loginEmailUser,
   markAllNotificationsRead,
   markNotificationRead,
+  recordRealtimeEvent,
   refreshSafetyJourneyRisk,
   registerEmailUser,
   resendVerificationCode,
@@ -67,9 +73,9 @@ import firebaseConfig from './firebase-applet-config.json';
 import {
   AuthRequest,
   FirebaseTokenVerifier,
+  initializeRuntimeSessionSecret,
   requireAuth,
   requireRole,
-  resolveSessionSecret,
   resolveUserFromToken,
   signAppToken,
   verifyAndSyncFirebaseUser,
@@ -103,6 +109,7 @@ import {
 import {
   GEMINI_MODELS,
   GeminiServiceError,
+  getAiRuntimeStatus,
   isGeminiConfigured,
   runEmergencyAssessmentAgent,
   runEmergencyCoordinationAgent,
@@ -121,16 +128,19 @@ import {
   computeSafeRoutesWithGoogle,
   fetchOpenMeteoWeather,
 } from './src/services/pulse.ts';
+import { cacheQueue } from './src/services/cacheQueue.ts';
+import { httpMetricsMiddleware, metrics } from './src/services/metrics.ts';
 import { errorHandlerMiddleware, requestLoggerMiddleware } from './src/services/logger.ts';
 
 const MAPS_ATTRIBUTION_ID = 'gmp_mcp_codeassist_v1_aistudio';
 const OPERATOR_ROLES: UserRole[] = ['emergency_operator', 'support_organization', 'administrator'];
-const MAX_REALTIME_PER_USER = 5;
-const MAX_REALTIME_TOTAL = 200;
-const MAX_LIVE_PER_USER = 2;
-const MAX_LIVE_TOTAL = 50;
+const MAX_REALTIME_PER_USER = Math.max(1, Number(process.env.WS_MAX_REALTIME_PER_USER || 5));
+const MAX_REALTIME_TOTAL = Math.max(50, Number(process.env.WS_MAX_REALTIME_TOTAL || 2000));
+const MAX_LIVE_PER_USER = Math.max(1, Number(process.env.WS_MAX_LIVE_PER_USER || 2));
+const MAX_LIVE_TOTAL = Math.max(10, Number(process.env.WS_MAX_LIVE_TOTAL || 100));
 const REALTIME_REPLAY_LIMIT = 500;
 const WS_HEARTBEAT_INTERVAL_MS = 25_000;
+const REALTIME_BUS_CHANNEL = 'lifeline:realtime:events';
 
 function isConfiguredKey(val: string | undefined, placeholder: string): boolean {
   const trimmed = (val || '').trim();
@@ -140,9 +150,6 @@ function isConfiguredKey(val: string | undefined, placeholder: string): boolean 
 function getServerMapsApiKey(): string {
   if (isConfiguredKey(process.env.GOOGLE_MAPS_API_KEY, 'MY_GOOGLE_MAPS_API_KEY')) {
     return process.env.GOOGLE_MAPS_API_KEY!.trim();
-  }
-  if (isConfiguredKey(process.env.VITE_GOOGLE_MAPS_API_KEY, 'MY_GOOGLE_MAPS_API_KEY')) {
-    return process.env.VITE_GOOGLE_MAPS_API_KEY!.trim();
   }
   return '';
 }
@@ -173,13 +180,64 @@ export async function createAppServer(options?: {
   enableVite?: boolean;
   firebaseVerifier?: FirebaseTokenVerifier;
 }) {
-  // Enforce strong SESSION_SECRET and lock authoritative DB before serving requests
-  resolveSessionSecret();
+  // Initialize authoritative DB first, then resolve or provision shared CSPRNG SESSION_SECRET
   await initializeDatabase();
+  await initializeRuntimeSessionSecret(getOrInitSharedRuntimeSessionSecret);
 
   const app = express();
-  app.use(express.json({ limit: '15mb' }));
+  app.set('trust proxy', 1);
+  app.disable('x-powered-by');
+  app.use(compression());
+
+  // Security headers without inline style breakage for Google Maps / Tailwind SPA
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('X-DNS-Prefetch-Control', 'off');
+    res.setHeader('Permissions-Policy', 'geolocation=(self), microphone=(self), camera=(self)');
+    if (process.env.NODE_ENV === 'production') {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+    next();
+  });
+
+  // Multimodal AI endpoints retain a 10 MB cap; all other routes enforce strict 256 KB limit
+  const largeAiJsonParser = express.json({ limit: '10mb' });
+  app.use('/api/ai/assess-emergency', largeAiJsonParser);
+  app.use('/api/ai/transcribe', largeAiJsonParser);
+  app.use(express.json({ limit: '256kb' }));
   app.use(requestLoggerMiddleware);
+
+  const MAX_INFLIGHT_REQUESTS = Math.max(50, Number(process.env.MAX_INFLIGHT_REQUESTS || 1500));
+  let isDraining = false;
+
+  app.use('/api', (req, res, next) => {
+    if (req.path === '/health' || req.path === '/health/db' || req.path === '/ready') {
+      next();
+      return;
+    }
+    if (isDraining) {
+      res.setHeader('Retry-After', '5');
+      return res.status(503).json({ error: 'Server instance is draining for shutdown.' });
+    }
+    const inFlight = metrics.incrementInFlight();
+    let released = false;
+    const release = () => {
+      if (!released) {
+        released = true;
+        metrics.decrementInFlight();
+      }
+    };
+    res.on('finish', release);
+    res.on('close', release);
+    if (inFlight > MAX_INFLIGHT_REQUESTS) {
+      res.setHeader('Retry-After', '2');
+      return res.status(503).json({ error: 'Server capacity threshold reached. Please retry briefly.' });
+    }
+    next();
+  });
+  app.use(httpMetricsMiddleware);
 
   const allowedOrigins = new Set(
     [
@@ -210,10 +268,13 @@ export async function createAppServer(options?: {
     userId: number;
     role: UserRole;
     isAlive: boolean;
+    msgWindowStart: number;
+    msgCount: number;
   }
 
   interface BufferedRealtimeEvent {
     seq: number;
+    eventId: string;
     targetUserId?: number;
     includeOperators: boolean;
     userPayload: Record<string, unknown>;
@@ -221,9 +282,49 @@ export async function createAppServer(options?: {
   }
 
   const realtimeClients = new Set<RealtimeClient>();
-  const liveClients = new Set<{ ws: WebSocket; userId: number; isAlive: boolean }>();
+  const liveClients = new Set<{
+    ws: WebSocket;
+    userId: number;
+    isAlive: boolean;
+    msgWindowStart: number;
+    msgCount: number;
+  }>();
   const eventReplayBuffer: BufferedRealtimeEvent[] = [];
-  let currentEventSeq = 0;
+  let currentEventSeq = await getLatestRealtimeEventSeq().catch(() => 0);
+
+  function deliverLocalRealtimeEvent(ev: BufferedRealtimeEvent) {
+    if (!cacheQueue.markEventSeen(ev.eventId)) return;
+    currentEventSeq = Math.max(currentEventSeq, ev.seq);
+
+    eventReplayBuffer.push(ev);
+    if (eventReplayBuffer.length > REALTIME_REPLAY_LIMIT) {
+      eventReplayBuffer.shift();
+    }
+
+    const serializedUser = JSON.stringify(ev.userPayload);
+    const serializedOp = JSON.stringify(ev.operatorPayload);
+
+    for (const client of realtimeClients) {
+      if (client.ws.readyState !== WebSocket.OPEN) continue;
+      const isOperator = OPERATOR_ROLES.includes(client.role);
+      const isTargetUser = ev.targetUserId !== undefined && client.userId === ev.targetUserId;
+      if (ev.includeOperators && isOperator) {
+        client.ws.send(serializedOp);
+      } else if (isTargetUser) {
+        client.ws.send(serializedUser);
+      }
+    }
+  }
+
+  await cacheQueue.subscribeBus(REALTIME_BUS_CHANNEL, (raw) => {
+    try {
+      const parsed = JSON.parse(raw) as BufferedRealtimeEvent;
+      if (!parsed || typeof parsed.eventId !== 'string') return;
+      deliverLocalRealtimeEvent(parsed);
+    } catch {
+      // ignore malformed bus message
+    }
+  });
 
   function pushAndBroadcastRealtimeEvent(params: {
     targetUserId?: number;
@@ -232,34 +333,37 @@ export async function createAppServer(options?: {
     operatorPayload?: Record<string, unknown>;
   }) {
     const seq = ++currentEventSeq;
+    const eventId = crypto.randomUUID();
     const includeOperators = Boolean(params.includeOperators);
     const userMsg = { ...params.userPayload, seq };
     const opMsg = { ...(params.operatorPayload || params.userPayload), seq };
 
-    eventReplayBuffer.push({
+    const ev: BufferedRealtimeEvent = {
       seq,
+      eventId,
       targetUserId: params.targetUserId,
       includeOperators,
       userPayload: userMsg,
       operatorPayload: opMsg,
+    };
+
+    // Deliver immediately to local sockets and mark eventId seen before Redis fan-out
+    deliverLocalRealtimeEvent(ev);
+
+    if (cacheQueue.isRedisActive()) {
+      void cacheQueue.publishBus(REALTIME_BUS_CHANNEL, ev as unknown as Record<string, unknown>);
+    }
+
+    // Durable persistence for multi-instance replay (?since=<seq>) and restarts
+    void recordRealtimeEvent({
+      eventId,
+      targetUserId: params.targetUserId ?? undefined,
+      includeOperators,
+      userPayload: userMsg,
+      operatorPayload: opMsg,
+    }).catch((err) => {
+      console.error('[realtime] Failed to persist event:', err);
     });
-    if (eventReplayBuffer.length > REALTIME_REPLAY_LIMIT) {
-      eventReplayBuffer.shift();
-    }
-
-    const serializedUser = JSON.stringify(userMsg);
-    const serializedOp = JSON.stringify(opMsg);
-
-    for (const client of realtimeClients) {
-      if (client.ws.readyState !== WebSocket.OPEN) continue;
-      const isOperator = OPERATOR_ROLES.includes(client.role);
-      const isTargetUser = params.targetUserId !== undefined && client.userId === params.targetUserId;
-      if (includeOperators && isOperator) {
-        client.ws.send(serializedOp);
-      } else if (isTargetUser) {
-        client.ws.send(serializedUser);
-      }
-    }
   }
 
   function sendRealtimeToUser(userId: number, payload: Record<string, unknown>) {
@@ -342,6 +446,7 @@ export async function createAppServer(options?: {
       service: 'LIFE-LINE AI',
       timestamp: new Date().toISOString(),
       database: dbHealth,
+      redisActive: cacheQueue.isRedisActive(),
       aiConfigured: isGeminiConfigured(),
       aiModels: GEMINI_MODELS,
       mapsConfigured: Boolean(getServerMapsApiKey() || getPublicClientMapsApiKey()),
@@ -357,6 +462,22 @@ export async function createAppServer(options?: {
   app.get('/api/health/db', async (_req, res) => {
     const dbHealth = await checkDatabaseHealth();
     res.status(dbHealth.ok ? 200 : 503).json(dbHealth);
+  });
+
+  app.get('/api/ready', async (_req, res) => {
+    if (isDraining) {
+      return res.status(503).json({ ready: false, reason: 'draining' });
+    }
+    const dbHealth = await checkDatabaseHealth();
+    if (!dbHealth.ok) {
+      return res.status(503).json({ ready: false, reason: 'database_unavailable', database: dbHealth });
+    }
+    res.json({
+      ready: true,
+      dialect: dbHealth.dialect,
+      redisActive: cacheQueue.isRedisActive(),
+      inFlight: metrics.getInFlight(),
+    });
   });
 
   app.get('/api/config/public', (_req, res) => {
@@ -969,6 +1090,7 @@ export async function createAppServer(options?: {
             error: l.errorMessage || undefined,
           })),
         };
+        metrics.recordSosOutcome({ deduplicated: true, confirmedCount: confirmed, failedCount: failed });
         return res.status(200).json({
           incident: sanitizeIncidentForViewer(incident, req.appUser!.role),
           deliveryResults: dedupSummary.deliveryResults,
@@ -1055,6 +1177,13 @@ export async function createAppServer(options?: {
         },
         ipAddress: req.ip,
       });
+
+      metrics.recordSosOutcome({
+        deduplicated: false,
+        confirmedCount: dispatchSummary.externalConfirmedCount,
+        failedCount: dispatchSummary.externalFailedCount,
+      });
+      void cacheQueue.invalidateCachePrefix('analytics:');
 
       const sanitizedForReporter = sanitizeIncidentForViewer(finalIncident, 'regular_user');
       pushAndBroadcastRealtimeEvent({
@@ -1259,6 +1388,8 @@ export async function createAppServer(options?: {
         details: { previousStatus: existing.status, newStatus: status, isInternal: isOperator ? Boolean(isInternal) : false },
         ipAddress: req.ip,
       });
+
+      void cacheQueue.invalidateCachePrefix('analytics:');
 
       const sanitizedForReporter = sanitizeIncidentForViewer(updated, 'regular_user');
       pushAndBroadcastRealtimeEvent({
@@ -2363,14 +2494,56 @@ export async function createAppServer(options?: {
     }
   });
 
+  app.get(
+    '/api/admin/monitoring',
+    requireAuth,
+    requireRole(['administrator', 'emergency_operator']),
+    async (_req, res) => {
+      try {
+        const dbHealth = await checkDatabaseHealth();
+        const cacheStats = cacheQueue.getStats();
+        const aiRuntime = getAiRuntimeStatus();
+        const snapshot = metrics.buildSnapshot({
+          database: {
+            dialect: dbHealth.dialect,
+            ok: dbHealth.ok,
+            healthLatencyMs: dbHealth.latencyMs,
+            avgQueryLatencyMs: 0,
+            p95QueryLatencyMs: 0,
+            pool:
+              dbHealth.dialect === 'postgres'
+                ? getPoolStats()
+                : { totalCount: 1, idleCount: 1, waitingCount: 0, maxConnections: 1 },
+          },
+          websockets: {
+            realtimeActive: realtimeClients.size,
+            liveVoiceActive: liveClients.size,
+            maxRealtimeCapacity: MAX_REALTIME_TOTAL,
+            maxLiveCapacity: MAX_LIVE_TOTAL,
+            pubsubMode: cacheQueue.isRedisActive() ? 'redis' : 'local',
+          },
+          cacheAndQueue: cacheStats,
+          aiRuntime,
+        });
+        res.json(snapshot);
+      } catch (err) {
+        res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to collect monitoring snapshot.' });
+      }
+    }
+  );
+
   app.use('/api', errorHandlerMiddleware);
 
   // ========================
   // HTTP SERVER + VITE / STATIC + HARDENED WEBSOCKETS
   // ========================
   const httpServer = http.createServer(app);
-  const wssRealtime = new WebSocketServer({ noServer: true });
-  const wssLive = new WebSocketServer({ noServer: true });
+  httpServer.keepAliveTimeout = 65_000;
+  httpServer.headersTimeout = 66_000;
+  httpServer.requestTimeout = 30_000;
+
+  const wssRealtime = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
+  const wssLive = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024 });
 
   wssRealtime.on('connection', async (ws, req) => {
     const token = extractWsToken(req);
@@ -2399,6 +2572,8 @@ export async function createAppServer(options?: {
       userId: resolvedUser.id,
       role: resolvedUser.role,
       isAlive: true,
+      msgWindowStart: Date.now(),
+      msgCount: 0,
     };
     realtimeClients.add(clientEntry);
 
@@ -2407,6 +2582,20 @@ export async function createAppServer(options?: {
     });
 
     ws.on('message', (raw) => {
+      const now = Date.now();
+      if (now - clientEntry.msgWindowStart > 10_000) {
+        clientEntry.msgWindowStart = now;
+        clientEntry.msgCount = 0;
+      }
+      clientEntry.msgCount++;
+      if (clientEntry.msgCount > 30) {
+        metrics.recordWsRateLimited();
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'error', error: 'WebSocket message rate limit exceeded.' }));
+        }
+        return;
+      }
+
       try {
         const msg = JSON.parse(raw.toString()) as { type?: string };
         if (msg.type === 'ping') {
@@ -2428,14 +2617,28 @@ export async function createAppServer(options?: {
       })
     );
 
-    // Missed-event recovery when reconnecting with ?since=<seq>
+    // Missed-event recovery combining durable DB event history + local buffer via ?since=<seq>
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const sinceParam = url.searchParams.get('since');
     if (sinceParam && /^\d+$/.test(sinceParam)) {
       const sinceSeq = Number(sinceParam);
       const isOperator = OPERATOR_ROLES.includes(resolvedUser.role);
+      const deliveredSeqs = new Set<number>();
+
+      try {
+        const persisted = await listRealtimeEventsSince(sinceSeq, resolvedUser.id, isOperator, 200);
+        for (const item of persisted) {
+          if (ws.readyState !== WebSocket.OPEN) break;
+          deliveredSeqs.add(item.seq);
+          ws.send(JSON.stringify(item.payload));
+        }
+      } catch {
+        // fall through to local replay buffer
+      }
+
       for (const ev of eventReplayBuffer) {
-        if (ev.seq <= sinceSeq) continue;
+        if (ev.seq <= sinceSeq || deliveredSeqs.has(ev.seq)) continue;
+        if (ws.readyState !== WebSocket.OPEN) break;
         if (ev.includeOperators && isOperator) {
           ws.send(JSON.stringify(ev.operatorPayload));
         } else if (ev.targetUserId === resolvedUser.id) {
@@ -2470,7 +2673,13 @@ export async function createAppServer(options?: {
       return;
     }
 
-    const liveEntry = { ws: clientWs, userId: resolvedUser.id, isAlive: true };
+    const liveEntry = {
+      ws: clientWs,
+      userId: resolvedUser.id,
+      isAlive: true,
+      msgWindowStart: Date.now(),
+      msgCount: 0,
+    };
     liveClients.add(liveEntry);
     clientWs.on('pong', () => {
       liveEntry.isAlive = true;
@@ -2544,6 +2753,16 @@ export async function createAppServer(options?: {
 
     clientWs.on('message', (raw) => {
       if (!session) return;
+      const now = Date.now();
+      if (now - liveEntry.msgWindowStart > 10_000) {
+        liveEntry.msgWindowStart = now;
+        liveEntry.msgCount = 0;
+      }
+      liveEntry.msgCount++;
+      if (liveEntry.msgCount > 200) {
+        metrics.recordWsRateLimited();
+        return;
+      }
       try {
         const payload = JSON.parse(raw.toString()) as { type?: string; audio?: string; text?: string };
         if (payload.type === 'ping') {
@@ -2621,10 +2840,6 @@ export async function createAppServer(options?: {
       appType: 'spa',
     });
 
-    // Vite 8's /@vite/client unconditionally opens an HMR WebSocket (defaulting to port 24678
-    // in middlewareMode) even when hmr: false and ws: false. Replace its WebSocket transport
-    // with a synchronous no-op transport so transport.connect() marks it connected without
-    // opening a socket and import.meta.hot.send() (e.g. vite-plugin-pwa) never throws.
     app.get('/@vite/client', async (_req, res, next) => {
       try {
         const result = await viteServer!.transformRequest('/@vite/client');
@@ -2644,20 +2859,43 @@ export async function createAppServer(options?: {
     app.use(viteServer.middlewares);
   } else if (process.env.NODE_ENV === 'production') {
     const distDir = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distDir));
+    app.use(
+      '/assets',
+      express.static(path.join(distDir, 'assets'), {
+        maxAge: '365d',
+        immutable: true,
+      })
+    );
+    app.use(express.static(distDir, { maxAge: '1h' }));
     app.get('*', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-cache');
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }
 
   const shutdown = async () => {
+    isDraining = true;
     clearInterval(heartbeatInterval);
-    for (const c of realtimeClients) c.ws.close();
-    for (const c of liveClients) c.ws.close();
+    for (const c of realtimeClients) {
+      try {
+        c.ws.close(1012, 'Server restarting');
+      } catch {
+        // ignore
+      }
+    }
+    for (const c of liveClients) {
+      try {
+        c.ws.close(1012, 'Server restarting');
+      } catch {
+        // ignore
+      }
+    }
     wssRealtime.close();
     wssLive.close();
     if (viteServer) await viteServer.close();
     await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    await cacheQueue.close().catch(() => {});
+    await closePool().catch(() => {});
   };
 
   return { app, httpServer, wssRealtime, wssLive, shutdown };
@@ -2665,9 +2903,24 @@ export async function createAppServer(options?: {
 
 async function startServer() {
   const PORT = Number(process.env.PORT || 3000);
-  const { httpServer } = await createAppServer();
+  const { httpServer, shutdown } = await createAppServer();
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`LIFE-LINE AI server listening on http://0.0.0.0:${PORT}`);
+  });
+
+  let shuttingDown = false;
+  const handleSignal = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[server] Received ${signal}, initiating graceful shutdown...`);
+    void shutdown().finally(() => {
+      process.exit(0);
+    });
+  };
+  process.on('SIGTERM', () => handleSignal('SIGTERM'));
+  process.on('SIGINT', () => handleSignal('SIGINT'));
+  process.on('unhandledRejection', (reason) => {
+    console.error('[server] Unhandled promise rejection:', reason);
   });
 }
 

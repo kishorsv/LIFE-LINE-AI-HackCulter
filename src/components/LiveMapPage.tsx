@@ -254,6 +254,7 @@ export function LiveMapPage() {
   const [manualAddress, setManualAddress] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('All');
   const [searchQuery, setSearchQuery] = useState('');
+  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('');
   const [directory, setDirectory] = useState<SupportResource[]>([]);
   const [livePlaces, setLivePlaces] = useState<LivePlaceResult[]>([]);
   const [placesError, setPlacesError] = useState('');
@@ -288,14 +289,21 @@ export function LiveMapPage() {
   }, []);
 
   useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearchQuery(searchQuery);
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
+
+  useEffect(() => {
     const params = new URLSearchParams();
     if (categoryFilter !== 'All') params.set('category', categoryFilter);
-    if (searchQuery.trim()) params.set('q', searchQuery.trim());
+    if (debouncedSearchQuery.trim()) params.set('q', debouncedSearchQuery.trim());
     fetch(`/api/support-directory?${params.toString()}`)
       .then((r) => r.json())
       .then((d: { resources?: SupportResource[] }) => setDirectory(d.resources || []))
       .catch(() => {});
-  }, [categoryFilter, searchQuery]);
+  }, [categoryFilter, debouncedSearchQuery]);
 
   useEffect(() => {
     let active = true;

@@ -346,3 +346,89 @@ export interface SosClusterAnalyticsResponse {
   hourlyDistribution: SosClusterHourlyBucket[];
   privacyNotice: string;
 }
+
+export interface MonitoringSnapshot {
+  timestamp: string;
+  uptimeSeconds: number;
+  nodeVersion: string;
+  process: {
+    rssMb: number;
+    heapUsedMb: number;
+    heapTotalMb: number;
+    cpuPercent: number;
+    eventLoopLagMs: number;
+  };
+  http: {
+    inFlight: number;
+    totalRequests: number;
+    rpsLast60s: number;
+    error5xxCount: number;
+    errorRatePercent: number;
+    rateLimited429Count: number;
+    overload503Count: number;
+    avgLatencyMs: number;
+    p50LatencyMs: number;
+    p95LatencyMs: number;
+    p99LatencyMs: number;
+  };
+  database: {
+    dialect: string;
+    ok: boolean;
+    healthLatencyMs: number;
+    avgQueryLatencyMs: number;
+    p95QueryLatencyMs: number;
+    pool: {
+      totalCount: number;
+      idleCount: number;
+      waitingCount: number;
+      maxConnections: number;
+    };
+  };
+  websockets: {
+    realtimeActive: number;
+    liveVoiceActive: number;
+    maxRealtimeCapacity: number;
+    maxLiveCapacity: number;
+    rateLimitedMessages: number;
+    pubsubMode: 'redis' | 'local';
+  };
+  cacheAndQueue: {
+    backend: 'redis' | 'memory';
+    redisConnected: boolean;
+    cacheHits: number;
+    cacheMisses: number;
+    cacheHitRatePercent: number;
+    queueDepth: number;
+    activeWorkers: number;
+    completedJobs: number;
+    failedJobs: number;
+    retriedJobs: number;
+  };
+  ai: {
+    configured: boolean;
+    circuitState: 'closed' | 'open' | 'half-open';
+    inFlight: number;
+    maxConcurrency: number;
+    totalCalls: number;
+    fallbackCalls: number;
+    quotaExceededCount: number;
+    avgLatencyMs: number;
+  };
+  sos: {
+    totalCreated: number;
+    deduplicatedCount: number;
+    externalConfirmed: number;
+    externalFailed: number;
+    lastDeliveryAt: string | null;
+  };
+  alerts: Array<{
+    id: string;
+    severity: 'warning' | 'critical';
+    title: string;
+    message: string;
+    value: string;
+    threshold: string;
+    triggeredAt: string;
+  }>;
+}
+

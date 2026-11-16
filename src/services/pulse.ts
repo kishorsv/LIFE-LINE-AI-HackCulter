@@ -1,3 +1,7 @@
+import { cacheQueue } from './cacheQueue.ts';
+
+const weatherInFlight = new Map<string, Promise<WeatherSnapshot>>();
+
 export interface GeoPoint {
   lat: number;
   lng: number;
@@ -152,10 +156,10 @@ export function describeWmoWeatherCode(code: number | null | undefined): string 
   return `Weather condition code ${code}`;
 }
 
-export async function fetchOpenMeteoWeather(
+async function executeOpenMeteoFetch(
   lat: number,
   lng: number,
-  fetchImpl: typeof fetch = fetch
+  fetchImpl: typeof fetch
 ): Promise<WeatherSnapshot> {
   const retrievedAt = new Date().toISOString();
   const url =
@@ -167,7 +171,7 @@ export async function fetchOpenMeteoWeather(
   try {
     const resp = await fetchImpl(url, {
       method: 'GET',
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(2500),
     });
     if (!resp.ok) {
       return {
@@ -232,6 +236,40 @@ export async function fetchOpenMeteoWeather(
       reason: err instanceof Error ? `Weather telemetry unreachable: ${err.message}` : 'Weather telemetry unreachable.',
     };
   }
+}
+
+export async function fetchOpenMeteoWeather(
+  lat: number,
+  lng: number,
+  fetchImpl: typeof fetch = fetch
+): Promise<WeatherSnapshot> {
+  // Preserve direct invocation when tests inject a custom mock fetch implementation
+  if (fetchImpl !== fetch) {
+    return executeOpenMeteoFetch(lat, lng, fetchImpl);
+  }
+
+  const cacheKey = `pulse:weather:${lat.toFixed(2)}:${lng.toFixed(2)}`;
+  const cached = await cacheQueue.getCachedJson<WeatherSnapshot>(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const existingFlight = weatherInFlight.get(cacheKey);
+  if (existingFlight) {
+    return existingFlight;
+  }
+
+  const promise = (async () => {
+    const result = await executeOpenMeteoFetch(lat, lng, fetchImpl);
+    // Cache live telemetry for 3 minutes and transient unavailability for 30s to prevent request pileups
+    await cacheQueue.setCachedJson(cacheKey, result, result.available ? 180 : 30);
+    return result;
+  })().finally(() => {
+    weatherInFlight.delete(cacheKey);
+  });
+
+  weatherInFlight.set(cacheKey, promise);
+  return promise;
 }
 
 export interface NearbyIncidentInput {

@@ -408,6 +408,23 @@ async function runPostgresMigrations(): Promise<string> {
       CREATE INDEX IF NOT EXISTS incidents_sim_status_created_idx ON emergency_incidents(is_simulated, status, created_at DESC);
       CREATE INDEX IF NOT EXISTS notifications_user_read_created_idx ON notifications(user_id, is_read, created_at DESC);
       CREATE INDEX IF NOT EXISTS safety_reports_sim_created_idx ON safety_reports(is_simulated, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS system_runtime_config (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS realtime_events (
+        id SERIAL PRIMARY KEY,
+        event_id TEXT NOT NULL UNIQUE,
+        target_user_id INTEGER,
+        include_operators BOOLEAN NOT NULL DEFAULT FALSE,
+        user_payload JSONB NOT NULL,
+        operator_payload JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS realtime_events_target_idx ON realtime_events(target_user_id, id);
     `);
     await queryWithRetry("INSERT INTO schema_migrations (version) VALUES ('v5_scalability_indexes') ON CONFLICT DO NOTHING");
   }
@@ -3382,4 +3399,181 @@ export async function listIncidentsForPulse(limit = 150) {
     createdAt: String(r.created_at),
   }));
 }
+
+// ========================
+// SHARED CLUSTER RUNTIME SECRET & PERSISTENT REALTIME EVENT LOG
+// ========================
+export async function getOrInitSharedRuntimeSessionSecret(): Promise<string> {
+  const dialect = await ensureDialect();
+  const generated = crypto.randomBytes(32).toString('hex');
+  const KEY_NAME = 'session_signing_secret';
+
+  if (dialect === 'postgres') {
+    await queryWithRetry(
+      `CREATE TABLE IF NOT EXISTS system_runtime_config (
+         key TEXT PRIMARY KEY,
+         value TEXT NOT NULL,
+         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+       )`
+    );
+    await queryWithRetry(
+      `INSERT INTO system_runtime_config (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING`,
+      [KEY_NAME, generated]
+    );
+    const res = await queryWithRetry<{ value: string }>(
+      'SELECT value FROM system_runtime_config WHERE key = $1 LIMIT 1',
+      [KEY_NAME]
+    );
+    return res.rows[0]?.value || generated;
+  }
+
+  sqlite
+    .prepare('INSERT OR IGNORE INTO system_runtime_config (key, value) VALUES (?, ?)')
+    .run(KEY_NAME, generated);
+  const row = sqlite
+    .prepare('SELECT value FROM system_runtime_config WHERE key = ? LIMIT 1')
+    .get(KEY_NAME) as { value?: string } | undefined;
+  return row?.value || generated;
+}
+
+export interface PersistedRealtimeEventRecord {
+  seq: number;
+  eventId: string;
+  targetUserId: number | null;
+  includeOperators: boolean;
+  userPayload: Record<string, unknown>;
+  operatorPayload: Record<string, unknown>;
+}
+
+export async function recordRealtimeEvent(input: {
+  eventId: string;
+  targetUserId?: number;
+  includeOperators: boolean;
+  userPayload: Record<string, unknown>;
+  operatorPayload: Record<string, unknown>;
+}): Promise<PersistedRealtimeEventRecord> {
+  const dialect = await ensureDialect();
+
+  if (dialect === 'postgres') {
+    const res = await queryWithRetry<{ id: number }>(
+      `INSERT INTO realtime_events (event_id, target_user_id, include_operators, user_payload, operator_payload)
+       VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
+       ON CONFLICT (event_id) DO UPDATE SET event_id = EXCLUDED.event_id
+       RETURNING id`,
+      [
+        input.eventId,
+        input.targetUserId ?? null,
+        input.includeOperators,
+        JSON.stringify(input.userPayload),
+        JSON.stringify(input.operatorPayload),
+      ]
+    );
+    const seq = Number(res.rows[0].id);
+    const userMsg = { ...input.userPayload, seq, eventId: input.eventId };
+    const opMsg = { ...input.operatorPayload, seq, eventId: input.eventId };
+    await queryWithRetry(
+      'UPDATE realtime_events SET user_payload = $1::jsonb, operator_payload = $2::jsonb WHERE id = $3',
+      [JSON.stringify(userMsg), JSON.stringify(opMsg), seq]
+    );
+    return {
+      seq,
+      eventId: input.eventId,
+      targetUserId: input.targetUserId ?? null,
+      includeOperators: input.includeOperators,
+      userPayload: userMsg,
+      operatorPayload: opMsg,
+    };
+  }
+
+  const res = sqlite
+    .prepare(
+      `INSERT INTO realtime_events (event_id, target_user_id, include_operators, user_payload, operator_payload)
+       VALUES (?, ?, ?, ?, ?)`
+    )
+    .run(
+      input.eventId,
+      input.targetUserId ?? null,
+      input.includeOperators ? 1 : 0,
+      JSON.stringify(input.userPayload),
+      JSON.stringify(input.operatorPayload)
+    );
+  const seq = Number(res.lastInsertRowid);
+  const userMsg = { ...input.userPayload, seq, eventId: input.eventId };
+  const opMsg = { ...input.operatorPayload, seq, eventId: input.eventId };
+  sqlite
+    .prepare('UPDATE realtime_events SET user_payload = ?, operator_payload = ? WHERE id = ?')
+    .run(JSON.stringify(userMsg), JSON.stringify(opMsg), seq);
+  return {
+    seq,
+    eventId: input.eventId,
+    targetUserId: input.targetUserId ?? null,
+    includeOperators: input.includeOperators,
+    userPayload: userMsg,
+    operatorPayload: opMsg,
+  };
+}
+
+export async function getLatestRealtimeEventSeq(): Promise<number> {
+  const dialect = await ensureDialect();
+  if (dialect === 'postgres') {
+    const res = await queryWithRetry<{ max_id: number | null }>('SELECT MAX(id)::int AS max_id FROM realtime_events');
+    return Number(res.rows[0]?.max_id || 0);
+  }
+  const row = sqlite.prepare('SELECT MAX(id) AS max_id FROM realtime_events').get() as { max_id: number | null } | undefined;
+  return Number(row?.max_id || 0);
+}
+
+export async function listRealtimeEventsSince(
+  sinceSeq: number,
+  viewerUserId: number,
+  isOperator: boolean,
+  limit = 200
+): Promise<Array<{ seq: number; payload: Record<string, unknown> }>> {
+  const dialect = await ensureDialect();
+  if (dialect === 'postgres') {
+    const res = await queryWithRetry<{
+      id: number;
+      target_user_id: number | null;
+      include_operators: boolean;
+      user_payload: Record<string, unknown>;
+      operator_payload: Record<string, unknown>;
+    }>(
+      `SELECT id, target_user_id, include_operators, user_payload, operator_payload
+       FROM realtime_events
+       WHERE id > $1 AND ((include_operators = TRUE AND $3 = TRUE) OR target_user_id = $2)
+       ORDER BY id ASC
+       LIMIT $4`,
+      [sinceSeq, viewerUserId, isOperator, limit]
+    );
+    return res.rows.map((r) => ({
+      seq: Number(r.id),
+      payload: r.include_operators && isOperator ? r.operator_payload : r.user_payload,
+    }));
+  }
+
+  const rows = sqlite
+    .prepare(
+      `SELECT id, target_user_id, include_operators, user_payload, operator_payload
+       FROM realtime_events
+       WHERE id > ? AND ((include_operators = 1 AND ? = 1) OR target_user_id = ?)
+       ORDER BY id ASC
+       LIMIT ?`
+    )
+    .all(sinceSeq, isOperator ? 1 : 0, viewerUserId, limit) as Array<{
+    id: number;
+    target_user_id: number | null;
+    include_operators: number;
+    user_payload: string;
+    operator_payload: string;
+  }>;
+
+  return rows.map((r) => ({
+    seq: Number(r.id),
+    payload: JSON.parse(r.include_operators && isOperator ? r.operator_payload : r.user_payload) as Record<
+      string,
+      unknown
+    >,
+  }));
+}
+
 

@@ -212,7 +212,7 @@ class MetricsRegistry {
   buildSnapshot(extra: {
     database: MonitoringSnapshot['database'];
     websockets: Omit<MonitoringSnapshot['websockets'], 'rateLimitedMessages'>;
-    cacheAndQueue: MonitoringSnapshot['cacheAndQueue'];
+    cacheAndQueue: Omit<MonitoringSnapshot['cacheAndQueue'], 'cacheHitRatePercent'>;
     aiRuntime: {
       configured: boolean;
       circuitState: 'closed' | 'open' | 'half-open';

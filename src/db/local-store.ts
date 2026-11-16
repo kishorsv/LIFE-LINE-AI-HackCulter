@@ -446,6 +446,23 @@ export function runSqliteMigrations(): string {
         CREATE INDEX IF NOT EXISTS notifications_user_read_created_idx ON notifications(user_id, is_read, created_at DESC);
         CREATE INDEX IF NOT EXISTS safety_reports_sim_created_idx ON safety_reports(is_simulated, created_at DESC);
         CREATE INDEX IF NOT EXISTS audit_logs_created_idx ON audit_logs(created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS system_runtime_config (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS realtime_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_id TEXT NOT NULL UNIQUE,
+          target_user_id INTEGER,
+          include_operators INTEGER NOT NULL DEFAULT 0,
+          user_payload TEXT NOT NULL,
+          operator_payload TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS realtime_events_target_idx ON realtime_events(target_user_id, id);
       `);
       sqlite.prepare("INSERT OR IGNORE INTO schema_migrations (version) VALUES ('v5_scalability_indexes')").run();
     });

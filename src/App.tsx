@@ -1,21 +1,15 @@
-import React, { useEffect, useState } from 'react';
+import React, { Suspense, useEffect, useState } from 'react';
 import { Check, X } from 'lucide-react';
 import { ThemeProvider } from './contexts/ThemeContext.tsx';
 import { AuthProvider, useAuth } from './contexts/AuthContext.tsx';
 import { ActiveView, WorkspaceConfirmPayload } from './types/lifeline.ts';
 import { Navbar } from './components/Navbar.tsx';
 import { LandingPage } from './components/LandingPage.tsx';
-import { UserDashboard } from './components/UserDashboard.tsx';
-import { LiveMapPage } from './components/LiveMapPage.tsx';
-import { AiAgentsHub } from './components/AiAgentsHub.tsx';
-import { OperatorDashboard } from './components/OperatorDashboard.tsx';
-import { ProfileSettings } from './components/ProfileSettings.tsx';
 import { AuthModal } from './components/AuthModal.tsx';
 import { SosModal } from './components/SosModal.tsx';
 import { WorkspaceConfirmModal } from './components/WorkspaceConfirmModal.tsx';
 import { OfflineIndicator } from './components/OfflineIndicator.tsx';
 import { FirebaseAuthBlockedAlert } from './components/FirebaseAuthBlockedAlert.tsx';
-import { PulseHub } from './components/PulseHub.tsx';
 import { LifeLineLogo } from './components/LifeLineLogo.tsx';
 import {
   clearLegacySharedSosQueue,
@@ -24,6 +18,39 @@ import {
   recordQueuedSosRetryFailure,
   removeQueuedSos,
 } from './lib/offlineSosQueue.ts';
+
+const UserDashboard = React.lazy(() =>
+  import('./components/UserDashboard.tsx').then((m) => ({ default: m.UserDashboard }))
+);
+const LiveMapPage = React.lazy(() =>
+  import('./components/LiveMapPage.tsx').then((m) => ({ default: m.LiveMapPage }))
+);
+const AiAgentsHub = React.lazy(() =>
+  import('./components/AiAgentsHub.tsx').then((m) => ({ default: m.AiAgentsHub }))
+);
+const OperatorDashboard = React.lazy(() =>
+  import('./components/OperatorDashboard.tsx').then((m) => ({ default: m.OperatorDashboard }))
+);
+const ProfileSettings = React.lazy(() =>
+  import('./components/ProfileSettings.tsx').then((m) => ({ default: m.ProfileSettings }))
+);
+const PulseHub = React.lazy(() =>
+  import('./components/PulseHub.tsx').then((m) => ({ default: m.PulseHub }))
+);
+
+function ViewLoadingSkeleton() {
+  return (
+    <div className="mx-auto max-w-7xl px-4 py-12 sm:px-6 space-y-6 animate-pulse">
+      <div className="h-8 w-64 rounded-xl bg-slate-200 dark:bg-slate-800/80" />
+      <div className="grid gap-4 md:grid-cols-3">
+        <div className="h-32 rounded-2xl bg-slate-200 dark:bg-slate-800/70" />
+        <div className="h-32 rounded-2xl bg-slate-200 dark:bg-slate-800/70" />
+        <div className="h-32 rounded-2xl bg-slate-200 dark:bg-slate-800/70" />
+      </div>
+      <div className="h-72 rounded-2xl bg-slate-200 dark:bg-slate-800/60" />
+    </div>
+  );
+}
 
 function AppShell() {
   const {
@@ -292,7 +319,9 @@ function AppShell() {
         </div>
       )}
 
-      <main>{renderMainContent()}</main>
+      <main>
+        <Suspense fallback={<ViewLoadingSkeleton />}>{renderMainContent()}</Suspense>
+      </main>
 
       <AuthModal
         open={authOpen}

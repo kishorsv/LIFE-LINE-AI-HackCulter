@@ -6,6 +6,7 @@ import { AppUser, getOrCreateUserByFirebase, getUserById, UserRole } from '../db
 const WEAK_SECRETS = new Set([
   'lifeline-ai-dev-session-secret',
   'my_session_secret',
+  'my-session-secret',
   'changeme',
   'secret',
   'default',
@@ -13,6 +14,7 @@ const WEAK_SECRETS = new Set([
 ]);
 
 let ephemeralDevSecret: string | null = null;
+let runtimeDbSecret: string | null = null;
 
 export function resolveSessionSecret(env: NodeJS.ProcessEnv = process.env): string {
   const configured = (env.SESSION_SECRET || '').trim();
@@ -34,6 +36,9 @@ export function resolveSessionSecret(env: NodeJS.ProcessEnv = process.env): stri
   }
 
   if (isProd) {
+    if (runtimeDbSecret && runtimeDbSecret.length >= 32) {
+      return runtimeDbSecret;
+    }
     throw new Error(
       'FATAL SECURITY ERROR: SESSION_SECRET environment variable is required in production (minimum 32 characters).'
     );
@@ -48,8 +53,39 @@ export function resolveSessionSecret(env: NodeJS.ProcessEnv = process.env): stri
   return ephemeralDevSecret;
 }
 
+/**
+ * Ensures production servers running in managed environments (e.g. Cloud Run) where SESSION_SECRET
+ * was omitted or set to a short placeholder obtain a shared 256-bit CSPRNG secret persisted in the
+ * authoritative database so multiple scaled instances verify each other's tokens without crashing.
+ */
+export async function initializeRuntimeSessionSecret(
+  loadOrCreateDbSecret: () => Promise<string>,
+  env: NodeJS.ProcessEnv = process.env
+): Promise<string> {
+  runtimeDbSecret = null;
+  try {
+    return resolveSessionSecret(env);
+  } catch (err) {
+    const canUseDbSecret =
+      env.NODE_ENV === 'production' && env.ALLOW_DB_SESSION_SECRET !== 'false';
+    if (!canUseDbSecret) {
+      throw err;
+    }
+    const dbSecret = await loadOrCreateDbSecret();
+    if (!dbSecret || dbSecret.length < 32) {
+      throw err;
+    }
+    runtimeDbSecret = dbSecret;
+    console.warn(
+      '[security] SESSION_SECRET missing or <32 chars in production; initialized shared 256-bit CSPRNG signing key in authoritative database. Set SESSION_SECRET in Cloud Run Secrets for manual key rotation.'
+    );
+    return runtimeDbSecret;
+  }
+}
+
 export function resetEphemeralSecretForTests() {
   ephemeralDevSecret = null;
+  runtimeDbSecret = null;
 }
 
 export interface AuthRequest extends Request {

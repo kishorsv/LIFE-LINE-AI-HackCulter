@@ -19,7 +19,7 @@ export function hasPostgresConfig(env: NodeJS.ProcessEnv = process.env): boolean
   );
 }
 
-const PG_POOL_MAX = Math.min(100, Math.max(5, Number(process.env.PG_POOL_MAX || 25)));
+const PG_POOL_MAX = Math.min(100, Math.max(5, Number(process.env.PG_POOL_MAX || 15)));
 const DB_STATEMENT_TIMEOUT_MS = Math.min(30_000, Math.max(1000, Number(process.env.DB_STATEMENT_TIMEOUT_MS || 8000)));
 
 export const createPool = () => {
