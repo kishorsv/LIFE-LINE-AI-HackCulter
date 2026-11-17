@@ -1,5 +1,4 @@
-import { useState } from 'react';
-import { APIProvider, AdvancedMarker, Map as GoogleMap, Pin } from '@vis.gl/react-google-maps';
+import React, { Suspense, useEffect, useRef, useState } from 'react';
 import {
   Activity,
   ArrowDown,
@@ -27,12 +26,44 @@ import { LifeLineLogo } from './LifeLineLogo.tsx';
 import { ParallaxBackdrop, ScrollProgressBar, ScrollReveal } from './CinematicPrimitives.tsx';
 
 import heroCityImg from '../assets/images/hero_city_network_1794749202766.jpg';
-import problemNightImg from '../assets/images/problem_night_commute_1794749202374.jpg';
-import youthWomenImg from '../assets/images/youth_women_safety_1794749203692.jpg';
-import missionHorizonImg from '../assets/images/mission_future_horizon_1794749204105.jpg';
+import heroCity1440Avif from '../assets/images/optimized/hero_city_network_1794749202766-1440.avif';
+import heroCity800Avif from '../assets/images/optimized/hero_city_network_1794749202766-800.avif';
+import heroCity1440Webp from '../assets/images/optimized/hero_city_network_1794749202766-1440.webp';
+import heroCity800Webp from '../assets/images/optimized/hero_city_network_1794749202766-800.webp';
 
-const INNOVATION_NETWORK_IMG = '/assets/aistudio/Screenshot_2026-11-15_184032_9a500a9b.png';
-const EMERGENCY_RESPONSE_IMG = '/assets/aistudio/Screenshot_2026-11-15_184024_742eb26f.png';
+import problemNightImg from '../assets/images/problem_night_commute_1794749202374.jpg';
+import problemNight1440Avif from '../assets/images/optimized/problem_night_commute_1794749202374-1440.avif';
+import problemNight800Avif from '../assets/images/optimized/problem_night_commute_1794749202374-800.avif';
+import problemNight1440Webp from '../assets/images/optimized/problem_night_commute_1794749202374-1440.webp';
+import problemNight800Webp from '../assets/images/optimized/problem_night_commute_1794749202374-800.webp';
+
+import youthWomenImg from '../assets/images/youth_women_safety_1794749203692.jpg';
+import youthWomen1440Avif from '../assets/images/optimized/youth_women_safety_1794749203692-1440.avif';
+import youthWomen800Avif from '../assets/images/optimized/youth_women_safety_1794749203692-800.avif';
+import youthWomen1440Webp from '../assets/images/optimized/youth_women_safety_1794749203692-1440.webp';
+import youthWomen800Webp from '../assets/images/optimized/youth_women_safety_1794749203692-800.webp';
+
+import missionHorizonImg from '../assets/images/mission_future_horizon_1794749204105.jpg';
+import missionHorizon1440Avif from '../assets/images/optimized/mission_future_horizon_1794749204105-1440.avif';
+import missionHorizon800Avif from '../assets/images/optimized/mission_future_horizon_1794749204105-800.avif';
+import missionHorizon1440Webp from '../assets/images/optimized/mission_future_horizon_1794749204105-1440.webp';
+import missionHorizon800Webp from '../assets/images/optimized/mission_future_horizon_1794749204105-800.webp';
+
+import innovationImg from '../assets/images/optimized/innovation_network-1440.jpg';
+import innovation1440Avif from '../assets/images/optimized/innovation_network-1440.avif';
+import innovation800Avif from '../assets/images/optimized/innovation_network-800.avif';
+import innovation1440Webp from '../assets/images/optimized/innovation_network-1440.webp';
+import innovation800Webp from '../assets/images/optimized/innovation_network-800.webp';
+
+import emergencyRespImg from '../assets/images/optimized/emergency_response-1440.jpg';
+import emergencyResp1440Avif from '../assets/images/optimized/emergency_response-1440.avif';
+import emergencyResp800Avif from '../assets/images/optimized/emergency_response-800.avif';
+import emergencyResp1440Webp from '../assets/images/optimized/emergency_response-1440.webp';
+import emergencyResp800Webp from '../assets/images/optimized/emergency_response-800.webp';
+
+const LandingPreviewMap = React.lazy(() =>
+  import('./LandingPreviewMap.tsx').then((m) => ({ default: m.LandingPreviewMap }))
+);
 
 interface LandingPageProps {
   onNavigate: (view: ActiveView) => void;
@@ -202,6 +233,28 @@ export function LandingPage({ onNavigate, onOpenAuth, onOpenSos }: LandingPagePr
   const [commandPriorityFilter, setCommandPriorityFilter] = useState<'ALL' | 'CRITICAL' | 'HIGH'>('ALL');
   const [activePipelineIndex, setActivePipelineIndex] = useState<number>(0);
   const [privacyNoticeOpen, setPrivacyNoticeOpen] = useState(false);
+  const [mapInViewport, setMapInViewport] = useState(false);
+  const mapContainerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const el = mapContainerRef.current;
+    if (!el || mapInViewport) return;
+    if (typeof IntersectionObserver === 'undefined') {
+      setMapInViewport(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setMapInViewport(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: '400px 0px' }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [mapInViewport]);
 
   const activeAgent = AI_AGENTS.find((a) => a.id === selectedAgentId) || AI_AGENTS[0];
   const activeRoute = SAFEROUTE_OPTIONS.find((r) => r.id === selectedRouteId) || SAFEROUTE_OPTIONS[0];
@@ -245,6 +298,9 @@ export function LandingPage({ onNavigate, onOpenAuth, onOpenSos }: LandingPagePr
       >
         <ParallaxBackdrop
           src={heroCityImg}
+          avifSrcSet={`${heroCity800Avif} 800w, ${heroCity1440Avif} 1440w`}
+          webpSrcSet={`${heroCity800Webp} 800w, ${heroCity1440Webp} 1440w`}
+          sizes="100vw"
           alt="Illuminated metropolitan skyline and connected urban transit corridors at dusk"
           baseScale={1.04}
           parallaxRange={30}
@@ -390,6 +446,9 @@ export function LandingPage({ onNavigate, onOpenAuth, onOpenSos }: LandingPagePr
       >
         <ParallaxBackdrop
           src={problemNightImg}
+          avifSrcSet={`${problemNight800Avif} 800w, ${problemNight1440Avif} 1440w`}
+          webpSrcSet={`${problemNight800Webp} 800w, ${problemNight1440Webp} 1440w`}
+          sizes="100vw"
           alt="Young woman checking her smartphone at a rain-dampened city transit station at dusk"
           baseScale={1.04}
           parallaxRange={34}
@@ -460,7 +519,10 @@ export function LandingPage({ onNavigate, onOpenAuth, onOpenSos }: LandingPagePr
         className="relative overflow-hidden border-b border-white/10 py-20 lg:py-28"
       >
         <ParallaxBackdrop
-          src={INNOVATION_NETWORK_IMG}
+          src={innovationImg}
+          avifSrcSet={`${innovation800Avif} 800w, ${innovation1440Avif} 1440w`}
+          webpSrcSet={`${innovation800Webp} 800w, ${innovation1440Webp} 1440w`}
+          sizes="100vw"
           alt="Connected global safety intelligence network with human silhouettes"
           baseScale={1.06}
           parallaxRange={28}
@@ -738,30 +800,21 @@ export function LandingPage({ onNavigate, onOpenAuth, onOpenSos }: LandingPagePr
                 </div>
               </div>
 
-              {/* Large Map Canvas (Live Google Map when key configured; architectural preview fallback otherwise) */}
-              <div className="lg:col-span-8 relative overflow-hidden rounded-3xl border border-white/15 bg-[#070E24] min-h-[420px] sm:min-h-[470px] shadow-2xl">
-                {mapsApiKey ? (
-                  <APIProvider apiKey={mapsApiKey}>
-                    <GoogleMap
-                      defaultCenter={{ lat: 37.7749, lng: -122.4194 }}
-                      defaultZoom={13}
-                      mapId="DEMO_MAP_ID"
-                      colorScheme="DARK"
-                      internalUsageAttributionIds={['gmp_mcp_codeassist_v1_aistudio']}
-                      disableDefaultUI={false}
-                      className="h-full w-full min-h-[420px] sm:min-h-[470px]"
-                    >
-                      <AdvancedMarker position={{ lat: 37.7819, lng: -122.4126 }} title="Youth Support Hub">
-                        <Pin background="#0EA5E9" borderColor="#FFFFFF" glyphColor="#FFFFFF" />
-                      </AdvancedMarker>
-                      <AdvancedMarker position={{ lat: 37.7656, lng: -122.4218 }} title="Safe Haven Support Hub">
-                        <Pin background="#10B981" borderColor="#FFFFFF" glyphColor="#FFFFFF" />
-                      </AdvancedMarker>
-                      <AdvancedMarker position={{ lat: 37.7749, lng: -122.4194 }} title="Origin Corridor">
-                        <Pin background="#E11D48" borderColor="#FFFFFF" glyphColor="#FFFFFF" />
-                      </AdvancedMarker>
-                    </GoogleMap>
-                  </APIProvider>
+              {/* Large Map Canvas (Live Google Map when key configured & scrolled near viewport; architectural preview fallback otherwise) */}
+              <div
+                ref={mapContainerRef}
+                className="lg:col-span-8 relative overflow-hidden rounded-3xl border border-white/15 bg-[#070E24] min-h-[420px] sm:min-h-[470px] shadow-2xl"
+              >
+                {mapsApiKey && mapInViewport ? (
+                  <Suspense
+                    fallback={
+                      <div className="flex h-full min-h-[420px] sm:min-h-[470px] items-center justify-center bg-[#060B1D] text-xs text-slate-400">
+                        Loading interactive corridor map...
+                      </div>
+                    }
+                  >
+                    <LandingPreviewMap apiKey={mapsApiKey} />
+                  </Suspense>
                 ) : (
                   <div className="relative flex h-full min-h-[420px] sm:min-h-[470px] flex-col justify-between p-6">
                     {/* Tactical Vector Corridor Map Canvas */}
@@ -874,7 +927,10 @@ export function LandingPage({ onNavigate, onOpenAuth, onOpenSos }: LandingPagePr
         className="relative flex min-h-[82vh] items-center overflow-hidden border-b border-white/10"
       >
         <ParallaxBackdrop
-          src={EMERGENCY_RESPONSE_IMG}
+          src={emergencyRespImg}
+          avifSrcSet={`${emergencyResp800Avif} 800w, ${emergencyResp1440Avif} 1440w`}
+          webpSrcSet={`${emergencyResp800Webp} 800w, ${emergencyResp1440Webp} 1440w`}
+          sizes="100vw"
           alt="Emergency responders operating beside an illuminated ambulance on a rain-slicked city street at night"
           baseScale={1.06}
           parallaxRange={34}
@@ -1114,6 +1170,9 @@ export function LandingPage({ onNavigate, onOpenAuth, onOpenSos }: LandingPagePr
       >
         <ParallaxBackdrop
           src={youthWomenImg}
+          avifSrcSet={`${youthWomen800Avif} 800w, ${youthWomen1440Avif} 1440w`}
+          webpSrcSet={`${youthWomen800Webp} 800w, ${youthWomen1440Webp} 1440w`}
+          sizes="100vw"
           alt="Two young women walking confidently together across an illuminated university campus at twilight"
           baseScale={1.04}
           parallaxRange={32}
@@ -1282,6 +1341,9 @@ export function LandingPage({ onNavigate, onOpenAuth, onOpenSos }: LandingPagePr
       >
         <ParallaxBackdrop
           src={missionHorizonImg}
+          avifSrcSet={`${missionHorizon800Avif} 800w, ${missionHorizon1440Avif} 1440w`}
+          webpSrcSet={`${missionHorizon800Webp} 800w, ${missionHorizon1440Webp} 1440w`}
+          sizes="100vw"
           alt="First dawn light over a modern city harbor horizon beneath a deep midnight navy sky"
           baseScale={1.04}
           parallaxRange={30}

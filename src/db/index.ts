@@ -129,17 +129,18 @@ export function getPoolStats() {
 export async function queryWithRetry<T extends QueryResultRow = QueryResultRow>(
   text: string,
   params?: unknown[],
-  maxAttempts = 3
+  maxAttempts = 3,
+  queryName?: string
 ): Promise<QueryResult<T>> {
   let lastErr: unknown;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const t0 = performance.now();
     try {
       const res = await pool.query<T>(text, params);
-      metrics.recordDbQuery(performance.now() - t0);
+      metrics.recordDbQuery(performance.now() - t0, queryName);
       return res;
     } catch (err) {
-      metrics.recordDbQuery(performance.now() - t0);
+      metrics.recordDbQuery(performance.now() - t0, queryName);
       lastErr = err;
       const code = (err as { code?: string })?.code || '';
       const msg = err instanceof Error ? err.message : '';

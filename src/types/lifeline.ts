@@ -377,12 +377,22 @@ export interface MonitoringSnapshot {
     healthLatencyMs: number;
     avgQueryLatencyMs: number;
     p95QueryLatencyMs: number;
+    slowQueryCount: number;
+    slowestQueryMs: number;
     pool: {
       totalCount: number;
       idleCount: number;
       waitingCount: number;
       maxConnections: number;
     };
+  };
+  webVitals: {
+    sampleCount: number;
+    lcpP75Ms: number;
+    inpP75Ms: number;
+    clsP75: number;
+    ttfbP75Ms: number;
+    lastReportedAt: string | null;
   };
   websockets: {
     realtimeActive: number;

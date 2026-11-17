@@ -227,4 +227,168 @@ describe('Production Readiness & Scalability Hardening', () => {
       fs.rmSync(mockCloudSqlRoot, { recursive: true, force: true });
     }
   });
+
+  it('batches incident timelines & delivery logs without losing internal-note redaction', async () => {
+    const userResp = await fetch(`${httpBase}/api/auth/demo-login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role: 'regular_user' }),
+    });
+    const userAuth = (await userResp.json()) as { token: string; user: { id: number } };
+
+    const opResp = await fetch(`${httpBase}/api/auth/demo-login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role: 'emergency_operator' }),
+    });
+    const opAuth = (await opResp.json()) as { token: string };
+
+    const sosResp = await fetch(`${httpBase}/api/incidents/sos`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${userAuth.token}`,
+      },
+      body: JSON.stringify({
+        title: 'Batch Query Redaction Check',
+        description: 'Testing batched updates and internal note privacy',
+        category: 'Safety Alert',
+        priority: 'HIGH',
+        latitude: 37.775,
+        longitude: -122.419,
+        locationLabel: 'Test Corridor',
+      }),
+    });
+    assert.equal(sosResp.status, 201);
+    const created = (await sosResp.json()) as { incident: { id: number } };
+
+    const internalNoteResp = await fetch(`${httpBase}/api/incidents/${created.incident.id}/status`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${opAuth.token}`,
+      },
+      body: JSON.stringify({
+        status: 'Acknowledged',
+        note: 'Confidential responder triage detail',
+        isInternal: true,
+      }),
+    });
+    assert.equal(internalNoteResp.status, 200);
+
+    const userIncidents = await repoMod.listIncidentsForUser(userAuth.user.id);
+    const targetForUser = userIncidents.find((i) => i.id === created.incident.id);
+    assert.ok(targetForUser);
+    assert.equal(
+      targetForUser.updates.some((u) => u.isInternal),
+      false
+    );
+
+    const opIncidents = await repoMod.listAllIncidentsForOperator({ limit: 25, offset: 0 });
+    const targetForOp = opIncidents.find((i) => i.id === created.incident.id);
+    assert.ok(targetForOp);
+    assert.equal(
+      targetForOp.updates.some((u) => u.isInternal && u.note.includes('Confidential')),
+      true
+    );
+  });
+
+  it('ingests Core Web Vitals via /api/metrics/vitals and exposes p75 + slow query metrics to operators', async () => {
+    const vitalsResp = await fetch(`${httpBase}/api/metrics/vitals`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        lcpMs: 1420,
+        inpMs: 85,
+        cls: 0.04,
+        ttfbMs: 110,
+      }),
+    });
+    assert.equal(vitalsResp.status, 202);
+
+    const opResp = await fetch(`${httpBase}/api/auth/demo-login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role: 'emergency_operator' }),
+    });
+    const opAuth = (await opResp.json()) as { token: string };
+
+    const monResp = await fetch(`${httpBase}/api/admin/monitoring`, {
+      headers: { Authorization: `Bearer ${opAuth.token}` },
+    });
+    assert.equal(monResp.status, 200);
+    const snap = (await monResp.json()) as {
+      database: { slowQueryCount: number; slowestQueryMs: number };
+      webVitals: { sampleCount: number; lcpP75Ms: number; inpP75Ms: number; clsP75: number; ttfbP75Ms: number };
+    };
+    assert.ok(snap.webVitals.sampleCount >= 1);
+    assert.ok(snap.webVitals.lcpP75Ms >= 1420);
+    assert.equal(typeof snap.database.slowQueryCount, 'number');
+    assert.equal(typeof snap.database.slowestQueryMs, 'number');
+  });
+
+  it('sets Cache-Control on directory/clusters and invalidates server caches on report submission', async () => {
+    const dirResp = await fetch(`${httpBase}/api/support-directory`);
+    assert.equal(dirResp.status, 200);
+    assert.ok((dirResp.headers.get('cache-control') || '').includes('max-age=30'));
+
+    const clusterUrl = `${httpBase}/api/maps/sos-clusters?lat=37.7749&lng=-122.4194&radiusKm=40&windowDays=30`;
+    const firstCluster = await fetch(clusterUrl);
+    assert.equal(firstCluster.status, 200);
+    assert.ok((firstCluster.headers.get('cache-control') || '').includes('max-age=20'));
+
+    const secondCluster = await fetch(clusterUrl);
+    assert.equal(secondCluster.status, 200);
+
+    const userResp = await fetch(`${httpBase}/api/auth/demo-login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role: 'regular_user' }),
+    });
+    const userAuth = (await userResp.json()) as { token: string };
+
+    const repResp = await fetch(`${httpBase}/api/pulse/reports`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${userAuth.token}`,
+      },
+      body: JSON.stringify({
+        category: 'Poor Lighting',
+        severity: 'MODERATE',
+        description: 'Cache invalidation test streetlight report',
+        latitude: 37.7749,
+        longitude: -122.4194,
+        locationLabel: 'Market Corridor',
+        isAnonymous: true,
+      }),
+    });
+    assert.equal(repResp.status, 201);
+
+    const afterCluster = await fetch(clusterUrl);
+    assert.equal(afterCluster.status, 200);
+  });
+
+  it('paginates /api/admin/users for large user directories', async () => {
+    const adminResp = await fetch(`${httpBase}/api/auth/demo-login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role: 'administrator' }),
+    });
+    const adminAuth = (await adminResp.json()) as { token: string };
+
+    const usersResp = await fetch(`${httpBase}/api/admin/users?page=1&limit=2`, {
+      headers: { Authorization: `Bearer ${adminAuth.token}` },
+    });
+    assert.equal(usersResp.status, 200);
+    const data = (await usersResp.json()) as {
+      users: Array<{ id: number }>;
+      pagination: { page: number; limit: number; total: number; totalPages: number };
+    };
+    assert.ok(Array.isArray(data.users));
+    assert.ok(data.users.length <= 2);
+    assert.equal(data.pagination.page, 1);
+    assert.equal(data.pagination.limit, 2);
+    assert.ok(data.pagination.total >= data.users.length);
+  });
 });

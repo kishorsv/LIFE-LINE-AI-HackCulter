@@ -74,8 +74,8 @@ export function ScrollReveal({
     <div
       ref={ref}
       style={reducedMotion ? undefined : { transitionDelay: `${delayMs}ms` }}
-      className={`transition-all duration-700 ease-out will-change-transform ${
-        visible ? 'opacity-100 translate-y-0 translate-x-0' : `opacity-0 ${hiddenTransform}`
+      className={`transition-all duration-700 ease-out ${
+        visible ? 'opacity-100 translate-y-0 translate-x-0' : `will-change-transform opacity-0 ${hiddenTransform}`
       } ${className}`}
     >
       {children}
@@ -85,6 +85,9 @@ export function ScrollReveal({
 
 interface ParallaxBackdropProps {
   src: string;
+  avifSrcSet?: string;
+  webpSrcSet?: string;
+  sizes?: string;
   alt: string;
   /** Initial zoom factor (use >= 1.04 if cropping subtle borders) */
   baseScale?: number;
@@ -98,6 +101,9 @@ interface ParallaxBackdropProps {
 
 export function ParallaxBackdrop({
   src,
+  avifSrcSet,
+  webpSrcSet,
+  sizes = '100vw',
   alt,
   baseScale = 1.05,
   parallaxRange = 36,
@@ -120,6 +126,7 @@ export function ParallaxBackdrop({
       if (!container || !img) return;
       const rect = container.getBoundingClientRect();
       const vh = window.innerHeight || 900;
+      if (rect.bottom < -120 || rect.top > vh + 120) return;
       const total = vh + rect.height;
       const progress = Math.min(1, Math.max(0, (vh - rect.top) / total));
       const translateY = (progress - 0.5) * parallaxRange * 2;
@@ -143,31 +150,47 @@ export function ParallaxBackdrop({
     };
   }, [reducedMotion, baseScale, parallaxRange, zoomDelta]);
 
+  const imgEl = (
+    <img
+      ref={imgRef}
+      src={src}
+      alt={alt}
+      loading={priority ? 'eager' : 'lazy'}
+      fetchPriority={priority ? 'high' : undefined}
+      decoding="async"
+      style={{ transform: `scale(${baseScale})` }}
+      className={`h-full w-full object-cover will-change-transform transition-transform duration-150 ease-out ${imgClassName}`}
+    />
+  );
+
   return (
     <div ref={containerRef} className="pointer-events-none absolute inset-0 overflow-hidden">
-      <img
-        ref={imgRef}
-        src={src}
-        alt={alt}
-        loading={priority ? 'eager' : 'lazy'}
-        decoding="async"
-        style={reducedMotion ? { transform: `scale(${baseScale})` } : { transform: `scale(${baseScale})` }}
-        className={`h-full w-full object-cover will-change-transform transition-transform duration-150 ease-out ${imgClassName}`}
-      />
+      {avifSrcSet || webpSrcSet ? (
+        <picture className="block h-full w-full">
+          {avifSrcSet && <source type="image/avif" srcSet={avifSrcSet} sizes={sizes} />}
+          {webpSrcSet && <source type="image/webp" srcSet={webpSrcSet} sizes={sizes} />}
+          {imgEl}
+        </picture>
+      ) : (
+        imgEl
+      )}
     </div>
   );
 }
 
 export function ScrollProgressBar() {
-  const [progress, setProgress] = useState(0);
+  const barRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     let raf = 0;
     const calc = () => {
       raf = 0;
+      const bar = barRef.current;
+      if (!bar) return;
       const doc = document.documentElement;
       const max = Math.max(1, doc.scrollHeight - window.innerHeight);
-      setProgress(Math.min(100, Math.max(0, (window.scrollY / max) * 100)));
+      const ratio = Math.min(1, Math.max(0, window.scrollY / max));
+      bar.style.transform = `scaleX(${ratio.toFixed(4)})`;
     };
     const onScroll = () => {
       if (!raf) raf = window.requestAnimationFrame(calc);
@@ -186,8 +209,9 @@ export function ScrollProgressBar() {
       className="pointer-events-none fixed left-0 right-0 top-0 z-50 h-[2px] bg-transparent"
     >
       <div
-        className="h-full bg-gradient-to-r from-[#0F275C] via-[#E11D48] to-[#FB7185] transition-[width] duration-75"
-        style={{ width: `${progress}%` }}
+        ref={barRef}
+        className="h-full w-full origin-left bg-gradient-to-r from-[#0F275C] via-[#E11D48] to-[#FB7185]"
+        style={{ transform: 'scaleX(0)' }}
       />
     </div>
   );

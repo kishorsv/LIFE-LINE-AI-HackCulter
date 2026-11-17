@@ -40,12 +40,22 @@ export interface MonitoringSnapshot {
     healthLatencyMs: number;
     avgQueryLatencyMs: number;
     p95QueryLatencyMs: number;
+    slowQueryCount: number;
+    slowestQueryMs: number;
     pool: {
       totalCount: number;
       idleCount: number;
       waitingCount: number;
       maxConnections: number;
     };
+  };
+  webVitals: {
+    sampleCount: number;
+    lcpP75Ms: number;
+    inpP75Ms: number;
+    clsP75: number;
+    ttfbP75Ms: number;
+    lastReportedAt: string | null;
   };
   websockets: {
     realtimeActive: number;
@@ -89,7 +99,9 @@ export interface MonitoringSnapshot {
 
 const MAX_LATENCY_SAMPLES = 2048;
 const MAX_DB_SAMPLES = 512;
+const MAX_VITAL_SAMPLES = 256;
 const MAX_RPS_BUCKET_SECONDS = 60;
+const SLOW_QUERY_THRESHOLD_MS = Math.max(25, Number(process.env.SLOW_QUERY_THRESHOLD_MS || 100));
 
 class MetricsRegistry {
   private startedAt = Date.now();
@@ -100,7 +112,17 @@ class MetricsRegistry {
   private overload503Count = 0;
   private httpLatencies: number[] = [];
   private dbLatencies: number[] = [];
+  private slowQueryCount = 0;
+  private slowestQueryMs = 0;
+  private lastSlowQueryWarnAt = 0;
   private rpsBuckets = new Map<number, number>();
+
+  private lcpSamples: number[] = [];
+  private inpSamples: number[] = [];
+  private clsSamples: number[] = [];
+  private ttfbSamples: number[] = [];
+  private webVitalsSampleCount = 0;
+  private lastWebVitalAt: string | null = null;
 
   private lastCpuUsage = process.cpuUsage();
   private lastCpuCheckMs = Date.now();
@@ -161,10 +183,42 @@ class MetricsRegistry {
     }
   }
 
-  recordDbQuery(durationMs: number) {
+  recordDbQuery(durationMs: number, queryName?: string) {
     this.dbLatencies.push(durationMs);
     if (this.dbLatencies.length > MAX_DB_SAMPLES) {
       this.dbLatencies.shift();
+    }
+    if (durationMs > this.slowestQueryMs) {
+      this.slowestQueryMs = Number(durationMs.toFixed(2));
+    }
+    if (durationMs >= SLOW_QUERY_THRESHOLD_MS) {
+      this.slowQueryCount++;
+      const now = Date.now();
+      if (process.env.NODE_ENV !== 'test' && now - this.lastSlowQueryWarnAt >= 5000) {
+        this.lastSlowQueryWarnAt = now;
+        console.warn(
+          `[db-slow-query] ${queryName || 'query'} took ${durationMs.toFixed(1)}ms (threshold=${SLOW_QUERY_THRESHOLD_MS}ms)`
+        );
+      }
+    }
+  }
+
+  recordWebVitals(sample: { lcpMs?: number; inpMs?: number; cls?: number; ttfbMs?: number }) {
+    let recorded = false;
+    const pushBounded = (arr: number[], val: number | undefined, maxValid: number) => {
+      if (typeof val === 'number' && Number.isFinite(val) && val >= 0 && val <= maxValid) {
+        arr.push(val);
+        if (arr.length > MAX_VITAL_SAMPLES) arr.shift();
+        recorded = true;
+      }
+    };
+    pushBounded(this.lcpSamples, sample.lcpMs, 60_000);
+    pushBounded(this.inpSamples, sample.inpMs, 30_000);
+    pushBounded(this.clsSamples, sample.cls, 25);
+    pushBounded(this.ttfbSamples, sample.ttfbMs, 60_000);
+    if (recorded) {
+      this.webVitalsSampleCount++;
+      this.lastWebVitalAt = new Date().toISOString();
     }
   }
 
@@ -203,14 +257,20 @@ class MetricsRegistry {
     return this.lastCpuPercent;
   }
 
-  private percentile(sorted: number[], p: number): number {
+  private percentile(sorted: number[], p: number, decimals = 2): number {
     if (sorted.length === 0) return 0;
     const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
-    return Number(sorted[idx].toFixed(2));
+    return Number(sorted[idx].toFixed(decimals));
   }
 
   buildSnapshot(extra: {
-    database: MonitoringSnapshot['database'];
+    database: Omit<
+      MonitoringSnapshot['database'],
+      'avgQueryLatencyMs' | 'p95QueryLatencyMs' | 'slowQueryCount' | 'slowestQueryMs'
+    > & {
+      avgQueryLatencyMs?: number;
+      p95QueryLatencyMs?: number;
+    };
     websockets: Omit<MonitoringSnapshot['websockets'], 'rateLimitedMessages'>;
     cacheAndQueue: Omit<MonitoringSnapshot['cacheAndQueue'], 'cacheHitRatePercent'>;
     aiRuntime: {
@@ -223,6 +283,10 @@ class MetricsRegistry {
     const mem = process.memoryUsage();
     const sortedHttp = [...this.httpLatencies].sort((a, b) => a - b);
     const sortedDb = [...this.dbLatencies].sort((a, b) => a - b);
+    const sortedLcp = [...this.lcpSamples].sort((a, b) => a - b);
+    const sortedInp = [...this.inpSamples].sort((a, b) => a - b);
+    const sortedCls = [...this.clsSamples].sort((a, b) => a - b);
+    const sortedTtfb = [...this.ttfbSamples].sort((a, b) => a - b);
 
     const avgLatencyMs = sortedHttp.length
       ? Number((sortedHttp.reduce((a, b) => a + b, 0) / sortedHttp.length).toFixed(2))
@@ -243,6 +307,10 @@ class MetricsRegistry {
 
     const p95LatencyMs = this.percentile(sortedHttp, 95);
     const p99LatencyMs = this.percentile(sortedHttp, 99);
+    const lcpP75Ms = this.percentile(sortedLcp, 75, 0);
+    const inpP75Ms = this.percentile(sortedInp, 75, 0);
+    const clsP75 = this.percentile(sortedCls, 75, 3);
+    const ttfbP75Ms = this.percentile(sortedTtfb, 75, 0);
 
     const alerts: SystemAlert[] = [];
     const nowIso = new Date().toISOString();
@@ -293,6 +361,28 @@ class MetricsRegistry {
         message: 'Rolling HTTP p95 response time exceeded 500 ms target.',
         value: `${p95LatencyMs} ms`,
         threshold: '<= 500 ms',
+        triggeredAt: nowIso,
+      });
+    }
+    if (sortedLcp.length >= 5 && lcpP75Ms > 2500) {
+      alerts.push({
+        id: 'poor_lcp',
+        severity: 'warning',
+        title: 'Core Web Vital: LCP Above 2.5s Target',
+        message: 'Observed 75th-percentile Largest Contentful Paint exceeded 2500 ms.',
+        value: `${lcpP75Ms} ms`,
+        threshold: '<= 2500 ms',
+        triggeredAt: nowIso,
+      });
+    }
+    if (sortedInp.length >= 5 && inpP75Ms > 200) {
+      alerts.push({
+        id: 'poor_inp',
+        severity: 'warning',
+        title: 'Core Web Vital: INP Above 200ms Target',
+        message: 'Observed 75th-percentile Interaction to Next Paint exceeded 200 ms.',
+        value: `${inpP75Ms} ms`,
+        threshold: '<= 200 ms',
         triggeredAt: nowIso,
       });
     }
@@ -361,9 +451,22 @@ class MetricsRegistry {
         p99LatencyMs,
       },
       database: {
-        ...extra.database,
+        dialect: extra.database.dialect,
+        ok: extra.database.ok,
+        healthLatencyMs: extra.database.healthLatencyMs,
+        pool: extra.database.pool,
         avgQueryLatencyMs,
         p95QueryLatencyMs: this.percentile(sortedDb, 95),
+        slowQueryCount: this.slowQueryCount,
+        slowestQueryMs: this.slowestQueryMs,
+      },
+      webVitals: {
+        sampleCount: this.webVitalsSampleCount,
+        lcpP75Ms,
+        inpP75Ms,
+        clsP75,
+        ttfbP75Ms,
+        lastReportedAt: this.lastWebVitalAt,
       },
       websockets: {
         ...extra.websockets,
@@ -403,6 +506,14 @@ class MetricsRegistry {
     this.overload503Count = 0;
     this.httpLatencies = [];
     this.dbLatencies = [];
+    this.slowQueryCount = 0;
+    this.slowestQueryMs = 0;
+    this.lcpSamples = [];
+    this.inpSamples = [];
+    this.clsSamples = [];
+    this.ttfbSamples = [];
+    this.webVitalsSampleCount = 0;
+    this.lastWebVitalAt = null;
     this.rpsBuckets.clear();
     this.wsRateLimitedMessages = 0;
     this.aiTotalCalls = 0;

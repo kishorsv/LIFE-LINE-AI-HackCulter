@@ -1110,12 +1110,40 @@ export async function listOperatorUserIds(): Promise<number[]> {
 
 export async function listAllUsersForAdmin(): Promise<AppUser[]> {
   const dialect = await ensureDialect();
+  const t0 = performance.now();
   if (dialect === 'postgres') {
     const rows = await db.select().from(users).orderBy(asc(users.id));
+    metrics.recordDbQuery(performance.now() - t0, 'listAllUsersForAdmin');
     return rows.map(mapPgUser);
   }
   const rows = sqlite.prepare('SELECT * FROM users ORDER BY id ASC').all() as Record<string, unknown>[];
+  metrics.recordDbQuery(performance.now() - t0, 'listAllUsersForAdmin');
   return rows.map(mapSqliteUser);
+}
+
+export async function listUsersForAdminPaginated(limit = 50, offset = 0): Promise<AppUser[]> {
+  const dialect = await ensureDialect();
+  const t0 = performance.now();
+  if (dialect === 'postgres') {
+    const rows = await db.select().from(users).orderBy(asc(users.id)).limit(limit).offset(offset);
+    metrics.recordDbQuery(performance.now() - t0, 'listUsersForAdminPaginated');
+    return rows.map(mapPgUser);
+  }
+  const rows = sqlite
+    .prepare('SELECT * FROM users ORDER BY id ASC LIMIT ? OFFSET ?')
+    .all(limit, offset) as Record<string, unknown>[];
+  metrics.recordDbQuery(performance.now() - t0, 'listUsersForAdminPaginated');
+  return rows.map(mapSqliteUser);
+}
+
+export async function countAllUsers(): Promise<number> {
+  const dialect = await ensureDialect();
+  if (dialect === 'postgres') {
+    const res = await db.select({ cnt: sql<number>`count(*)::int` }).from(users);
+    return res[0]?.cnt ?? 0;
+  }
+  const row = sqlite.prepare('SELECT COUNT(*) as cnt FROM users').get() as { cnt: number };
+  return Number(row?.cnt || 0);
 }
 
 export async function countAdministrators(): Promise<number> {
@@ -1934,6 +1962,196 @@ export async function getIncidentById(incidentId: number): Promise<IncidentRecor
   };
 }
 
+function mapIncidentRowWithRelations(
+  r: Record<string, unknown>,
+  updates: Record<string, unknown>[],
+  deliveryLogs: Record<string, unknown>[],
+  isPostgres: boolean
+): IncidentRecord {
+  const toIso = (val: unknown) =>
+    isPostgres ? new Date(String(val)).toISOString() : String(val);
+
+  return {
+    id: Number(r.id),
+    userId: Number(r.user_id),
+    idempotencyKey: r.idempotency_key ? String(r.idempotency_key) : null,
+    clientQueuedAt: r.client_queued_at ? toIso(r.client_queued_at) : null,
+    deliveryStatus: (r.delivery_status as DeliveryState) || 'submitted',
+    reporterName: String(r.reporter_name || r.reporter_email),
+    reporterEmail: String(r.reporter_email),
+    title: String(r.title),
+    description: String(r.description || ''),
+    category: String(r.category),
+    status: String(r.status),
+    priority: String(r.priority),
+    latitude: r.latitude != null ? Number(r.latitude) : null,
+    longitude: r.longitude != null ? Number(r.longitude) : null,
+    locationLabel: String(r.location_label || ''),
+    locationAccuracyMeters: r.location_accuracy_meters != null ? Number(r.location_accuracy_meters) : null,
+    isSimulated: Boolean(r.is_simulated),
+    acknowledgedByUserId: r.acknowledged_by_user_id != null ? Number(r.acknowledged_by_user_id) : null,
+    operatorName: r.operator_name ? String(r.operator_name) : null,
+    acknowledgedAt: r.acknowledged_at ? toIso(r.acknowledged_at) : null,
+    resolvedAt: r.resolved_at ? toIso(r.resolved_at) : null,
+    createdAt: toIso(r.created_at),
+    updatedAt: toIso(r.updated_at),
+    updates: updates.map((u) => ({
+      id: Number(u.id),
+      authorRole: String(u.author_role),
+      authorName: u.author_name ? String(u.author_name) : 'System',
+      previousStatus: String(u.previous_status),
+      newStatus: String(u.new_status),
+      note: String(u.note),
+      isInternal: Boolean(u.is_internal),
+      createdAt: toIso(u.created_at),
+    })),
+    deliveryLogs: deliveryLogs.map((l) => ({
+      id: Number(l.id),
+      recipient: String(l.recipient),
+      channel: String(l.channel),
+      provider: String(l.provider),
+      status: String(l.status),
+      attemptCount: Number(l.attempt_count),
+      errorMessage: String(l.error_message || ''),
+      sentAt: l.sent_at ? toIso(l.sent_at) : null,
+      createdAt: toIso(l.created_at),
+    })),
+  };
+}
+
+export async function getIncidentsByIds(
+  ids: number[],
+  preResolvedDialect?: DatabaseDialect
+): Promise<IncidentRecord[]> {
+  if (ids.length === 0) return [];
+  const dialect = preResolvedDialect ?? (await ensureDialect());
+  const t0 = performance.now();
+
+  if (dialect === 'postgres') {
+    const [incRes, updatesRes, logsRes] = await Promise.all([
+      queryWithRetry<Record<string, unknown>>(
+        `SELECT i.*, u.email AS reporter_email, u.display_name AS reporter_name,
+                op.display_name AS operator_name
+         FROM emergency_incidents i
+         JOIN users u ON u.id = i.user_id
+         LEFT JOIN users op ON op.id = i.acknowledged_by_user_id
+         WHERE i.id = ANY($1::int[])`,
+        [ids],
+        3,
+        'getIncidentsByIds.incidents'
+      ),
+      queryWithRetry<Record<string, unknown>>(
+        `SELECT iu.*, u.display_name AS author_name
+         FROM incident_updates iu
+         LEFT JOIN users u ON u.id = iu.author_user_id
+         WHERE iu.incident_id = ANY($1::int[])
+         ORDER BY iu.created_at ASC, iu.id ASC`,
+        [ids],
+        3,
+        'getIncidentsByIds.updates'
+      ),
+      queryWithRetry<Record<string, unknown>>(
+        `SELECT * FROM notification_delivery_logs
+         WHERE incident_id = ANY($1::int[])
+         ORDER BY id DESC`,
+        [ids],
+        3,
+        'getIncidentsByIds.logs'
+      ),
+    ]);
+
+    const incMap = new Map<number, Record<string, unknown>>();
+    for (const r of incRes.rows) incMap.set(Number(r.id), r);
+
+    const updatesMap = new Map<number, Record<string, unknown>[]>();
+    for (const u of updatesRes.rows) {
+      const incId = Number(u.incident_id);
+      const list = updatesMap.get(incId);
+      if (list) list.push(u);
+      else updatesMap.set(incId, [u]);
+    }
+
+    const logsMap = new Map<number, Record<string, unknown>[]>();
+    for (const l of logsRes.rows) {
+      const incId = Number(l.incident_id);
+      const list = logsMap.get(incId);
+      if (list) list.push(l);
+      else logsMap.set(incId, [l]);
+    }
+
+    const results: IncidentRecord[] = [];
+    for (const id of ids) {
+      const row = incMap.get(id);
+      if (!row) continue;
+      results.push(
+        mapIncidentRowWithRelations(row, updatesMap.get(id) || [], logsMap.get(id) || [], true)
+      );
+    }
+    return results;
+  }
+
+  const placeholders = ids.map(() => '?').join(',');
+  const incRows = sqlite
+    .prepare(
+      `SELECT i.*, u.email as reporter_email, u.display_name as reporter_name,
+              op.display_name as operator_name, op.email as operator_email
+       FROM emergency_incidents i
+       JOIN users u ON u.id = i.user_id
+       LEFT JOIN users op ON op.id = i.acknowledged_by_user_id
+       WHERE i.id IN (${placeholders})`
+    )
+    .all(...ids) as Record<string, unknown>[];
+
+  const updateRows = sqlite
+    .prepare(
+      `SELECT iu.*, u.display_name as author_name
+       FROM incident_updates iu
+       LEFT JOIN users u ON u.id = iu.author_user_id
+       WHERE iu.incident_id IN (${placeholders})
+       ORDER BY iu.created_at ASC, iu.id ASC`
+    )
+    .all(...ids) as Record<string, unknown>[];
+
+  const logRows = sqlite
+    .prepare(
+      `SELECT * FROM notification_delivery_logs
+       WHERE incident_id IN (${placeholders})
+       ORDER BY id DESC`
+    )
+    .all(...ids) as Record<string, unknown>[];
+
+  metrics.recordDbQuery(performance.now() - t0, 'getIncidentsByIds');
+
+  const incMap = new Map<number, Record<string, unknown>>();
+  for (const r of incRows) incMap.set(Number(r.id), r);
+
+  const updatesMap = new Map<number, Record<string, unknown>[]>();
+  for (const u of updateRows) {
+    const incId = Number(u.incident_id);
+    const list = updatesMap.get(incId);
+    if (list) list.push(u);
+    else updatesMap.set(incId, [u]);
+  }
+
+  const logsMap = new Map<number, Record<string, unknown>[]>();
+  for (const l of logRows) {
+    const incId = Number(l.incident_id);
+    const list = logsMap.get(incId);
+    if (list) list.push(l);
+    else logsMap.set(incId, [l]);
+  }
+
+  const results: IncidentRecord[] = [];
+  for (const id of ids) {
+    const row = incMap.get(id);
+    if (!row) continue;
+    results.push(
+      mapIncidentRowWithRelations(row, updatesMap.get(id) || [], logsMap.get(id) || [], false)
+    );
+  }
+  return results;
+}
+
 export async function listIncidentsForUser(
   userId: number,
   viewerRole: UserRole = 'regular_user',
@@ -1942,6 +2160,7 @@ export async function listIncidentsForUser(
   const limit = options.limit ?? 50;
   const offset = options.offset ?? 0;
   const dialect = await ensureDialect();
+  const t0 = performance.now();
   if (dialect === 'postgres') {
     const rows = await db
       .select({ id: emergencyIncidents.id })
@@ -1950,23 +2169,17 @@ export async function listIncidentsForUser(
       .orderBy(desc(emergencyIncidents.createdAt), desc(emergencyIncidents.id))
       .limit(limit)
       .offset(offset);
-    const results: IncidentRecord[] = [];
-    for (const row of rows) {
-      const full = await getIncidentById(row.id);
-      if (full) results.push(sanitizeIncidentForViewer(full, viewerRole));
-    }
-    return results;
+    metrics.recordDbQuery(performance.now() - t0, 'listIncidentsForUser.ids');
+    const items = await getIncidentsByIds(rows.map((r) => r.id), dialect);
+    return items.map((full) => sanitizeIncidentForViewer(full, viewerRole));
   }
 
   const rows = sqlite
     .prepare('SELECT id FROM emergency_incidents WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?')
     .all(userId, limit, offset) as { id: number }[];
-  const results: IncidentRecord[] = [];
-  for (const row of rows) {
-    const full = await getIncidentById(row.id);
-    if (full) results.push(sanitizeIncidentForViewer(full, viewerRole));
-  }
-  return results;
+  metrics.recordDbQuery(performance.now() - t0, 'listIncidentsForUser.ids');
+  const items = await getIncidentsByIds(rows.map((r) => Number(r.id)), dialect);
+  return items.map((full) => sanitizeIncidentForViewer(full, viewerRole));
 }
 
 export async function countIncidentsForUser(userId: number): Promise<number> {
@@ -1988,6 +2201,7 @@ export async function listAllIncidentsForOperator(options: { limit?: number; off
   const limit = options.limit ?? 100;
   const offset = options.offset ?? 0;
   const dialect = await ensureDialect();
+  const t0 = performance.now();
   if (dialect === 'postgres') {
     const rows = await db
       .select({ id: emergencyIncidents.id })
@@ -1995,23 +2209,15 @@ export async function listAllIncidentsForOperator(options: { limit?: number; off
       .orderBy(desc(emergencyIncidents.createdAt), desc(emergencyIncidents.id))
       .limit(limit)
       .offset(offset);
-    const results: IncidentRecord[] = [];
-    for (const row of rows) {
-      const full = await getIncidentById(row.id);
-      if (full) results.push(full);
-    }
-    return results;
+    metrics.recordDbQuery(performance.now() - t0, 'listAllIncidentsForOperator.ids');
+    return getIncidentsByIds(rows.map((r) => r.id), dialect);
   }
 
   const rows = sqlite
     .prepare('SELECT id FROM emergency_incidents ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?')
     .all(limit, offset) as { id: number }[];
-  const results: IncidentRecord[] = [];
-  for (const row of rows) {
-    const full = await getIncidentById(row.id);
-    if (full) results.push(full);
-  }
-  return results;
+  metrics.recordDbQuery(performance.now() - t0, 'listAllIncidentsForOperator.ids');
+  return getIncidentsByIds(rows.map((r) => Number(r.id)), dialect);
 }
 
 export async function countAllIncidentsForOperator(): Promise<number> {
@@ -3349,22 +3555,50 @@ export async function createSafetyReport(input: {
 
 export async function listSafetyReportsForPulse(limit = 100): Promise<SafetyReportRecord[]> {
   const dialect = await ensureDialect();
+  const cacheKey = `pulse_data:reports:${dialect}:${limit}`;
+  const cached = await cacheQueue.getCachedJson<SafetyReportRecord[]>(cacheKey);
+  if (cached) return cached;
+
+  const t0 = performance.now();
+  let mapped: SafetyReportRecord[];
   if (dialect === 'postgres') {
     const rows = await db
       .select()
       .from(safetyReports)
       .orderBy(desc(safetyReports.createdAt), desc(safetyReports.id))
       .limit(limit);
-    return rows.map((r) => mapReportRow(r as unknown as Record<string, unknown>));
+    metrics.recordDbQuery(performance.now() - t0, 'listSafetyReportsForPulse');
+    mapped = rows.map((r) => mapReportRow(r as unknown as Record<string, unknown>));
+  } else {
+    const rows = sqlite
+      .prepare('SELECT * FROM safety_reports ORDER BY created_at DESC, id DESC LIMIT ?')
+      .all(limit) as Record<string, unknown>[];
+    metrics.recordDbQuery(performance.now() - t0, 'listSafetyReportsForPulse');
+    mapped = rows.map(mapReportRow);
   }
-  const rows = sqlite
-    .prepare('SELECT * FROM safety_reports ORDER BY created_at DESC, id DESC LIMIT ?')
-    .all(limit) as Record<string, unknown>[];
-  return rows.map(mapReportRow);
+  await cacheQueue.setCachedJson(cacheKey, mapped, 15);
+  return mapped;
 }
 
 export async function listIncidentsForPulse(limit = 150) {
   const dialect = await ensureDialect();
+  const cacheKey = `pulse_data:incidents:${dialect}:${limit}`;
+  const cached = await cacheQueue.getCachedJson<
+    Array<{
+      id: number;
+      category: string;
+      priority: string;
+      status: string;
+      latitude: number | null;
+      longitude: number | null;
+      isSimulated: boolean;
+      createdAt: string;
+    }>
+  >(cacheKey);
+  if (cached) return cached;
+
+  const t0 = performance.now();
+  let mapped;
   if (dialect === 'postgres') {
     const rows = await db
       .select({
@@ -3380,7 +3614,8 @@ export async function listIncidentsForPulse(limit = 150) {
       .from(emergencyIncidents)
       .orderBy(desc(emergencyIncidents.createdAt))
       .limit(limit);
-    return rows.map((r) => ({
+    metrics.recordDbQuery(performance.now() - t0, 'listIncidentsForPulse');
+    mapped = rows.map((r) => ({
       id: r.id,
       category: r.category,
       priority: r.priority,
@@ -3390,23 +3625,26 @@ export async function listIncidentsForPulse(limit = 150) {
       isSimulated: r.isSimulated,
       createdAt: r.createdAt.toISOString(),
     }));
+  } else {
+    const rows = sqlite
+      .prepare(
+        'SELECT id, category, priority, status, latitude, longitude, is_simulated, created_at FROM emergency_incidents ORDER BY created_at DESC LIMIT ?'
+      )
+      .all(limit) as Record<string, unknown>[];
+    metrics.recordDbQuery(performance.now() - t0, 'listIncidentsForPulse');
+    mapped = rows.map((r) => ({
+      id: Number(r.id),
+      category: String(r.category),
+      priority: String(r.priority),
+      status: String(r.status),
+      latitude: r.latitude != null ? Number(r.latitude) : null,
+      longitude: r.longitude != null ? Number(r.longitude) : null,
+      isSimulated: Boolean(r.is_simulated),
+      createdAt: String(r.created_at),
+    }));
   }
-
-  const rows = sqlite
-    .prepare(
-      'SELECT id, category, priority, status, latitude, longitude, is_simulated, created_at FROM emergency_incidents ORDER BY created_at DESC LIMIT ?'
-    )
-    .all(limit) as Record<string, unknown>[];
-  return rows.map((r) => ({
-    id: Number(r.id),
-    category: String(r.category),
-    priority: String(r.priority),
-    status: String(r.status),
-    latitude: r.latitude != null ? Number(r.latitude) : null,
-    longitude: r.longitude != null ? Number(r.longitude) : null,
-    isSimulated: Boolean(r.is_simulated),
-    createdAt: String(r.created_at),
-  }));
+  await cacheQueue.setCachedJson(cacheKey, mapped, 15);
+  return mapped;
 }
 
 // ========================

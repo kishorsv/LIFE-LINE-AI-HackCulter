@@ -24,6 +24,7 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext.tsx';
+import { cachedFetchJson } from '../lib/clientCache.ts';
 import { SosClusterAnalyticsResponse, SosIncidentCluster, SupportResource } from '../types/lifeline.ts';
 import {
   D3GoogleMapsClusterOverlay,
@@ -282,6 +283,7 @@ export function LiveMapPage() {
   const [clustersLoading, setClustersLoading] = useState(false);
   const [clusterError, setClusterError] = useState('');
   const [selectedCluster, setSelectedCluster] = useState<SosIncidentCluster | null>(null);
+  const [visibleDirCount, setVisibleDirCount] = useState(12);
 
   const handleRouteResult = useCallback((info: { distanceKm: string; durationMins: number } | null, err?: string) => {
     setRouteSummary(info);
@@ -296,17 +298,33 @@ export function LiveMapPage() {
   }, [searchQuery]);
 
   useEffect(() => {
+    setVisibleDirCount(12);
+    const controller = new AbortController();
     const params = new URLSearchParams();
     if (categoryFilter !== 'All') params.set('category', categoryFilter);
-    if (debouncedSearchQuery.trim()) params.set('q', debouncedSearchQuery.trim());
-    fetch(`/api/support-directory?${params.toString()}`)
-      .then((r) => r.json())
-      .then((d: { resources?: SupportResource[] }) => setDirectory(d.resources || []))
+    const trimmed = debouncedSearchQuery.trim();
+    if (trimmed) params.set('q', trimmed);
+    const cacheKey = `public:support-directory:${categoryFilter.toLowerCase()}:${trimmed.toLowerCase()}`;
+
+    cachedFetchJson<{ resources?: SupportResource[] }>(
+      cacheKey,
+      async (signal) => {
+        const res = await fetch(`/api/support-directory?${params.toString()}`, { signal });
+        if (!res.ok) throw new Error('Failed to load support directory');
+        return res.json() as Promise<{ resources?: SupportResource[] }>;
+      },
+      { ttlMs: 30_000, staleWhileRevalidateMs: 60_000, signal: controller.signal }
+    )
+      .then((d) => {
+        if (!controller.signal.aborted) setDirectory(d.resources || []);
+      })
       .catch(() => {});
+
+    return () => controller.abort();
   }, [categoryFilter, debouncedSearchQuery]);
 
   useEffect(() => {
-    let active = true;
+    const controller = new AbortController();
     setClustersLoading(true);
     setClusterError('');
     const params = new URLSearchParams({
@@ -316,14 +334,20 @@ export function LiveMapPage() {
       windowDays: String(clusterWindowDays),
       includeSimulated: String(includeSimulatedClusters),
     });
-    fetch(`/api/maps/sos-clusters?${params.toString()}`)
-      .then(async (r) => {
+    const cacheKey = `public:sos-clusters:${userCoords.lat.toFixed(3)}:${userCoords.lng.toFixed(3)}:${clusterWindowDays}:${includeSimulatedClusters}`;
+
+    cachedFetchJson<SosClusterAnalyticsResponse>(
+      cacheKey,
+      async (signal) => {
+        const r = await fetch(`/api/maps/sos-clusters?${params.toString()}`, { signal });
         const data = (await r.json()) as SosClusterAnalyticsResponse & { error?: string };
         if (!r.ok) throw new Error(data.error || 'Failed to load SOS clusters.');
         return data;
-      })
+      },
+      { ttlMs: 20_000, staleWhileRevalidateMs: 45_000, signal: controller.signal }
+    )
       .then((data) => {
-        if (!active) return;
+        if (controller.signal.aborted) return;
         setClusterData(data);
         setSelectedCluster((prev) => {
           if (prev && data.clusters.some((c) => c.id === prev.id)) {
@@ -333,15 +357,14 @@ export function LiveMapPage() {
         });
       })
       .catch((err: unknown) => {
-        if (!active) return;
+        if (controller.signal.aborted) return;
         setClusterError(err instanceof Error ? err.message : 'Unable to load SOS cluster data.');
       })
       .finally(() => {
-        if (active) setClustersLoading(false);
+        if (!controller.signal.aborted) setClustersLoading(false);
       });
-    return () => {
-      active = false;
-    };
+
+    return () => controller.abort();
   }, [userCoords.lat, userCoords.lng, clusterWindowDays, includeSimulatedClusters]);
 
   const detectBrowserLocation = () => {
@@ -983,7 +1006,7 @@ export function LiveMapPage() {
         </div>
 
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-          {directory.map((r) => (
+          {directory.slice(0, visibleDirCount).map((r) => (
             <div
               key={r.id}
               className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-5 flex flex-col justify-between gap-3"
@@ -1033,6 +1056,18 @@ export function LiveMapPage() {
             </div>
           ))}
         </div>
+
+        {directory.length > visibleDirCount && (
+          <div className="flex justify-center pt-2">
+            <button
+              type="button"
+              onClick={() => setVisibleDirCount((c) => c + 12)}
+              className="rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#0B1022] px-5 py-2.5 text-xs font-semibold text-violet-600 dark:text-violet-400 hover:border-violet-500/60"
+            >
+              Load More Support Resources ({directory.length - visibleDirCount} remaining)
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );

@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AppLanguage,
   AppUser,
@@ -130,12 +130,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     localStorage.setItem('lifeline_demo_mode', String(demoMode));
   }, [demoMode]);
 
-  // Load public non-secret configuration (Maps client key fallback, developer contact & demo sandbox availability)
+  const initialMapsKeyRef = useRef(mapsApiKey);
+
+  // Load public non-secret configuration once on mount (Maps client key fallback, developer contact & demo sandbox availability)
   useEffect(() => {
-    fetch('/api/config/public')
+    const controller = new AbortController();
+    fetch('/api/config/public', { signal: controller.signal })
       .then((r) => r.json())
       .then((data: { mapsApiKey?: string; demoSandboxEnabled?: boolean; developerContactEmail?: string }) => {
-        if (!mapsApiKey && data.mapsApiKey) setMapsApiKey(data.mapsApiKey);
+        if (!initialMapsKeyRef.current && data.mapsApiKey) setMapsApiKey(data.mapsApiKey);
         if (typeof data.demoSandboxEnabled === 'boolean') {
           setDemoSandboxEnabled(data.demoSandboxEnabled);
         }
@@ -144,7 +147,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
       })
       .catch(() => {});
-  }, [mapsApiKey]);
+    return () => controller.abort();
+  }, []);
 
   const apiFetch = useCallback(
     async <T = unknown,>(url: string, options: RequestInit = {}): Promise<T> => {
@@ -499,47 +503,72 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await signOutFirebase().catch(() => {});
   };
 
-  return (
-    <AuthContext.Provider
-      value={{
-        user,
-        profile,
-        preferences,
-        token,
-        googleAccessToken,
-        loading,
-        demoMode,
-        demoSandboxEnabled,
-        setDemoMode,
-        contacts,
-        incidents,
-        operatorIncidents,
-        notifications,
-        journeys,
-        language,
-        setLanguage,
-        mapsApiKey,
-        developerContactEmail,
-        authBlockedAlert,
-        reportAuthBlockedAlert,
-        dismissAuthBlockedAlert,
-        realtimeConnected,
-        apiFetch,
-        loginWithEmail,
-        registerWithEmail,
-        loginWithGoogle,
-        connectWorkspaceOAuth,
-        loginDemoRole,
-        logout,
-        refreshAllData,
-        refreshJourneys,
-        markAllNotificationsRead,
-        setUser,
-      }}
-    >
-      {children}
-    </AuthContext.Provider>
+  const contextValue = useMemo<AuthContextValue>(
+    () => ({
+      user,
+      profile,
+      preferences,
+      token,
+      googleAccessToken,
+      loading,
+      demoMode,
+      demoSandboxEnabled,
+      setDemoMode,
+      contacts,
+      incidents,
+      operatorIncidents,
+      notifications,
+      journeys,
+      language,
+      setLanguage,
+      mapsApiKey,
+      developerContactEmail,
+      authBlockedAlert,
+      reportAuthBlockedAlert,
+      dismissAuthBlockedAlert,
+      realtimeConnected,
+      apiFetch,
+      loginWithEmail,
+      registerWithEmail,
+      loginWithGoogle,
+      connectWorkspaceOAuth,
+      loginDemoRole,
+      logout,
+      refreshAllData,
+      refreshJourneys,
+      markAllNotificationsRead,
+      setUser,
+    }),
+    [
+      user,
+      profile,
+      preferences,
+      token,
+      googleAccessToken,
+      loading,
+      demoMode,
+      demoSandboxEnabled,
+      contacts,
+      incidents,
+      operatorIncidents,
+      notifications,
+      journeys,
+      language,
+      setLanguage,
+      mapsApiKey,
+      developerContactEmail,
+      authBlockedAlert,
+      reportAuthBlockedAlert,
+      dismissAuthBlockedAlert,
+      realtimeConnected,
+      apiFetch,
+      refreshAllData,
+      refreshJourneys,
+      markAllNotificationsRead,
+    ]
   );
+
+  return <AuthContext.Provider value={contextValue}>{children}</AuthContext.Provider>;
 }
 
 export function useAuth() {

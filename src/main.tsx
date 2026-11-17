@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { registerSW } from 'virtual:pwa-register';
 import App from './App.tsx';
 import './index.css';
+import { initWebVitalsReporting } from './lib/webVitals.ts';
 
 // Tier 1 Google Maps Demo Key Quota Defense (registered before React mounts)
 (window as unknown as { gm_authFailure?: () => void }).gm_authFailure = () => {
@@ -20,6 +21,7 @@ console.error = (...args: unknown[]) => {
 
 // Register Service Worker for offline emergency asset caching & resilience
 registerSW({ immediate: true });
+initWebVitalsReporting();
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

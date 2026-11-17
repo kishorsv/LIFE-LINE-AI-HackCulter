@@ -16,6 +16,7 @@ import {
   checkInSafetyJourney,
   completePasswordReset,
   countAllIncidentsForOperator,
+  countAllUsers,
   countAuditLogs,
   countIncidentsForUser,
   countNotificationsForUser,
@@ -35,7 +36,6 @@ import {
   initializeDatabase,
   initiatePasswordReset,
   listAllIncidentsForOperator,
-  listAllUsersForAdmin,
   listAiRecommendationsForUser,
   listAuditLogs,
   listIncidentsForPulse,
@@ -48,6 +48,7 @@ import {
   listSafetyReportsForPulse,
   listSupportDirectory,
   listTrustedContacts,
+  listUsersForAdminPaginated,
   loginEmailUser,
   markAllNotificationsRead,
   markNotificationRead,
@@ -436,6 +437,13 @@ export async function createAppServer(options?: {
     message: 'Too many community safety reports submitted. Please wait before submitting another.',
   });
 
+  const vitalsLimiter = createRateLimiter({
+    name: 'web_vitals',
+    windowMs: 60 * 1000,
+    maxRequests: 60,
+    message: 'Too many web vitals reports.',
+  });
+
   // ========================
   // HEALTH & NON-SECRET CLIENT CONFIG
   // ========================
@@ -488,6 +496,7 @@ export async function createAppServer(options?: {
       apiKey?: string;
       oAuthClientId?: string;
     };
+    res.setHeader('Cache-Control', 'public, max-age=300, stale-while-revalidate=600');
     res.json({
       mapsApiKey: getPublicClientMapsApiKey(),
       appUrl: process.env.APP_URL || '',
@@ -499,6 +508,26 @@ export async function createAppServer(options?: {
         oAuthClientConfigured: Boolean(fb.oAuthClientId && fb.oAuthClientId.includes('.apps.googleusercontent.com')),
       },
     });
+  });
+
+  app.post('/api/metrics/vitals', vitalsLimiter, (req, res) => {
+    const body = (req.body && typeof req.body === 'object' ? req.body : {}) as {
+      lcpMs?: unknown;
+      inpMs?: unknown;
+      cls?: unknown;
+      ttfbMs?: unknown;
+    };
+    const sanitizeMetric = (val: unknown, max: number): number | undefined => {
+      if (typeof val !== 'number' || !Number.isFinite(val) || val < 0 || val > max) return undefined;
+      return val;
+    };
+    metrics.recordWebVitals({
+      lcpMs: sanitizeMetric(body.lcpMs, 60_000),
+      inpMs: sanitizeMetric(body.inpMs, 30_000),
+      cls: sanitizeMetric(body.cls, 25),
+      ttfbMs: sanitizeMetric(body.ttfbMs, 60_000),
+    });
+    res.status(202).json({ ok: true });
   });
 
   // ========================
@@ -1184,6 +1213,9 @@ export async function createAppServer(options?: {
         failedCount: dispatchSummary.externalFailedCount,
       });
       void cacheQueue.invalidateCachePrefix('analytics:');
+      void cacheQueue.invalidateCachePrefix('pulse_data:');
+      void cacheQueue.invalidateCachePrefix('sos_clusters:');
+      void cacheQueue.invalidateCachePrefix('pulse_risk:');
 
       const sanitizedForReporter = sanitizeIncidentForViewer(finalIncident, 'regular_user');
       pushAndBroadcastRealtimeEvent({
@@ -1390,6 +1422,9 @@ export async function createAppServer(options?: {
       });
 
       void cacheQueue.invalidateCachePrefix('analytics:');
+      void cacheQueue.invalidateCachePrefix('pulse_data:');
+      void cacheQueue.invalidateCachePrefix('sos_clusters:');
+      void cacheQueue.invalidateCachePrefix('pulse_risk:');
 
       const sanitizedForReporter = sanitizeIncidentForViewer(updated, 'regular_user');
       pushAndBroadcastRealtimeEvent({
@@ -1413,6 +1448,7 @@ export async function createAppServer(options?: {
       const category = req.query.category ? sanitizeBoundedString(req.query.category, 64) : undefined;
       const query = req.query.q ? sanitizeBoundedString(req.query.q, 120) : undefined;
       const resources = await listSupportDirectory(category, query);
+      res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
       res.json({ resources });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load support directory.' });
@@ -1626,6 +1662,13 @@ export async function createAppServer(options?: {
         ? Math.min(Math.max(radiusKm, 0.5), 25)
         : 3.5;
 
+    const cleanLabel = sanitizeBoundedString(label, 180) || '';
+    const cacheKey = `pulse_risk:${lat.toFixed(2)}:${lng.toFixed(2)}:${cleanRadius.toFixed(1)}:${cleanLabel.toLowerCase().slice(0, 48)}`;
+    const cached = await cacheQueue.getCachedJson<{ risk: ReturnType<typeof computePredictiveRisk> }>(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
     const [weather, incidents, reports, supportHubs] = await Promise.all([
       fetchOpenMeteoWeather(lat, lng),
       listIncidentsForPulse(150),
@@ -1636,14 +1679,16 @@ export async function createAppServer(options?: {
     const assessment = computePredictiveRisk({
       latitude: lat,
       longitude: lng,
-      locationLabel: sanitizeBoundedString(label, 180) || undefined,
+      locationLabel: cleanLabel || undefined,
       radiusKm: cleanRadius,
       weather,
       incidents,
       reports,
       supportHubs,
     });
-    return res.json({ risk: assessment });
+    const payload = { risk: assessment };
+    await cacheQueue.setCachedJson(cacheKey, payload, 15);
+    return res.json(payload);
   };
 
   app.post('/api/pulse/risk', mapsLimiter, async (req, res) => {
@@ -1717,6 +1762,10 @@ export async function createAppServer(options?: {
         ipAddress: req.ip,
       });
 
+      void cacheQueue.invalidateCachePrefix('pulse_data:');
+      void cacheQueue.invalidateCachePrefix('sos_clusters:');
+      void cacheQueue.invalidateCachePrefix('pulse_risk:');
+
       pushAndBroadcastRealtimeEvent({
         includeOperators: true,
         userPayload: { type: 'pulse:report_created', report },
@@ -1749,6 +1798,16 @@ export async function createAppServer(options?: {
       }
       const includeSimulated = req.query.includeSimulated !== 'false';
 
+      const latBucket = latRaw !== undefined ? latRaw.toFixed(2) : 'all';
+      const lngBucket = lngRaw !== undefined ? lngRaw.toFixed(2) : 'all';
+      const cacheKey = `sos_clusters:${latBucket}:${lngBucket}:${radiusKm}:${windowDays}:${includeSimulated}`;
+
+      const cached = await cacheQueue.getCachedJson<ReturnType<typeof buildSosIncidentClusters>>(cacheKey);
+      if (cached) {
+        res.setHeader('Cache-Control', 'public, max-age=20, stale-while-revalidate=40');
+        return res.json(cached);
+      }
+
       const [incidents, reports] = await Promise.all([
         listIncidentsForPulse(400),
         listSafetyReportsForPulse(200),
@@ -1763,6 +1822,8 @@ export async function createAppServer(options?: {
         windowDays,
         includeSimulated,
       });
+      await cacheQueue.setCachedJson(cacheKey, result, 20);
+      res.setHeader('Cache-Control', 'public, max-age=20, stale-while-revalidate=40');
       res.json(result);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to compute SOS clusters.' });
@@ -2460,9 +2521,16 @@ export async function createAppServer(options?: {
     }
   );
 
-  app.get('/api/admin/users', requireAuth, requireRole(['administrator']), async (_req, res) => {
-    const users = await listAllUsersForAdmin();
-    res.json({ users });
+  app.get('/api/admin/users', requireAuth, requireRole(['administrator']), async (req, res) => {
+    const { page, limit, offset } = parsePagination(req.query as Record<string, unknown>, { limit: 50, maxLimit: 100 });
+    const [users, total] = await Promise.all([
+      listUsersForAdminPaginated(limit, offset),
+      countAllUsers(),
+    ]);
+    res.json({
+      users,
+      pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
+    });
   });
 
   app.patch('/api/admin/users/:id/role', requireAuth, requireRole(['administrator']), async (req: AuthRequest, res) => {

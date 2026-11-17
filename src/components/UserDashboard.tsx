@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext.tsx';
 import { formatGoogleAuthError } from '../lib/firebaseAuthErrors.ts';
+import { cachedFetchJson } from '../lib/clientCache.ts';
 import { FirebaseAuthBlockedAlert } from './FirebaseAuthBlockedAlert.tsx';
 import { t } from '../i18n/translations.ts';
 import { LifeLineLogo } from './LifeLineLogo.tsx';
@@ -79,6 +80,8 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
   const [dashboardError, setDashboardError] = useState('');
   const [cancellingId, setCancellingId] = useState<number | null>(null);
   const [journeyBusy, setJourneyBusy] = useState(false);
+  const [showAllIncidents, setShowAllIncidents] = useState(false);
+  const [showAllNotifications, setShowAllNotifications] = useState(false);
 
   useEffect(() => {
     if (profile) {
@@ -88,15 +91,28 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
   }, [profile]);
 
   useEffect(() => {
-    fetch('/api/support-directory')
-      .then((r) => r.json())
-      .then((d: { resources?: SupportResource[] }) => setNearbyPreview((d.resources || []).slice(0, 3)))
+    const controller = new AbortController();
+    cachedFetchJson<{ resources?: SupportResource[] }>(
+      'public:support-directory:all:',
+      async (signal) => {
+        const res = await fetch('/api/support-directory', { signal });
+        if (!res.ok) throw new Error('Failed to load directory');
+        return res.json() as Promise<{ resources?: SupportResource[] }>;
+      },
+      { ttlMs: 60_000, staleWhileRevalidateMs: 120_000, signal: controller.signal }
+    )
+      .then((d) => {
+        if (!controller.signal.aborted) setNearbyPreview((d.resources || []).slice(0, 3));
+      })
       .catch(() => {});
     if (user) {
       apiFetch<{ recommendations: AiRecommendationItem[] }>('/api/ai/recommendations')
-        .then((d) => setRecommendations(d.recommendations || []))
+        .then((d) => {
+          if (!controller.signal.aborted) setRecommendations(d.recommendations || []);
+        })
         .catch(() => {});
     }
+    return () => controller.abort();
   }, [user, apiFetch]);
 
   const handleStatusChange = async (nextStatus: string) => {
@@ -703,58 +719,69 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
                 No SOS incidents triggered yet. Use Emergency SOS or Hackathon Demo Mode to test the workflow.
               </p>
             ) : (
-              incidents.slice(0, 6).map((inc) => {
-                const isActive = !['Resolved', 'Cancelled'].includes(inc.status);
-                return (
-                  <div key={inc.id} className="rounded-xl border border-slate-200 dark:border-slate-800 p-3.5 space-y-1.5">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <span className="text-sm font-semibold text-slate-900 dark:text-white">
-                        {inc.isSimulated ? '[SIMULATED] ' : ''}#{inc.id} · {inc.title}
-                      </span>
-                      <div className="flex items-center gap-1.5">
-                        {inc.deliveryStatus && (
-                          <span
-                            className={`rounded-md px-2 py-0.5 font-mono text-[10px] font-semibold uppercase ${
-                              inc.deliveryStatus === 'delivered'
-                                ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
-                                : inc.deliveryStatus === 'failed'
-                                ? 'bg-rose-500/15 text-rose-700 dark:text-rose-300'
-                                : 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
-                            }`}
-                          >
-                            {inc.deliveryStatus}
-                          </span>
-                        )}
-                        <span className="rounded-md border border-violet-500/35 bg-violet-500/10 px-2 py-0.5 text-[11px] font-semibold text-violet-700 dark:text-violet-300">
-                          {inc.status}
+              <>
+                {(showAllIncidents ? incidents : incidents.slice(0, 6)).map((inc) => {
+                  const isActive = !['Resolved', 'Cancelled'].includes(inc.status);
+                  return (
+                    <div key={inc.id} className="rounded-xl border border-slate-200 dark:border-slate-800 p-3.5 space-y-1.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-sm font-semibold text-slate-900 dark:text-white">
+                          {inc.isSimulated ? '[SIMULATED] ' : ''}#{inc.id} · {inc.title}
                         </span>
+                        <div className="flex items-center gap-1.5">
+                          {inc.deliveryStatus && (
+                            <span
+                              className={`rounded-md px-2 py-0.5 font-mono text-[10px] font-semibold uppercase ${
+                                inc.deliveryStatus === 'delivered'
+                                  ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                                  : inc.deliveryStatus === 'failed'
+                                  ? 'bg-rose-500/15 text-rose-700 dark:text-rose-300'
+                                  : 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                              }`}
+                            >
+                              {inc.deliveryStatus}
+                            </span>
+                          )}
+                          <span className="rounded-md border border-violet-500/35 bg-violet-500/10 px-2 py-0.5 text-[11px] font-semibold text-violet-700 dark:text-violet-300">
+                            {inc.status}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="text-xs text-slate-500 dark:text-slate-400">
+                        {inc.locationLabel} · Priority: {inc.priority}
+                      </div>
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        {inc.operatorName ? (
+                          <div className="text-[11px] text-emerald-600 dark:text-emerald-400">
+                            Responder: {inc.operatorName}
+                          </div>
+                        ) : (
+                          <span />
+                        )}
+                        {isActive && (
+                          <button
+                            type="button"
+                            disabled={cancellingId === inc.id}
+                            onClick={() => handleMarkSafeIncident(inc.id)}
+                            className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-60"
+                          >
+                            {cancellingId === inc.id ? 'Updating...' : t(language, 'dash_mark_safe')}
+                          </button>
+                        )}
                       </div>
                     </div>
-                    <div className="text-xs text-slate-500 dark:text-slate-400">
-                      {inc.locationLabel} · Priority: {inc.priority}
-                    </div>
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      {inc.operatorName ? (
-                        <div className="text-[11px] text-emerald-600 dark:text-emerald-400">
-                          Responder: {inc.operatorName}
-                        </div>
-                      ) : (
-                        <span />
-                      )}
-                      {isActive && (
-                        <button
-                          type="button"
-                          disabled={cancellingId === inc.id}
-                          onClick={() => handleMarkSafeIncident(inc.id)}
-                          className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-60"
-                        >
-                          {cancellingId === inc.id ? 'Updating...' : t(language, 'dash_mark_safe')}
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                );
-              })
+                  );
+                })}
+                {incidents.length > 6 && (
+                  <button
+                    type="button"
+                    onClick={() => setShowAllIncidents((v) => !v)}
+                    className="w-full rounded-xl border border-slate-200 dark:border-slate-800 py-1.5 text-[11px] font-semibold text-violet-600 dark:text-violet-400 hover:bg-violet-500/5"
+                  >
+                    {showAllIncidents ? 'Show Fewer Incidents' : `Show All ${incidents.length} Incidents`}
+                  </button>
+                )}
+              </>
             )}
           </div>
         </div>
@@ -981,19 +1008,30 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
             {notifications.length === 0 ? (
               <p className="text-xs text-slate-500 dark:text-slate-400">No recent alerts.</p>
             ) : (
-              notifications.slice(0, 5).map((n) => (
-                <div
-                  key={n.id}
-                  className={`rounded-xl border p-3 ${
-                    n.isRead
-                      ? 'border-slate-200 dark:border-slate-800 opacity-75'
-                      : 'border-violet-500/35 bg-violet-500/5'
-                  }`}
-                >
-                  <div className="text-xs font-semibold text-slate-900 dark:text-white">{n.title}</div>
-                  <div className="text-[11px] text-slate-600 dark:text-slate-300 mt-0.5">{n.message}</div>
-                </div>
-              ))
+              <>
+                {(showAllNotifications ? notifications : notifications.slice(0, 5)).map((n) => (
+                  <div
+                    key={n.id}
+                    className={`rounded-xl border p-3 ${
+                      n.isRead
+                        ? 'border-slate-200 dark:border-slate-800 opacity-75'
+                        : 'border-violet-500/35 bg-violet-500/5'
+                    }`}
+                  >
+                    <div className="text-xs font-semibold text-slate-900 dark:text-white">{n.title}</div>
+                    <div className="text-[11px] text-slate-600 dark:text-slate-300 mt-0.5">{n.message}</div>
+                  </div>
+                ))}
+                {notifications.length > 5 && (
+                  <button
+                    type="button"
+                    onClick={() => setShowAllNotifications((v) => !v)}
+                    className="w-full rounded-xl border border-slate-200 dark:border-slate-800 py-1.5 text-[11px] font-semibold text-violet-600 dark:text-violet-400 hover:bg-violet-500/5"
+                  >
+                    {showAllNotifications ? 'Show Fewer Alerts' : `Show All ${notifications.length} Alerts`}
+                  </button>
+                )}
+              </>
             )}
           </div>
         </div>

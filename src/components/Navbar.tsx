@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import React, { useState } from 'react';
 import {
   Bell,
   FlaskConical,
@@ -13,6 +13,7 @@ import { ActiveView } from '../types/lifeline.ts';
 import { useTheme } from '../contexts/ThemeContext.tsx';
 import { useAuth } from '../contexts/AuthContext.tsx';
 import { t } from '../i18n/translations.ts';
+import { prefetchViewResources } from '../lib/routePrefetch.ts';
 import { PWAInstallButton } from './PWAInstallButton.tsx';
 import { LifeLineLogo } from './LifeLineLogo.tsx';
 
@@ -24,7 +25,13 @@ interface NavbarProps {
   onToggleNotifications: () => void;
 }
 
-export function Navbar({ activeView, onNavigate, onOpenAuth, onOpenSos, onToggleNotifications }: NavbarProps) {
+export const Navbar = React.memo(function Navbar({
+  activeView,
+  onNavigate,
+  onOpenAuth,
+  onOpenSos,
+  onToggleNotifications,
+}: NavbarProps) {
   const { theme, toggleTheme } = useTheme();
   const { user, demoMode, setDemoMode, notifications, language, setLanguage } = useAuth();
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -72,6 +79,8 @@ export function Navbar({ activeView, onNavigate, onOpenAuth, onOpenSos, onToggle
                 key={item.id}
                 type="button"
                 onClick={() => handleNav(item.id)}
+                onMouseEnter={() => prefetchViewResources(item.id)}
+                onFocus={() => prefetchViewResources(item.id)}
                 className={`rounded-lg px-3 py-2 text-sm font-medium transition-colors whitespace-nowrap ${
                   active
                     ? 'bg-violet-600/12 text-violet-700 dark:bg-violet-500/20 dark:text-violet-300'
@@ -206,6 +215,8 @@ export function Navbar({ activeView, onNavigate, onOpenAuth, onOpenSos, onToggle
               key={item.id}
               type="button"
               onClick={() => handleNav(item.id)}
+              onMouseEnter={() => prefetchViewResources(item.id)}
+              onFocus={() => prefetchViewResources(item.id)}
               className={`block w-full rounded-lg px-3 py-2 text-left text-sm font-medium ${
                 activeView === item.id
                   ? 'bg-violet-600/15 text-violet-700 dark:text-violet-300'
@@ -219,4 +230,4 @@ export function Navbar({ activeView, onNavigate, onOpenAuth, onOpenSos, onToggle
       )}
     </header>
   );
-}
+});

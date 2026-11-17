@@ -1,7 +1,5 @@
-import { useCallback, useEffect, useState } from 'react';
-import { APIProvider, AdvancedMarker, Map as GoogleMap, Pin } from '@vis.gl/react-google-maps';
-import { Bar, BarChart, CartesianGrid, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
-import { Activity, AlertTriangle, CheckCircle2, ClipboardList, Cpu, Database, Lock, Radio, RefreshCw, ShieldCheck, UserCheck, Users } from 'lucide-react';
+import { Suspense, lazy, useCallback, useEffect, useState } from 'react';
+import { Activity, AlertTriangle, CheckCircle2, ClipboardList, Cpu, Database, Gauge, Lock, Radio, RefreshCw, ShieldCheck, UserCheck, Users } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext.tsx';
 import { LifeLineLogo } from './LifeLineLogo.tsx';
 import {
@@ -13,6 +11,9 @@ import {
   ResponderInfo,
   UserRole,
 } from '../types/lifeline.ts';
+
+const OperatorIncidentMap = lazy(() => import('./OperatorIncidentMap.tsx'));
+const OperatorAnalyticsPanel = lazy(() => import('./OperatorAnalyticsPanel.tsx'));
 
 export function OperatorDashboard() {
   const { user, operatorIncidents, demoMode, loginDemoRole, mapsApiKey, apiFetch, refreshAllData } = useAuth();
@@ -31,6 +32,8 @@ export function OperatorDashboard() {
   const [queuePage, setQueuePage] = useState(1);
   const [queueTotalPages, setQueueTotalPages] = useState(1);
   const [adminUsers, setAdminUsers] = useState<AppUser[]>([]);
+  const [adminUsersPage, setAdminUsersPage] = useState(1);
+  const [adminUsersTotalPages, setAdminUsersTotalPages] = useState(1);
   const [responders, setResponders] = useState<ResponderInfo[]>([]);
   const [assignOperatorId, setAssignOperatorId] = useState<string>('');
   const [myStatus, setMyStatus] = useState<'Available' | 'Responding' | 'Off Duty'>('Available');
@@ -44,28 +47,34 @@ export function OperatorDashboard() {
 
   const loadOperatorResources = useCallback(async () => {
     if (!isAuthorized || !user) return;
-    apiFetch<AnalyticsSummary>('/api/analytics').then(setAnalytics).catch(() => {});
-    apiFetch<{ responders: ResponderInfo[] }>('/api/operator/responders')
-      .then((d) => {
-        setResponders(d.responders);
-        const me = d.responders.find((r) => r.id === user.id);
-        if (me) setMyStatus(me.responderStatus);
-        if (!assignOperatorId && d.responders.length > 0) {
-          setAssignOperatorId(String(me?.id || d.responders[0].id));
-        }
-      })
-      .catch(() => {});
 
-    apiFetch<{ incidents: EmergencyIncident[]; pagination?: { totalPages: number } }>(
-      `/api/operator/incidents?page=${queuePage}&limit=25`
-    )
-      .then((d) => {
-        setPagedQueue(d.incidents);
-        if (d.pagination?.totalPages) setQueueTotalPages(d.pagination.totalPages);
-      })
-      .catch(() => {});
+    if (tab === 'queue') {
+      apiFetch<{ responders: ResponderInfo[] }>('/api/operator/responders')
+        .then((d) => {
+          setResponders(d.responders);
+          const me = d.responders.find((r) => r.id === user.id);
+          if (me) setMyStatus(me.responderStatus);
+          if (d.responders.length > 0) {
+            setAssignOperatorId((prev) => prev || String(me?.id || d.responders[0].id));
+          }
+        })
+        .catch(() => {});
 
-    if (['administrator', 'emergency_operator'].includes(user.role)) {
+      apiFetch<{ incidents: EmergencyIncident[]; pagination?: { totalPages: number } }>(
+        `/api/operator/incidents?page=${queuePage}&limit=25`
+      )
+        .then((d) => {
+          setPagedQueue(d.incidents);
+          if (d.pagination?.totalPages) setQueueTotalPages(d.pagination.totalPages);
+        })
+        .catch(() => {});
+    }
+
+    if (tab === 'analytics') {
+      apiFetch<AnalyticsSummary>('/api/analytics').then(setAnalytics).catch(() => {});
+    }
+
+    if (tab === 'audit' && ['administrator', 'emergency_operator'].includes(user.role)) {
       apiFetch<{ logs: AuditLogEntry[]; pagination?: { totalPages: number } }>(
         `/api/admin/audit-logs?page=${auditPage}&limit=25`
       )
@@ -74,27 +83,49 @@ export function OperatorDashboard() {
           if (d.pagination?.totalPages) setAuditTotalPages(d.pagination.totalPages);
         })
         .catch(() => {});
-      apiFetch<MonitoringSnapshot>('/api/admin/monitoring')
-        .then(setMonitoring)
+    }
+
+    if (tab === 'monitoring' && canViewMonitoring) {
+      apiFetch<MonitoringSnapshot>('/api/admin/monitoring').then(setMonitoring).catch(() => {});
+    }
+
+    if (tab === 'roles' && user.role === 'administrator') {
+      apiFetch<{ users: AppUser[]; pagination?: { totalPages: number } }>(
+        `/api/admin/users?page=${adminUsersPage}&limit=50`
+      )
+        .then((d) => {
+          setAdminUsers(d.users);
+          if (d.pagination?.totalPages) setAdminUsersTotalPages(d.pagination.totalPages);
+        })
         .catch(() => {});
     }
-    if (user.role === 'administrator') {
-      apiFetch<{ users: AppUser[] }>('/api/admin/users')
-        .then((d) => setAdminUsers(d.users))
-        .catch(() => {});
-    }
-  }, [isAuthorized, user, apiFetch, queuePage, auditPage, assignOperatorId]);
+  }, [isAuthorized, canViewMonitoring, user, tab, apiFetch, queuePage, auditPage, adminUsersPage]);
 
   useEffect(() => {
     void loadOperatorResources();
   }, [loadOperatorResources, operatorIncidents.length]);
 
+  // Fetch initial monitoring alert badge once on authorized mount
+  useEffect(() => {
+    if (!canViewMonitoring || monitoring) return;
+    apiFetch<MonitoringSnapshot>('/api/admin/monitoring').then(setMonitoring).catch(() => {});
+  }, [canViewMonitoring, monitoring, apiFetch]);
+
   useEffect(() => {
     if (tab !== 'monitoring' || !canViewMonitoring || !monitoringAutoRefresh) return;
-    const timer = setInterval(() => {
+    const poll = () => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
       apiFetch<MonitoringSnapshot>('/api/admin/monitoring').then(setMonitoring).catch(() => {});
-    }, 5000);
-    return () => clearInterval(timer);
+    };
+    const timer = setInterval(poll, 5000);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') poll();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
   }, [tab, canViewMonitoring, monitoringAutoRefresh, apiFetch]);
 
   if (!isAuthorized) {
@@ -192,14 +223,15 @@ export function OperatorDashboard() {
         method: 'PATCH',
         body: JSON.stringify({ role }),
       });
-      const res = await apiFetch<{ users: AppUser[] }>('/api/admin/users');
+      const res = await apiFetch<{ users: AppUser[]; pagination?: { totalPages: number } }>(
+        `/api/admin/users?page=${adminUsersPage}&limit=50`
+      );
       setAdminUsers(res.users);
+      if (res.pagination?.totalPages) setAdminUsersTotalPages(res.pagination.totalPages);
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Role update failed.');
     }
   };
-
-  const COLORS = ['#8B5CF6', '#EC4899', '#10B981', '#F59E0B', '#38BDF8'];
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 space-y-6">
@@ -526,35 +558,20 @@ export function OperatorDashboard() {
                 {/* Live Multi-Incident Command Map */}
                 {mapsApiKey && selectedIncident.latitude != null && selectedIncident.longitude != null && (
                   <div className="h-64 w-full overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-800 relative">
-                    <APIProvider apiKey={mapsApiKey}>
-                      <GoogleMap
-                        center={{ lat: selectedIncident.latitude, lng: selectedIncident.longitude }}
-                        defaultZoom={13}
-                        mapId="DEMO_MAP_ID"
-                        internalUsageAttributionIds={['gmp_mcp_codeassist_v1_aistudio']}
-                        style={{ width: '100%', height: '100%' }}
-                      >
-                        {mappableIncidents.map((inc) => (
-                          <AdvancedMarker
-                            key={inc.id}
-                            position={{ lat: inc.latitude, lng: inc.longitude }}
-                            onClick={() => setSelectedId(inc.id)}
-                          >
-                            <Pin
-                              background={
-                                inc.id === selectedIncident.id
-                                  ? '#E11D48'
-                                  : inc.status === 'Resolved' || inc.status === 'Cancelled'
-                                  ? '#10B981'
-                                  : '#F59E0B'
-                              }
-                              borderColor={inc.id === selectedIncident.id ? '#FFFFFF' : '#0F172A'}
-                              glyphColor="#FFFFFF"
-                            />
-                          </AdvancedMarker>
-                        ))}
-                      </GoogleMap>
-                    </APIProvider>
+                    <Suspense
+                      fallback={
+                        <div className="h-full w-full flex items-center justify-center text-xs text-slate-400 animate-pulse">
+                          Loading interactive incident command map...
+                        </div>
+                      }
+                    >
+                      <OperatorIncidentMap
+                        mapsApiKey={mapsApiKey}
+                        selectedIncident={selectedIncident as EmergencyIncident & { latitude: number; longitude: number }}
+                        mappableIncidents={mappableIncidents}
+                        onSelectIncident={setSelectedId}
+                      />
+                    </Suspense>
                   </div>
                 )}
               </>
@@ -568,130 +585,22 @@ export function OperatorDashboard() {
       )}
 
       {/* Analytics Dashboard (strictly separating Live vs Simulated Metrics) */}
-      {tab === 'analytics' && analytics && (
-        <div className="space-y-6">
-          <div className="grid gap-4 md:grid-cols-2">
-            {/* Real Live Operational Metrics */}
-            <div className="rounded-2xl border border-emerald-500/35 bg-white dark:bg-[#0B1022] p-5 space-y-3">
-              <div className="flex items-center justify-between">
-                <h2 className="font-display text-base font-bold text-slate-900 dark:text-white">
-                  Live Operational Metrics
-                </h2>
-                <span className="rounded bg-emerald-500/15 px-2 py-0.5 font-mono text-[10px] font-bold text-emerald-700 dark:text-emerald-300">
-                  REAL DATABASE DATA
-                </span>
+      {tab === 'analytics' && (
+        analytics ? (
+          <Suspense
+            fallback={
+              <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-8 text-center text-xs text-slate-500 animate-pulse">
+                Loading analytics charts...
               </div>
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-center">
-                <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
-                  <div className="text-[11px] text-slate-500">Total Live</div>
-                  <div className="font-display text-2xl font-extrabold tabular-nums">{analytics.liveStats.total}</div>
-                </div>
-                <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
-                  <div className="text-[11px] text-slate-500">Active Now</div>
-                  <div className="font-display text-2xl font-extrabold tabular-nums text-rose-500">
-                    {analytics.liveStats.active}
-                  </div>
-                </div>
-                <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
-                  <div className="text-[11px] text-slate-500">Avg Ack (s)</div>
-                  <div className="font-display text-2xl font-extrabold tabular-nums">
-                    {analytics.liveStats.avgAckSeconds ?? '—'}
-                  </div>
-                </div>
-                <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
-                  <div className="text-[11px] text-slate-500">Avg Resolve (s)</div>
-                  <div className="font-display text-2xl font-extrabold tabular-nums text-emerald-500">
-                    {analytics.liveStats.avgResolutionSeconds ?? '—'}
-                  </div>
-                </div>
-              </div>
-              {analytics.responders && (
-                <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                  Responder Fleet: {analytics.responders.available} Available · {analytics.responders.responding} Responding ·{' '}
-                  {analytics.responders.offDuty} Off Duty
-                </div>
-              )}
-            </div>
-
-            {/* Simulated Demo Metrics */}
-            <div className="rounded-2xl border border-amber-500/35 bg-white dark:bg-[#0B1022] p-5 space-y-3">
-              <div className="flex items-center justify-between">
-                <h2 className="font-display text-base font-bold text-slate-900 dark:text-white">
-                  Simulated Sandbox Metrics
-                </h2>
-                <span className="rounded bg-amber-500/15 px-2 py-0.5 font-mono text-[10px] font-bold text-amber-700 dark:text-amber-300">
-                  [SIMULATED] DEMO DATA
-                </span>
-              </div>
-              <div className="grid grid-cols-3 gap-3 text-center">
-                <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
-                  <div className="text-[11px] text-slate-500">Total Demo</div>
-                  <div className="font-display text-2xl font-extrabold tabular-nums">{analytics.demoStats.total}</div>
-                </div>
-                <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
-                  <div className="text-[11px] text-slate-500">Active Demo</div>
-                  <div className="font-display text-2xl font-extrabold tabular-nums text-amber-500">
-                    {analytics.demoStats.active}
-                  </div>
-                </div>
-                <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
-                  <div className="text-[11px] text-slate-500">Resolved Demo</div>
-                  <div className="font-display text-2xl font-extrabold tabular-nums text-emerald-500">
-                    {analytics.demoStats.resolved}
-                  </div>
-                </div>
-              </div>
-            </div>
+            }
+          >
+            <OperatorAnalyticsPanel analytics={analytics} />
+          </Suspense>
+        ) : (
+          <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-8 text-center text-xs text-slate-500 animate-pulse">
+            Loading operational metrics...
           </div>
-
-          <div className="grid gap-6 lg:grid-cols-2">
-            <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-5">
-              <h3 className="font-display text-sm font-bold mb-4">Support Directory Resource Distribution</h3>
-              <div className="h-64">
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={analytics.resourceDistribution}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#334155" opacity={0.3} />
-                    <XAxis dataKey="category" tick={{ fontSize: 10 }} />
-                    <YAxis allowDecimals={false} tick={{ fontSize: 11 }} />
-                    <Tooltip />
-                    <Bar dataKey="count" fill="#8B5CF6" radius={[6, 6, 0, 0]} />
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-
-            <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-5">
-              <h3 className="font-display text-sm font-bold mb-4">Simulated Incidents by Category</h3>
-              <div className="h-64">
-                <ResponsiveContainer width="100%" height="100%">
-                  <PieChart>
-                    <Pie
-                      data={
-                        analytics.demoStats.byCategory.length
-                          ? analytics.demoStats.byCategory
-                          : [{ name: 'No Data', count: 1 }]
-                      }
-                      dataKey="count"
-                      nameKey="name"
-                      cx="50%"
-                      cy="50%"
-                      outerRadius={80}
-                      label
-                    >
-                      {(analytics.demoStats.byCategory.length
-                        ? analytics.demoStats.byCategory
-                        : [{ name: 'No Data', count: 1 }]
-                      ).map((_, idx) => (
-                        <Cell key={idx} fill={COLORS[idx % COLORS.length]} />
-                      ))}
-                    </Pie>
-                    <Tooltip />
-                  </PieChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-          </div>
-        </div>
+        )
       )}
 
       {/* Operator / Admin-Only System Health & Performance Monitoring Dashboard */}
@@ -844,8 +753,12 @@ export function OperatorDashboard() {
                   <div className="text-[11px] text-slate-500 flex items-center gap-1.5">
                     <Database className="h-3.5 w-3.5" />
                     <span>
-                      Avg query: {monitoring.database.avgQueryLatencyMs} ms · p95:{' '}
-                      {monitoring.database.p95QueryLatencyMs} ms
+                      Avg: {monitoring.database.avgQueryLatencyMs} ms · p95:{' '}
+                      {monitoring.database.p95QueryLatencyMs} ms · Slow (&gt;100ms):{' '}
+                      <strong className={monitoring.database.slowQueryCount > 0 ? 'text-amber-500' : ''}>
+                        {monitoring.database.slowQueryCount}
+                      </strong>{' '}
+                      (max {monitoring.database.slowestQueryMs} ms)
                     </span>
                   </div>
                 </div>
@@ -938,6 +851,63 @@ export function OperatorDashboard() {
                     AI Fallbacks: {monitoring.ai.fallbackCalls}
                   </div>
                 </div>
+
+                {/* Core Web Vitals (p75 RUM Telemetry) */}
+                <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-5 space-y-2.5 md:col-span-2 lg:col-span-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="inline-flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-slate-500">
+                      <Gauge className="h-3.5 w-3.5 text-violet-500" />
+                      <span>Real-User Core Web Vitals (p75)</span>
+                    </span>
+                    <span className="rounded bg-violet-500/15 px-2 py-0.5 font-mono text-[10px] font-bold text-violet-700 dark:text-violet-300">
+                      {monitoring.webVitals.sampleCount} SAMPLES
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                      <div className="text-[11px] text-slate-500">LCP p75 (Target ≤2500ms)</div>
+                      <div
+                        className={`font-display text-xl font-bold tabular-nums ${
+                          monitoring.webVitals.lcpP75Ms > 2500
+                            ? 'text-amber-500'
+                            : 'text-emerald-600 dark:text-emerald-400'
+                        }`}
+                      >
+                        {monitoring.webVitals.sampleCount > 0 ? `${monitoring.webVitals.lcpP75Ms} ms` : '—'}
+                      </div>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                      <div className="text-[11px] text-slate-500">INP p75 (Target ≤200ms)</div>
+                      <div
+                        className={`font-display text-xl font-bold tabular-nums ${
+                          monitoring.webVitals.inpP75Ms > 200
+                            ? 'text-amber-500'
+                            : 'text-emerald-600 dark:text-emerald-400'
+                        }`}
+                      >
+                        {monitoring.webVitals.sampleCount > 0 ? `${monitoring.webVitals.inpP75Ms} ms` : '—'}
+                      </div>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                      <div className="text-[11px] text-slate-500">CLS p75 (Target ≤0.1)</div>
+                      <div
+                        className={`font-display text-xl font-bold tabular-nums ${
+                          monitoring.webVitals.clsP75 > 0.1
+                            ? 'text-amber-500'
+                            : 'text-emerald-600 dark:text-emerald-400'
+                        }`}
+                      >
+                        {monitoring.webVitals.sampleCount > 0 ? monitoring.webVitals.clsP75 : '—'}
+                      </div>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5">
+                      <div className="text-[11px] text-slate-500">TTFB p75</div>
+                      <div className="font-display text-xl font-bold tabular-nums">
+                        {monitoring.webVitals.sampleCount > 0 ? `${monitoring.webVitals.ttfbP75Ms} ms` : '—'}
+                      </div>
+                    </div>
+                  </div>
+                </div>
               </div>
             </>
           ) : (
@@ -1012,9 +982,34 @@ export function OperatorDashboard() {
       {/* Admin Role Governance */}
       {tab === 'roles' && user!.role === 'administrator' && (
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-6 space-y-4">
-          <div className="flex items-center gap-2">
-            <Users className="h-5 w-5 text-amber-500" />
-            <h2 className="font-display text-base font-bold">Administrator Role Governance</h2>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Users className="h-5 w-5 text-amber-500" />
+              <h2 className="font-display text-base font-bold">Administrator Role Governance</h2>
+            </div>
+            {adminUsersTotalPages > 1 && (
+              <div className="flex items-center gap-2 text-xs">
+                <button
+                  type="button"
+                  disabled={adminUsersPage <= 1}
+                  onClick={() => setAdminUsersPage((p) => Math.max(1, p - 1))}
+                  className="rounded border border-slate-300 dark:border-slate-700 px-2.5 py-1 disabled:opacity-40"
+                >
+                  Prev
+                </button>
+                <span className="font-mono text-slate-500">
+                  Page {adminUsersPage} of {adminUsersTotalPages}
+                </span>
+                <button
+                  type="button"
+                  disabled={adminUsersPage >= adminUsersTotalPages}
+                  onClick={() => setAdminUsersPage((p) => Math.min(adminUsersTotalPages, p + 1))}
+                  className="rounded border border-slate-300 dark:border-slate-700 px-2.5 py-1 disabled:opacity-40"
+                >
+                  Next
+                </button>
+              </div>
+            )}
           </div>
           <div className="space-y-2.5">
             {adminUsers.map((u) => (

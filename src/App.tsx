@@ -1,4 +1,4 @@
-import React, { Suspense, useEffect, useState } from 'react';
+import React, { Suspense, useCallback, useEffect, useState } from 'react';
 import { Check, X } from 'lucide-react';
 import { ThemeProvider } from './contexts/ThemeContext.tsx';
 import { AuthProvider, useAuth } from './contexts/AuthContext.tsx';
@@ -52,6 +52,14 @@ function ViewLoadingSkeleton() {
   );
 }
 
+const VALID_VIEWS = new Set<ActiveView>(['landing', 'dashboard', 'pulse', 'map', 'agents', 'operator', 'profile']);
+
+function readViewFromLocation(): ActiveView {
+  if (typeof window === 'undefined') return 'landing';
+  const param = new URLSearchParams(window.location.search).get('view') as ActiveView | null;
+  return param && VALID_VIEWS.has(param) ? param : 'landing';
+}
+
 function AppShell() {
   const {
     user,
@@ -63,7 +71,7 @@ function AppShell() {
     developerContactEmail,
     dismissAuthBlockedAlert,
   } = useAuth();
-  const [activeView, setActiveView] = useState<ActiveView>('landing');
+  const [activeView, setActiveViewState] = useState<ActiveView>(() => readViewFromLocation());
   const [authOpen, setAuthOpen] = useState(false);
   const [sosOpen, setSosOpen] = useState(false);
   const [notifDrawerOpen, setNotifDrawerOpen] = useState(false);
@@ -72,6 +80,31 @@ function AppShell() {
   const [queuedSosCount, setQueuedSosCount] = useState(0);
   const [failedSosCount, setFailedSosCount] = useState(0);
   const flushingRef = React.useRef(false);
+
+  const setActiveView = useCallback((view: ActiveView) => {
+    setActiveViewState(view);
+    if (typeof window !== 'undefined') {
+      const url = new URL(window.location.href);
+      if (view === 'landing') {
+        url.searchParams.delete('view');
+      } else {
+        url.searchParams.set('view', view);
+      }
+      const nextUrl = `${url.pathname}${url.search}${url.hash}`;
+      if (nextUrl !== `${window.location.pathname}${window.location.search}${window.location.hash}`) {
+        window.history.pushState({ view }, '', nextUrl);
+      }
+      window.scrollTo({ top: 0, behavior: 'auto' });
+    }
+  }, []);
+
+  useEffect(() => {
+    const onPopState = () => {
+      setActiveViewState(readViewFromLocation());
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
 
   useEffect(() => {
     clearLegacySharedSosQueue();

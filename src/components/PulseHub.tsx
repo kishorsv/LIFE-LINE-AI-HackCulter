@@ -1,5 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { APIProvider, AdvancedMarker, Map as GoogleMap, Pin, useMap } from '@vis.gl/react-google-maps';
+import React, { Suspense, lazy, useCallback, useEffect, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
@@ -24,6 +23,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext.tsx';
 import { t } from '../i18n/translations.ts';
+import { cachedFetchJson, invalidateClientCache } from '../lib/clientCache.ts';
 import { LifeLineLogo } from './LifeLineLogo.tsx';
 import {
   PredictiveRiskAssessment,
@@ -31,6 +31,8 @@ import {
   SafetyJourneyItem,
   SafetyReportItem,
 } from '../types/lifeline.ts';
+
+const PulseSafeRouteMap = lazy(() => import('./PulseSafeRouteMap.tsx'));
 
 interface SafeRouteAgentOutput {
   modelUsed: string;
@@ -42,65 +44,6 @@ interface SafeRouteAgentOutput {
   confidenceScore: number;
   uncertaintyNotes: string;
 }
-
-function PulsePolylineRenderer({
-  routes,
-  selectedIndex,
-}: {
-  routes: SafeRouteCandidateItem[];
-  selectedIndex: number;
-}) {
-  const map = useMap();
-  const linesRef = useRef<Array<{ setMap: (m: unknown | null) => void }>>([]);
-
-  useEffect(() => {
-    linesRef.current.forEach((l) => l.setMap(null));
-    linesRef.current = [];
-    if (!map || routes.length === 0) return;
-    const gMaps = (window as unknown as {
-      google?: {
-        maps?: {
-          Polyline: new (opts: Record<string, unknown>) => { setMap: (m: unknown | null) => void };
-          LatLngBounds: new () => { extend: (pt: { lat: number; lng: number }) => void };
-        };
-      };
-    }).google?.maps;
-    if (!gMaps?.Polyline || !gMaps?.LatLngBounds) return;
-
-    const bounds = new gMaps.LatLngBounds();
-    const created: Array<{ setMap: (m: unknown | null) => void }> = [];
-
-    routes.forEach((r, idx) => {
-      if (!r.path || r.path.length === 0) return;
-      const isSelected = idx === selectedIndex;
-      const poly = new gMaps.Polyline({
-        path: r.path,
-        strokeColor: isSelected ? (r.isRecommended ? '#10B981' : '#8B5CF6') : '#64748B',
-        strokeOpacity: isSelected ? 0.95 : 0.45,
-        strokeWeight: isSelected ? 6 : 4,
-        zIndex: isSelected ? 10 : 2,
-      });
-      poly.setMap(map);
-      created.push(poly);
-      if (isSelected) {
-        r.path.forEach((p) => bounds.extend(p));
-      }
-    });
-
-    linesRef.current = created;
-    if (typeof (map as unknown as { fitBounds?: (b: unknown) => void }).fitBounds === 'function') {
-      (map as unknown as { fitBounds: (b: unknown) => void }).fitBounds(bounds);
-    }
-
-    return () => {
-      linesRef.current.forEach((l) => l.setMap(null));
-      linesRef.current = [];
-    };
-  }, [map, routes, selectedIndex]);
-
-  return null;
-}
-
 function formatCountdown(targetIso: string, nowMs: number): { label: string; overdue: boolean } {
   const diffSec = Math.round((new Date(targetIso).getTime() - nowMs) / 1000);
   if (diffSec <= 0) {
@@ -110,6 +53,27 @@ function formatCountdown(targetIso: string, nowMs: number): { label: string; ove
   const mins = Math.floor(diffSec / 60);
   const secs = diffSec % 60;
   return { label: `${mins}m ${String(secs).padStart(2, '0')}s`, overdue: false };
+}
+
+function JourneyCheckInCountdown({ targetIso }: { targetIso: string }) {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  const countdown = formatCountdown(targetIso, nowMs);
+  return (
+    <div
+      className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 font-mono text-[11px] font-semibold ${
+        countdown.overdue
+          ? 'bg-rose-500/20 text-rose-700 dark:text-rose-300'
+          : 'bg-violet-500/15 text-violet-700 dark:text-violet-300'
+      }`}
+    >
+      <Clock className="h-3.5 w-3.5" />
+      <span>Next safety check-in: {countdown.label}</span>
+    </div>
+  );
 }
 
 export function PulseHub({ onOpenAuth, onOpenSos }: { onOpenAuth: () => void; onOpenSos: () => void }) {
@@ -144,21 +108,16 @@ export function PulseHub({ onOpenAuth, onOpenSos }: { onOpenAuth: () => void; on
   const [checkInMinutes, setCheckInMinutes] = useState<number>(15);
   const [journeyBusy, setJourneyBusy] = useState(false);
   const [journeyMessage, setJourneyMessage] = useState('');
-  const [nowMs, setNowMs] = useState(() => Date.now());
 
   // Safety Reports state
   const [reports, setReports] = useState<SafetyReportItem[]>([]);
+  const [showAllReports, setShowAllReports] = useState(false);
   const [reportCat, setReportCat] = useState('Poor Lighting');
   const [reportSeverity, setReportSeverity] = useState<'LOW' | 'MODERATE' | 'HIGH'>('MODERATE');
   const [reportDesc, setReportDesc] = useState('');
   const [reportAnonymous, setReportAnonymous] = useState(true);
   const [reportBusy, setReportBusy] = useState(false);
   const [reportFeedback, setReportFeedback] = useState('');
-
-  useEffect(() => {
-    const timer = setInterval(() => setNowMs(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, []);
 
   const evaluateRisk = useCallback(
     async (targetLat = lat, targetLng = lng, label = locationLabel) => {
@@ -179,19 +138,28 @@ export function PulseHub({ onOpenAuth, onOpenSos }: { onOpenAuth: () => void; on
     [apiFetch, lat, lng, locationLabel]
   );
 
-  const loadReports = useCallback(async () => {
+  const loadReports = useCallback(async (signal?: AbortSignal, forceRefresh = false) => {
     try {
-      const res = await fetch('/api/pulse/reports');
-      const data = (await res.json()) as { reports?: SafetyReportItem[] };
-      if (data.reports) setReports(data.reports);
+      const data = await cachedFetchJson<{ reports?: SafetyReportItem[] }>(
+        'public:pulse-reports',
+        async (s) => {
+          const res = await fetch('/api/pulse/reports', { signal: s });
+          if (!res.ok) throw new Error('Failed to load reports');
+          return res.json() as Promise<{ reports?: SafetyReportItem[] }>;
+        },
+        { ttlMs: 15_000, staleWhileRevalidateMs: 45_000, signal, forceRefresh }
+      );
+      if (!signal?.aborted && data.reports) setReports(data.reports);
     } catch {
-      // ignore offline
+      // ignore offline or abort
     }
   }, []);
 
   useEffect(() => {
+    const controller = new AbortController();
     void evaluateRisk(lat, lng, locationLabel);
-    void loadReports();
+    void loadReports(controller.signal);
+    return () => controller.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -365,8 +333,9 @@ export function PulseHub({ onOpenAuth, onOpenSos }: { onOpenAuth: () => void; on
         }),
       });
       setReportDesc('');
+      invalidateClientCache('public:pulse-reports');
       setReportFeedback('Safety report saved. Predictive Risk scores will include this verified community report.');
-      await Promise.all([loadReports(), evaluateRisk(lat, lng, locationLabel)]);
+      await Promise.all([loadReports(undefined, true), evaluateRisk(lat, lng, locationLabel)]);
     } catch (err) {
       setReportFeedback(err instanceof Error ? err.message : 'Failed to submit report.');
     } finally {
@@ -849,23 +818,24 @@ export function PulseHub({ onOpenAuth, onOpenSos }: { onOpenAuth: () => void; on
             <div className="lg:col-span-7 space-y-5">
               <div className="h-[340px] rounded-2xl overflow-hidden border border-slate-200 dark:border-slate-800 bg-slate-950 relative">
                 {mapsApiKey ? (
-                  <APIProvider apiKey={mapsApiKey}>
-                    <GoogleMap
-                      defaultCenter={{ lat, lng }}
-                      defaultZoom={14}
-                      mapId="DEMO_MAP_ID"
-                      internalUsageAttributionIds={['gmp_mcp_codeassist_v1_aistudio']}
-                      className="h-full w-full"
-                    >
-                      <AdvancedMarker position={{ lat, lng }} title="Origin">
-                        <Pin background="#8B5CF6" glyphColor="#FFFFFF" borderColor="#DDD6FE" />
-                      </AdvancedMarker>
-                      <AdvancedMarker position={{ lat: destLat, lng: destLng }} title={destLabel}>
-                        <Pin background="#10B981" glyphColor="#FFFFFF" borderColor="#A7F3D0" />
-                      </AdvancedMarker>
-                      <PulsePolylineRenderer routes={routes} selectedIndex={selectedRouteIdx} />
-                    </GoogleMap>
-                  </APIProvider>
+                  <Suspense
+                    fallback={
+                      <div className="h-full w-full flex items-center justify-center text-xs text-slate-400 animate-pulse">
+                        Loading interactive SafeRoute map...
+                      </div>
+                    }
+                  >
+                    <PulseSafeRouteMap
+                      mapsApiKey={mapsApiKey}
+                      lat={lat}
+                      lng={lng}
+                      destLat={destLat}
+                      destLng={destLng}
+                      destLabel={destLabel}
+                      routes={routes}
+                      selectedRouteIdx={selectedRouteIdx}
+                    />
+                  </Suspense>
                 ) : (
                   <div className="flex h-full items-center justify-center p-6 text-center text-xs text-slate-300">
                     Google Maps JavaScript API key not configured for visual canvas. Server-side predictive risk & journey sharing remain active.
@@ -922,81 +892,67 @@ export function PulseHub({ onOpenAuth, onOpenSos }: { onOpenAuth: () => void; on
                     <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">
                       Your Shared Journeys ({journeys.length})
                     </div>
-                    {journeys.slice(0, 5).map((j) => {
-                      const countdown = j.status === 'Active' ? formatCountdown(j.nextCheckInDueAt, nowMs) : null;
-                      return (
-                        <div
-                          key={j.id}
-                          className={`rounded-xl border p-3.5 text-xs space-y-2 ${
-                            j.status === 'Active'
-                              ? 'border-emerald-500/40 bg-emerald-500/5'
-                              : 'border-slate-200 dark:border-slate-800 opacity-85'
-                          }`}
-                        >
-                          <div className="flex flex-wrap items-center justify-between gap-2">
-                            <span className="font-bold text-slate-900 dark:text-white">
-                              {j.originLabel} → {j.destinationLabel}
-                            </span>
-                            <span className="rounded px-2 py-0.5 font-mono text-[10px] font-bold uppercase bg-slate-900/10 dark:bg-white/10">
-                              {j.status}
-                            </span>
-                          </div>
-                          <div className="text-slate-500 dark:text-slate-400">
-                            {j.selectedRouteSummary} · Risk: <strong>{j.routeRiskLevel}</strong>
-                          </div>
-                          {countdown && (
-                            <div
-                              className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 font-mono text-[11px] font-semibold ${
-                                countdown.overdue
-                                  ? 'bg-rose-500/20 text-rose-700 dark:text-rose-300'
-                                  : 'bg-violet-500/15 text-violet-700 dark:text-violet-300'
-                              }`}
-                            >
-                              <Clock className="h-3.5 w-3.5" />
-                              <span>Next safety check-in: {countdown.label}</span>
-                            </div>
-                          )}
-                          {j.status === 'Active' && (
-                            <div className="flex flex-wrap gap-2 pt-1">
-                              <button
-                                type="button"
-                                disabled={journeyBusy}
-                                onClick={() => handleJourneyAction(j.id, 'checkin')}
-                                className="rounded-lg bg-violet-600 px-3 py-1.5 font-semibold text-white hover:bg-violet-500"
-                              >
-                                {t(language, 'pulse_checkin_safe')}
-                              </button>
-                              <button
-                                type="button"
-                                disabled={journeyBusy}
-                                onClick={() => handleJourneyAction(j.id, 'arrive')}
-                                className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-1.5 font-semibold text-white hover:bg-emerald-500"
-                              >
-                                <CheckCircle2 className="h-3.5 w-3.5" />
-                                <span>{t(language, 'pulse_confirm_arrival')}</span>
-                              </button>
-                              <button
-                                type="button"
-                                disabled={journeyBusy}
-                                onClick={() => handleJourneyAction(j.id, 'refresh')}
-                                className="rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-1.5 font-semibold"
-                              >
-                                {t(language, 'pulse_refresh_route')}
-                              </button>
-                              <button
-                                type="button"
-                                disabled={journeyBusy}
-                                onClick={() => handleJourneyAction(j.id, 'escalate')}
-                                className="inline-flex items-center gap-1 rounded-lg bg-rose-600 px-3 py-1.5 font-semibold text-white hover:bg-rose-500"
-                              >
-                                <ShieldAlert className="h-3.5 w-3.5" />
-                                <span>Escalate SOS</span>
-                              </button>
-                            </div>
-                          )}
+                    {journeys.slice(0, 5).map((j) => (
+                      <div
+                        key={j.id}
+                        className={`rounded-xl border p-3.5 text-xs space-y-2 ${
+                          j.status === 'Active'
+                            ? 'border-emerald-500/40 bg-emerald-500/5'
+                            : 'border-slate-200 dark:border-slate-800 opacity-85'
+                        }`}
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="font-bold text-slate-900 dark:text-white">
+                            {j.originLabel} → {j.destinationLabel}
+                          </span>
+                          <span className="rounded px-2 py-0.5 font-mono text-[10px] font-bold uppercase bg-slate-900/10 dark:bg-white/10">
+                            {j.status}
+                          </span>
                         </div>
-                      );
-                    })}
+                        <div className="text-slate-500 dark:text-slate-400">
+                          {j.selectedRouteSummary} · Risk: <strong>{j.routeRiskLevel}</strong>
+                        </div>
+                        {j.status === 'Active' && <JourneyCheckInCountdown targetIso={j.nextCheckInDueAt} />}
+                        {j.status === 'Active' && (
+                          <div className="flex flex-wrap gap-2 pt-1">
+                            <button
+                              type="button"
+                              disabled={journeyBusy}
+                              onClick={() => handleJourneyAction(j.id, 'checkin')}
+                              className="rounded-lg bg-violet-600 px-3 py-1.5 font-semibold text-white hover:bg-violet-500"
+                            >
+                              {t(language, 'pulse_checkin_safe')}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={journeyBusy}
+                              onClick={() => handleJourneyAction(j.id, 'arrive')}
+                              className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-1.5 font-semibold text-white hover:bg-emerald-500"
+                            >
+                              <CheckCircle2 className="h-3.5 w-3.5" />
+                              <span>{t(language, 'pulse_confirm_arrival')}</span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={journeyBusy}
+                              onClick={() => handleJourneyAction(j.id, 'refresh')}
+                              className="rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-1.5 font-semibold"
+                            >
+                              {t(language, 'pulse_refresh_route')}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={journeyBusy}
+                              onClick={() => handleJourneyAction(j.id, 'escalate')}
+                              className="inline-flex items-center gap-1 rounded-lg bg-rose-600 px-3 py-1.5 font-semibold text-white hover:bg-rose-500"
+                            >
+                              <ShieldAlert className="h-3.5 w-3.5" />
+                              <span>Escalate SOS</span>
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    ))}
                   </div>
                 )}
               </div>
@@ -1098,7 +1054,7 @@ export function PulseHub({ onOpenAuth, onOpenSos }: { onOpenAuth: () => void; on
               </div>
             ) : (
               <div className="space-y-3">
-                {reports.map((rep) => (
+                {(showAllReports ? reports : reports.slice(0, 8)).map((rep) => (
                   <div key={rep.id} className="rounded-xl border border-slate-200 dark:border-slate-800 p-3.5 text-xs space-y-1.5">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <span className="font-bold text-slate-900 dark:text-white">
@@ -1127,6 +1083,15 @@ export function PulseHub({ onOpenAuth, onOpenSos }: { onOpenAuth: () => void; on
                     </div>
                   </div>
                 ))}
+                {reports.length > 8 && (
+                  <button
+                    type="button"
+                    onClick={() => setShowAllReports((v) => !v)}
+                    className="w-full rounded-xl border border-slate-200 dark:border-slate-800 py-2 text-xs font-semibold text-violet-600 dark:text-violet-400 hover:bg-violet-500/5"
+                  >
+                    {showAllReports ? 'Show Fewer Reports' : `Show All ${reports.length} Safety Reports`}
+                  </button>
+                )}
               </div>
             )}
           </div>
