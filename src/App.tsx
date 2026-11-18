@@ -15,6 +15,7 @@ import {
   clearLegacySharedSosQueue,
   getQueuedSosAlerts,
   getRetryableQueuedSosAlerts,
+  markQueuedSosSyncing,
   recordQueuedSosRetryFailure,
   removeQueuedSos,
 } from './lib/offlineSosQueue.ts';
@@ -138,6 +139,7 @@ function AppShell() {
       let anySynced = false;
       try {
         for (const item of retryable) {
+          markQueuedSosSyncing(item.id, true);
           try {
             await apiFetch('/api/incidents/sos', {
               method: 'POST',
@@ -162,6 +164,8 @@ function AppShell() {
             const isPermanentValidationErr = /invalid|forbidden|unauthorized|must be/i.test(msg);
             recordQueuedSosRetryFailure(item.id, user, msg, { permanent: isPermanentValidationErr });
             if (!isPermanentValidationErr) break;
+          } finally {
+            markQueuedSosSyncing(item.id, false);
           }
         }
       } finally {
@@ -173,8 +177,13 @@ function AppShell() {
       }
     };
 
+    const onFlushRequested = () => {
+      void flushQueue();
+    };
+
     syncQueueCounts();
     window.addEventListener('lifeline-sos-queue-updated', syncQueueCounts);
+    window.addEventListener('lifeline-sos-flush-requested', onFlushRequested);
     window.addEventListener('online', flushQueue);
     const retryTimer = setInterval(flushQueue, 15_000);
     void flushQueue();
@@ -182,6 +191,7 @@ function AppShell() {
     return () => {
       clearInterval(retryTimer);
       window.removeEventListener('lifeline-sos-queue-updated', syncQueueCounts);
+      window.removeEventListener('lifeline-sos-flush-requested', onFlushRequested);
       window.removeEventListener('online', flushQueue);
     };
   }, [user, apiFetch, refreshAllData]);

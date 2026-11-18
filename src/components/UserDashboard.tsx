@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import {
   Activity,
-  AlertCircle,
   CalendarPlus,
   Check,
   CheckCircle2,
@@ -25,6 +24,7 @@ import { cachedFetchJson } from '../lib/clientCache.ts';
 import { FirebaseAuthBlockedAlert } from './FirebaseAuthBlockedAlert.tsx';
 import { t } from '../i18n/translations.ts';
 import { LifeLineLogo } from './LifeLineLogo.tsx';
+import { SosHistorySection } from './SosHistorySection.tsx';
 import { ActiveView, AiRecommendationItem, SupportResource, WorkspaceConfirmPayload } from '../types/lifeline.ts';
 import {
   createSafetyActionTask,
@@ -80,7 +80,6 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
   const [dashboardError, setDashboardError] = useState('');
   const [cancellingId, setCancellingId] = useState<number | null>(null);
   const [journeyBusy, setJourneyBusy] = useState(false);
-  const [showAllIncidents, setShowAllIncidents] = useState(false);
   const [showAllNotifications, setShowAllNotifications] = useState(false);
 
   useEffect(() => {
@@ -588,7 +587,18 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
         </div>
       </div>
 
-      {/* Main Grid: Trusted Contacts, Recent Incidents, Nearby Support & AI Recommendations */}
+      {/* Dedicated Past SOS Reports & Status History Section */}
+      <SosHistorySection
+        user={user}
+        incidents={incidents}
+        language={language}
+        realtimeConnected={realtimeConnected}
+        onMarkSafeIncident={handleMarkSafeIncident}
+        onRefresh={refreshAllData}
+        cancellingId={cancellingId}
+      />
+
+      {/* Main Grid: Trusted Contacts & Notification Center */}
       <div className="grid gap-6 lg:grid-cols-12">
         {/* Trusted Contacts */}
         <div className="lg:col-span-6 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-6">
@@ -701,84 +711,53 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
           </div>
         </div>
 
-        {/* Recent Emergency Activity */}
+        {/* Notification Center */}
         <div className="lg:col-span-6 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-6">
-          <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center justify-between gap-2 mb-4">
             <div className="flex items-center gap-2">
-              <AlertCircle className="h-5 w-5 text-rose-500" />
+              <ShieldCheck className="h-4 w-4 text-emerald-500" />
               <h2 className="font-display text-base font-bold text-slate-900 dark:text-white">
-                {t(language, 'dash_incidents_title')}
+                {t(language, 'dash_notifications_title')}
               </h2>
             </div>
-            <span className="tabular-nums text-xs text-slate-500 dark:text-slate-400">{incidents.length} recorded</span>
+            {notifications.some((n) => !n.isRead) && (
+              <button
+                type="button"
+                onClick={() => {
+                  void markAllNotificationsRead();
+                }}
+                className="inline-flex items-center gap-1 text-[11px] font-semibold text-violet-600 dark:text-violet-400 hover:underline"
+              >
+                <Check className="h-3 w-3" />
+                <span>{t(language, 'dash_mark_all_read')}</span>
+              </button>
+            )}
           </div>
-
-          <div className="space-y-3 max-h-80 overflow-y-auto pr-1">
-            {incidents.length === 0 ? (
-              <p className="text-xs text-slate-500 dark:text-slate-400">
-                No SOS incidents triggered yet. Use Emergency SOS or Hackathon Demo Mode to test the workflow.
-              </p>
+          <div className="space-y-2.5 max-h-72 overflow-y-auto">
+            {notifications.length === 0 ? (
+              <p className="text-xs text-slate-500 dark:text-slate-400">No recent alerts.</p>
             ) : (
               <>
-                {(showAllIncidents ? incidents : incidents.slice(0, 6)).map((inc) => {
-                  const isActive = !['Resolved', 'Cancelled'].includes(inc.status);
-                  return (
-                    <div key={inc.id} className="rounded-xl border border-slate-200 dark:border-slate-800 p-3.5 space-y-1.5">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <span className="text-sm font-semibold text-slate-900 dark:text-white">
-                          {inc.isSimulated ? '[SIMULATED] ' : ''}#{inc.id} · {inc.title}
-                        </span>
-                        <div className="flex items-center gap-1.5">
-                          {inc.deliveryStatus && (
-                            <span
-                              className={`rounded-md px-2 py-0.5 font-mono text-[10px] font-semibold uppercase ${
-                                inc.deliveryStatus === 'delivered'
-                                  ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
-                                  : inc.deliveryStatus === 'failed'
-                                  ? 'bg-rose-500/15 text-rose-700 dark:text-rose-300'
-                                  : 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
-                              }`}
-                            >
-                              {inc.deliveryStatus}
-                            </span>
-                          )}
-                          <span className="rounded-md border border-violet-500/35 bg-violet-500/10 px-2 py-0.5 text-[11px] font-semibold text-violet-700 dark:text-violet-300">
-                            {inc.status}
-                          </span>
-                        </div>
-                      </div>
-                      <div className="text-xs text-slate-500 dark:text-slate-400">
-                        {inc.locationLabel} · Priority: {inc.priority}
-                      </div>
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        {inc.operatorName ? (
-                          <div className="text-[11px] text-emerald-600 dark:text-emerald-400">
-                            Responder: {inc.operatorName}
-                          </div>
-                        ) : (
-                          <span />
-                        )}
-                        {isActive && (
-                          <button
-                            type="button"
-                            disabled={cancellingId === inc.id}
-                            onClick={() => handleMarkSafeIncident(inc.id)}
-                            className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-60"
-                          >
-                            {cancellingId === inc.id ? 'Updating...' : t(language, 'dash_mark_safe')}
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-                {incidents.length > 6 && (
+                {(showAllNotifications ? notifications : notifications.slice(0, 5)).map((n) => (
+                  <div
+                    key={n.id}
+                    className={`rounded-xl border p-3 ${
+                      n.isRead
+                        ? 'border-slate-200 dark:border-slate-800 opacity-75'
+                        : 'border-violet-500/35 bg-violet-500/5'
+                    }`}
+                  >
+                    <div className="text-xs font-semibold text-slate-900 dark:text-white">{n.title}</div>
+                    <div className="text-[11px] text-slate-600 dark:text-slate-300 mt-0.5">{n.message}</div>
+                  </div>
+                ))}
+                {notifications.length > 5 && (
                   <button
                     type="button"
-                    onClick={() => setShowAllIncidents((v) => !v)}
+                    onClick={() => setShowAllNotifications((v) => !v)}
                     className="w-full rounded-xl border border-slate-200 dark:border-slate-800 py-1.5 text-[11px] font-semibold text-violet-600 dark:text-violet-400 hover:bg-violet-500/5"
                   >
-                    {showAllIncidents ? 'Show Fewer Incidents' : `Show All ${incidents.length} Incidents`}
+                    {showAllNotifications ? 'Show Fewer Alerts' : `Show All ${notifications.length} Alerts`}
                   </button>
                 )}
               </>
@@ -925,9 +904,9 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
         </div>
       </div>
 
-      {/* Nearby Support Preview + AI Safety Recommendations + Recent Notifications */}
+      {/* Nearby Support Preview + AI Safety Recommendations */}
       <div className="grid gap-6 lg:grid-cols-12">
-        <div className="lg:col-span-4 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-6">
+        <div className="lg:col-span-6 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-6">
           <div className="flex items-center justify-between mb-4">
             <h2 className="font-display text-base font-bold text-slate-900 dark:text-white">Nearby Support Preview</h2>
             <button
@@ -953,7 +932,7 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
           </div>
         </div>
 
-        <div className="lg:col-span-4 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-6">
+        <div className="lg:col-span-6 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-6">
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">
               <Sparkles className="h-4 w-4 text-violet-500" />
@@ -979,59 +958,6 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
                   <div className="text-xs text-slate-600 dark:text-slate-300 mt-0.5">{rec.recommendationText}</div>
                 </div>
               ))
-            )}
-          </div>
-        </div>
-
-        <div className="lg:col-span-4 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B1022] p-6">
-          <div className="flex items-center justify-between gap-2 mb-4">
-            <div className="flex items-center gap-2">
-              <ShieldCheck className="h-4 w-4 text-emerald-500" />
-              <h2 className="font-display text-base font-bold text-slate-900 dark:text-white">
-                {t(language, 'dash_notifications_title')}
-              </h2>
-            </div>
-            {notifications.some((n) => !n.isRead) && (
-              <button
-                type="button"
-                onClick={() => {
-                  void markAllNotificationsRead();
-                }}
-                className="inline-flex items-center gap-1 text-[11px] font-semibold text-violet-600 dark:text-violet-400 hover:underline"
-              >
-                <Check className="h-3 w-3" />
-                <span>{t(language, 'dash_mark_all_read')}</span>
-              </button>
-            )}
-          </div>
-          <div className="space-y-2.5 max-h-60 overflow-y-auto">
-            {notifications.length === 0 ? (
-              <p className="text-xs text-slate-500 dark:text-slate-400">No recent alerts.</p>
-            ) : (
-              <>
-                {(showAllNotifications ? notifications : notifications.slice(0, 5)).map((n) => (
-                  <div
-                    key={n.id}
-                    className={`rounded-xl border p-3 ${
-                      n.isRead
-                        ? 'border-slate-200 dark:border-slate-800 opacity-75'
-                        : 'border-violet-500/35 bg-violet-500/5'
-                    }`}
-                  >
-                    <div className="text-xs font-semibold text-slate-900 dark:text-white">{n.title}</div>
-                    <div className="text-[11px] text-slate-600 dark:text-slate-300 mt-0.5">{n.message}</div>
-                  </div>
-                ))}
-                {notifications.length > 5 && (
-                  <button
-                    type="button"
-                    onClick={() => setShowAllNotifications((v) => !v)}
-                    className="w-full rounded-xl border border-slate-200 dark:border-slate-800 py-1.5 text-[11px] font-semibold text-violet-600 dark:text-violet-400 hover:bg-violet-500/5"
-                  >
-                    {showAllNotifications ? 'Show Fewer Alerts' : `Show All ${notifications.length} Alerts`}
-                  </button>
-                )}
-              </>
             )}
           </div>
         </div>

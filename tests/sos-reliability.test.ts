@@ -231,4 +231,113 @@ describe('SOS Reliability, Idempotency, Offline Queue Isolation & Truthful Notif
     assert.equal(okSummary.externalConfirmedCount, 1);
     delete process.env.RESEND_API_KEY;
   });
+
+  it('normalizes past and offline-queued SOS reports across queued, syncing, acknowledged, and resolved states', async () => {
+    const historyMod = await import('../src/lib/sosHistory.ts');
+    const storage = createMemoryStorage();
+    const owner = { id: 501, uid: 'uid-history-user' };
+    const t0 = 1_700_000_000_000;
+
+    const queuedItem = queueMod.enqueueOfflineSos(
+      {
+        userId: owner.id,
+        userUid: owner.uid,
+        idempotencyKey: 'sos_hist_queue_1',
+        title: 'Offline Queued SOS',
+        description: 'Tunnel signal loss',
+        category: 'Safe Transit',
+        priority: 'CRITICAL',
+        latitude: 12.31,
+        longitude: 76.65,
+        locationLabel: 'Mysuru Ring Road',
+        locationAccuracyMeters: 20,
+        isSimulated: false,
+      },
+      { storage, nowMs: t0 + 30_000, maxRetries: 2 }
+    );
+
+    const serverIncidents = [
+      {
+        id: 11,
+        userId: owner.id,
+        reporterName: 'User',
+        reporterEmail: 'user@example.com',
+        title: 'Acknowledged Medical SOS',
+        description: 'Need ambulance info',
+        category: 'Medical Urgency',
+        status: 'Acknowledged' as const,
+        deliveryStatus: 'delivered' as const,
+        priority: 'CRITICAL' as const,
+        latitude: 12.3,
+        longitude: 76.64,
+        locationLabel: 'K.R. Circle',
+        locationAccuracyMeters: 10,
+        isSimulated: false,
+        acknowledgedByUserId: 2,
+        operatorName: 'Elena Vance',
+        acknowledgedAt: new Date(t0 + 20_000).toISOString(),
+        resolvedAt: null,
+        createdAt: new Date(t0 + 15_000).toISOString(),
+        updatedAt: new Date(t0 + 20_000).toISOString(),
+        updates: [],
+        deliveryLogs: [],
+      },
+      {
+        id: 10,
+        userId: owner.id,
+        reporterName: 'User',
+        reporterEmail: 'user@example.com',
+        title: 'Past Resolved SOS',
+        description: 'Resolved check',
+        category: 'Personal Safety',
+        status: 'Resolved' as const,
+        deliveryStatus: 'delivered' as const,
+        priority: 'HIGH' as const,
+        latitude: 12.29,
+        longitude: 76.65,
+        locationLabel: 'Agrahara',
+        locationAccuracyMeters: 12,
+        isSimulated: false,
+        acknowledgedByUserId: 2,
+        operatorName: 'Elena Vance',
+        acknowledgedAt: new Date(t0 + 2_000).toISOString(),
+        resolvedAt: new Date(t0 + 5_000).toISOString(),
+        createdAt: new Date(t0).toISOString(),
+        updatedAt: new Date(t0 + 5_000).toISOString(),
+        updates: [],
+        deliveryLogs: [],
+      },
+    ];
+
+    // Before syncing starts: queued, acknowledged, resolved
+    const initialList = historyMod.buildUnifiedSosReports(serverIncidents, queueMod.getQueuedSosAlerts(owner, storage, t0 + 30_000));
+    assert.deepEqual(
+      initialList.map((r) => r.lifecycleStatus),
+      ['queued', 'acknowledged', 'resolved']
+    );
+
+    // While item is syncing: reflects 'syncing' immediately
+    queueMod.markQueuedSosSyncing(queuedItem.id, true);
+    const syncingList = historyMod.buildUnifiedSosReports(
+      serverIncidents,
+      queueMod.getQueuedSosAlerts(owner, storage, t0 + 30_000),
+      queueMod.getSyncingSosIds()
+    );
+    assert.equal(syncingList[0]?.lifecycleStatus, 'syncing');
+    queueMod.markQueuedSosSyncing(queuedItem.id, false);
+
+    // Exhaust retries -> 'failed', then resetQueuedSosForManualRetry -> back to 'queued'
+    queueMod.recordQueuedSosRetryFailure(queuedItem.id, owner, 'Timeout', { storage, nowMs: t0 + 31_000, permanent: true });
+    const failedList = historyMod.buildUnifiedSosReports(serverIncidents, queueMod.getQueuedSosAlerts(owner, storage, t0 + 32_000));
+    assert.equal(failedList[0]?.lifecycleStatus, 'failed');
+    const summaryFailed = historyMod.summarizeSosReports(failedList);
+    assert.equal(summaryFailed.failed, 1);
+    assert.equal(summaryFailed.active, 1);
+    assert.equal(summaryFailed.resolvedOrClosed, 1);
+
+    const resetItem = queueMod.resetQueuedSosForManualRetry(queuedItem.id, owner, storage, t0 + 33_000);
+    assert.equal(resetItem?.state, 'queued');
+    assert.equal(queueMod.getRetryableQueuedSosAlerts(owner, storage, t0 + 33_000).length, 1);
+  });
 });
+
