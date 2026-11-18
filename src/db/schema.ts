@@ -432,6 +432,64 @@ export const realtimeEvents = pgTable(
   (table) => [index('realtime_events_target_idx').on(table.targetUserId, table.id)]
 );
 
+// 19. live_external_alerts (Standardized NDMA SACHET, IMD CAP, USGS & NASA FIRMS live alerts)
+export const liveExternalAlerts = pgTable(
+  'live_external_alerts',
+  {
+    id: serial('id').primaryKey(),
+    externalKey: text('external_key').notNull().unique(),
+    sourceId: text('source_id').notNull(),
+    sourceName: text('source_name').notNull(),
+    sourceUrl: text('source_url').notNull().default(''),
+    category: text('category').notNull(),
+    title: text('title').notNull(),
+    description: text('description').notNull().default(''),
+    instruction: text('instruction').notNull().default(''),
+    severity: text('severity').notNull().default('MODERATE'),
+    severityColor: text('severity_color').notNull().default('amber'),
+    certainty: text('certainty').notNull().default('Observed'),
+    verificationStatus: text('verification_status').notNull().default('Official Alert'),
+    signalType: text('signal_type').notNull().default('official_alert'),
+    locationLabel: text('location_label').notNull(),
+    stateName: text('state_name').notNull().default(''),
+    districtName: text('district_name').notNull().default(''),
+    latitude: doublePrecision('latitude'),
+    longitude: doublePrecision('longitude'),
+    areaCoveredSqKm: doublePrecision('area_covered_sq_km'),
+    language: text('language').notNull().default('en'),
+    firstReportedAt: timestamp('first_reported_at').defaultNow().notNull(),
+    effectiveFrom: timestamp('effective_from'),
+    expiresAt: timestamp('expires_at'),
+    lastUpdatedAt: timestamp('last_updated_at').defaultNow().notNull(),
+    isActive: boolean('is_active').notNull().default(true),
+    rawPayload: jsonb('raw_payload').$type<Record<string, unknown>>().notNull().default({}),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at').defaultNow().notNull(),
+  },
+  (table) => [
+    index('live_alerts_active_updated_idx').on(table.isActive, table.lastUpdatedAt),
+    index('live_alerts_state_district_idx').on(table.stateName, table.districtName),
+    index('live_alerts_source_idx').on(table.sourceId, table.isActive),
+  ]
+);
+
+// 20. live_feed_sync_runs (Connectivity, cooldowns & freshness telemetry per live feed source)
+export const liveFeedSyncRuns = pgTable('live_feed_sync_runs', {
+  sourceId: text('source_id').primaryKey(),
+  sourceName: text('source_name').notNull(),
+  sourceKind: text('source_kind').notNull().default('official_cap'),
+  endpointUrl: text('endpoint_url').notNull(),
+  status: text('status').notNull().default('offline'),
+  pollIntervalSeconds: integer('poll_interval_seconds').notNull().default(180),
+  lastAttemptAt: timestamp('last_attempt_at'),
+  lastSuccessAt: timestamp('last_success_at'),
+  lastError: text('last_error').notNull().default(''),
+  recordsFetched: integer('records_fetched').notNull().default(0),
+  recordsActive: integer('records_active').notNull().default(0),
+  latencyMs: integer('latency_ms').notNull().default(0),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
 // Drizzle Relations
 export const usersRelations = relations(users, ({ one, many }) => ({
   profile: one(userProfiles, { fields: [users.id], references: [userProfiles.userId] }),

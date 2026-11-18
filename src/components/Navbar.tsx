@@ -40,6 +40,7 @@ export const Navbar = React.memo(function Navbar({
 
   const navItems: Array<{ id: ActiveView; label: string }> = [
     { id: 'landing', label: t(language, 'nav_overview') },
+    { id: 'incidents', label: t(language, 'nav_incidents') },
     { id: 'dashboard', label: t(language, 'nav_dashboard') },
     { id: 'pulse', label: t(language, 'nav_pulse') },
     { id: 'map', label: t(language, 'nav_map') },
@@ -49,7 +50,7 @@ export const Navbar = React.memo(function Navbar({
 
   const handleNav = (id: ActiveView) => {
     setMobileOpen(false);
-    if (id !== 'landing' && id !== 'map' && id !== 'pulse' && !user) {
+    if (id !== 'landing' && id !== 'map' && id !== 'pulse' && id !== 'incidents' && !user) {
       onOpenAuth();
       return;
     }

@@ -360,6 +360,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             apiFetch<{ notifications: NotificationItem[] }>('/api/notifications')
               .then((res) => setNotifications(res.notifications))
               .catch(() => {});
+          } else if (msg.type === 'live_incident:sync' || msg.type === 'live_incident:status_updated') {
+            window.dispatchEvent(new CustomEvent('lifeline-live-incidents-updated', { detail: msg }));
+            if (
+              msg.type === 'live_incident:sync' &&
+              typeof Notification !== 'undefined' &&
+              Notification.permission === 'granted' &&
+              localStorage.getItem('lifeline_desktop_live_alerts') === 'true'
+            ) {
+              const incoming = (msg as { alerts?: Array<{ title?: string; severity?: string; sourceName?: string }> }).alerts;
+              if (Array.isArray(incoming) && incoming.length > 0) {
+                const top = incoming[0];
+                try {
+                  new Notification(`LIFE-LINE Live Alert (${top.severity || 'OFFICIAL'})`, {
+                    body: `${top.title || 'New verified alert'} — ${top.sourceName || 'NDMA/IMD'}`,
+                  });
+                } catch {
+                  // ignore browser notification restrictions
+                }
+              }
+            }
           }
         } catch {
           // ignore malformed message

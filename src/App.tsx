@@ -37,6 +37,9 @@ const ProfileSettings = React.lazy(() =>
 const PulseHub = React.lazy(() =>
   import('./components/PulseHub.tsx').then((m) => ({ default: m.PulseHub }))
 );
+const LiveIncidentsPage = React.lazy(() =>
+  import('./components/LiveIncidentsPage.tsx').then((m) => ({ default: m.LiveIncidentsPage }))
+);
 
 function ViewLoadingSkeleton() {
   return (
@@ -52,7 +55,7 @@ function ViewLoadingSkeleton() {
   );
 }
 
-const VALID_VIEWS = new Set<ActiveView>(['landing', 'dashboard', 'pulse', 'map', 'agents', 'operator', 'profile']);
+const VALID_VIEWS = new Set<ActiveView>(['landing', 'incidents', 'dashboard', 'pulse', 'map', 'agents', 'operator', 'profile']);
 
 function readViewFromLocation(): ActiveView {
   if (typeof window === 'undefined') return 'landing';
@@ -231,6 +234,8 @@ function AppShell() {
             onOpenSos={() => setSosOpen(true)}
           />
         );
+      case 'incidents':
+        return <LiveIncidentsPage onOpenAuth={() => setAuthOpen(true)} />;
       case 'pulse':
         return <PulseHub onOpenAuth={() => setAuthOpen(true)} onOpenSos={() => setSosOpen(true)} />;
       case 'agents':

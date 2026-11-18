@@ -1280,3 +1280,163 @@ Rules:
   }
 }
 
+// 8. Live Incident & Minutes-to-Safety Intelligence Agent (gemini-4-hydrogen + structured schema + en/kn)
+export async function runLiveIncidentIntelligenceAgent(
+  input: {
+    localityName: string;
+    region: string;
+    alerts: Array<{
+      sourceName: string;
+      category: string;
+      severity: string;
+      verificationStatus: string;
+      title: string;
+      locationLabel: string;
+      firstReportedAt: string;
+      expiresAt: string | null;
+    }>;
+    weatherSummary: string;
+    safetyGapScore: number;
+    riskBand: string;
+    missingResources: string[];
+    nearestHubSummary: string;
+    whatIfQuestion?: string;
+    language?: 'en' | 'kn';
+  },
+  options?: { client?: GoogleGenAI | null; timeoutMs?: number }
+) {
+  const lang = input.language === 'kn' ? 'kn' : 'en';
+  const hasObservedAlerts = input.alerts.length > 0;
+
+  const buildFallback = (reason: AiFallbackReason, notice: string) => ({
+    modelUsed: 'fallback-live-incident-analyst',
+    aiAvailable: false,
+    isAiAdvisory: true,
+    advisoryNotice: AI_ADVISORY_NOTICE,
+    fallbackReason: reason,
+    situationAssessment: hasObservedAlerts
+      ? `[Observed] ${input.alerts.length} active external alert(s) near ${input.localityName} (${input.region}). [Observed Telemetry] ${input.weatherSummary}. [AI Advisory] Fallback mode active: ${notice}`
+      : `[Observed] Zero active official disaster alerts in ${input.localityName}. [Observed Telemetry] ${input.weatherSummary}. [AI Advisory] Fallback mode active: ${notice}`,
+    affectedCommunitiesAndInfra:
+      input.missingResources.length > 0
+        ? input.missingResources
+        : [
+            `No immediate official disaster closures reported in ${input.localityName}; continue monitoring local feeder roads and primary health clinics.`,
+          ],
+    responderRecommendations: [
+      `Human Confirmation Required: Verify nearest directory support hub (${input.nearestHubSummary}) by phone before dispatching field teams.`,
+      'Monitor NDMA SACHET and IMD Bengaluru CAP RSS updates continuously; escalate only on verified official or operator confirmation.',
+    ],
+    lastMileSurvivalGuidance:
+      lang === 'kn'
+        ? [
+            'ತಕ್ಷಣದ ದೈಹಿಕ ಅಪಾಯದಲ್ಲಿದ್ದರೆ ಅಧಿಕೃತ ತುರ್ತು ಸಹಾಯವಾಣಿ 112 ಅಥವಾ ಆಂಬ್ಯುಲೆನ್ಸ್ 108 ಗೆ ಕರೆ ಮಾಡಿ.',
+            'ಹತ್ತಿರದ ಸುರಕ್ಷಿತ ಆಶ್ರಯ ಅಥವಾ ಆಸ್ಪತ್ರೆಗೆ ತಲುಪುವ ಮುನ್ನ ಲಭ್ಯತೆಗಾಗಿ ದೂರವಾಣಿ ಮೂಲಕ ದೃಢೀಕರಿಸಿ.',
+            'ಬಿಸಿಲು ಅಥವಾ ಭಾರೀ ಮಳೆಯ ಸಂದರ್ಭದಲ್ಲಿ ಪ್ರವಾಹ ಪೀಡಿತ ರಸ್ತೆಗಳು ಮತ್ತು ತಗ್ಗು ಪ್ರದೇಶಗಳನ್ನು ತಪ್ಪಿಸಿ.',
+          ]
+        : [
+            'If in immediate physical danger, dial official emergency helpline 112 (or 108 for medical ambulance).',
+            'Call ahead to verify live facility availability before travelling to the nearest clinic or shelter.',
+            'Avoid low-lying underpasses during heavy rainfall and stay hydrated/shaded during high heat.',
+          ],
+    whatIfAnalysis: input.whatIfQuestion
+      ? `[AI Advisory] Scenario "${input.whatIfQuestion}": With Safety Gap Score ${input.safetyGapScore}/100 (${input.riskBand}), ensure backup 24/7 hubs in the directory are pre-verified by phone and alert ERSS-112 early.`
+      : `Baseline Safety Gap Score for ${input.localityName} is ${input.safetyGapScore}/100 (${input.riskBand}).`,
+    uncertaintyDisclosure: `${notice} Hospital bed counts and road closures require direct local confirmation.`,
+  });
+
+  const ai = getAiClient(options?.client);
+  if (!ai) {
+    return buildFallback('not_configured', 'Gemini Live Incident Analyst is offline; showing deterministic telemetry summary.');
+  }
+
+  try {
+    const langDirective =
+      lang === 'kn'
+        ? 'Write lastMileSurvivalGuidance in clear, natural Kannada (ಕನ್ನಡ) keeping emergency numbers (112, 108, 181) exact. Keep technical headings/badges in English or bilingual cleanly.'
+        : 'Write all strings in clear, concise English.';
+
+    const resp = await withRetryAndTimeout(
+      () =>
+        ai.models.generateContent({
+          model: GEMINI_MODELS.reasoning,
+          contents: `Analyze live incident intelligence for ${input.localityName} (${input.region}):
+Active Official/External Alerts (${input.alerts.length}):
+${hasObservedAlerts ? JSON.stringify(input.alerts.slice(0, 8), null, 2) : 'NONE — Zero verified active alerts in region.'}
+
+Observed Weather & 24h Forecast: ${input.weatherSummary}
+Minutes-to-Safety Gap Score: ${input.safetyGapScore}/100 (Band: ${input.riskBand})
+Nearest Support Hub: ${input.nearestHubSummary}
+Identified Resource Gaps: ${input.missingResources.join('; ') || 'None flagged'}
+What-If Preparedness Question: ${input.whatIfQuestion || 'None specified'}`,
+          config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
+            systemInstruction: `You are the LIFE-LINE AI Live Incident & Preventive Preparedness Analyst starting in Mysuru, Karnataka and across India.
+${langDirective}
+CRITICAL RULES:
+- Strictly separate [Observed], [Official Forecast], and [AI Advisory].
+- NEVER invent active incidents, casualties, or hospital bed counts when alerts list is empty.
+- NEVER claim responders or ambulances were automatically dispatched — explicitly note human operator confirmation is required.
+- Always surface official India emergency numbers (112, 108, 181) in survival guidance.`,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                situationAssessment: { type: Type.STRING },
+                affectedCommunitiesAndInfra: { type: Type.ARRAY, items: { type: Type.STRING } },
+                responderRecommendations: { type: Type.ARRAY, items: { type: Type.STRING } },
+                lastMileSurvivalGuidance: { type: Type.ARRAY, items: { type: Type.STRING } },
+                whatIfAnalysis: { type: Type.STRING },
+                uncertaintyDisclosure: { type: Type.STRING },
+              },
+              required: [
+                'situationAssessment',
+                'affectedCommunitiesAndInfra',
+                'responderRecommendations',
+                'lastMileSurvivalGuidance',
+                'whatIfAnalysis',
+                'uncertaintyDisclosure',
+              ],
+            },
+          },
+        }),
+      options?.timeoutMs ?? 20000,
+      2,
+      'Live Incident Intelligence Agent'
+    );
+
+    const parsed = safeParseJsonObject(resp.text);
+    if (!parsed || typeof parsed.situationAssessment !== 'string') {
+      return buildFallback('malformed_response', 'AI incident analysis could not be parsed cleanly.');
+    }
+
+    const filterStrings = (v: unknown, max: number) =>
+      Array.isArray(v)
+        ? v.filter((s): s is string => typeof s === 'string' && s.trim().length > 0).slice(0, max)
+        : [];
+
+    return {
+      modelUsed: GEMINI_MODELS.reasoning,
+      aiAvailable: true,
+      isAiAdvisory: true,
+      advisoryNotice: AI_ADVISORY_NOTICE,
+      situationAssessment: parsed.situationAssessment.trim(),
+      affectedCommunitiesAndInfra: filterStrings(parsed.affectedCommunitiesAndInfra, 5),
+      responderRecommendations: filterStrings(parsed.responderRecommendations, 5),
+      lastMileSurvivalGuidance: filterStrings(parsed.lastMileSurvivalGuidance, 5),
+      whatIfAnalysis:
+        typeof parsed.whatIfAnalysis === 'string' && parsed.whatIfAnalysis.trim()
+          ? parsed.whatIfAnalysis.trim()
+          : 'No additional scenario delta identified.',
+      uncertaintyDisclosure:
+        typeof parsed.uncertaintyDisclosure === 'string' && parsed.uncertaintyDisclosure.trim()
+          ? parsed.uncertaintyDisclosure.trim()
+          : 'Hospital capacity and road passability must be confirmed by human operators.',
+    };
+  } catch (err) {
+    const classified = classifyGeminiError(err);
+    return buildFallback(classified.reason, classified.publicMessage);
+  }
+}
+
+

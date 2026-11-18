@@ -4,6 +4,7 @@ const TRANSLATIONS: Record<AppLanguage, Record<string, string>> = {
   en: {
     nav_overview: 'Overview',
     nav_dashboard: 'Dashboard',
+    nav_incidents: 'Live Incidents',
     nav_pulse: 'PULSE',
     nav_map: 'Live Map',
     nav_agents: 'AI Agents',
@@ -36,6 +37,7 @@ const TRANSLATIONS: Record<AppLanguage, Record<string, string>> = {
   kn: {
     nav_overview: 'ಅವಲೋಕನ',
     nav_dashboard: 'ಡ್ಯಾಶ್‌ಬೋರ್ಡ್',
+    nav_incidents: 'ಲೈವ್ ಘಟನೆಗಳು',
     nav_pulse: 'ಪಲ್ಸ್ (PULSE)',
     nav_map: 'ಲೈವ್ ನಕ್ಷೆ',
     nav_agents: 'AI ಏಜೆಂಟ್‌ಗಳು',

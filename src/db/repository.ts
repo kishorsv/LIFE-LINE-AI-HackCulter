@@ -8,6 +8,8 @@ import {
   emergencyIncidents,
   incidentAssignments,
   incidentUpdates,
+  liveExternalAlerts,
+  liveFeedSyncRuns,
   notificationDeliveryLogs,
   notifications,
   safetyJourneys,
@@ -17,6 +19,12 @@ import {
   userProfiles,
   users,
 } from './schema.ts';
+import type {
+  LiveAlertSeverity,
+  LiveExternalAlert,
+  LiveFeedSyncRun,
+  LiveIncidentVerificationStatus,
+} from '../types/lifeline.ts';
 import {
   hashOneTimeCode,
   hashPasswordAsync,
@@ -76,6 +84,8 @@ const REQUIRED_TABLES = [
   'support_locations',
   'safety_journeys',
   'safety_reports',
+  'live_external_alerts',
+  'live_feed_sync_runs',
 ];
 
 let activeDialect: DatabaseDialect | null = null;
@@ -427,6 +437,62 @@ async function runPostgresMigrations(): Promise<string> {
     await queryWithRetry("INSERT INTO schema_migrations (version) VALUES ('v5_scalability_indexes') ON CONFLICT DO NOTHING");
   }
 
+  if (!applied.has('v6_live_incident_intelligence')) {
+    await queryWithRetry(`
+      CREATE TABLE IF NOT EXISTS live_external_alerts (
+        id SERIAL PRIMARY KEY,
+        external_key TEXT NOT NULL UNIQUE,
+        source_id TEXT NOT NULL,
+        source_name TEXT NOT NULL,
+        source_url TEXT NOT NULL DEFAULT '',
+        category TEXT NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        instruction TEXT NOT NULL DEFAULT '',
+        severity TEXT NOT NULL DEFAULT 'MODERATE',
+        severity_color TEXT NOT NULL DEFAULT 'amber',
+        certainty TEXT NOT NULL DEFAULT 'Observed',
+        verification_status TEXT NOT NULL DEFAULT 'Official Alert',
+        signal_type TEXT NOT NULL DEFAULT 'official_alert',
+        location_label TEXT NOT NULL,
+        state_name TEXT NOT NULL DEFAULT '',
+        district_name TEXT NOT NULL DEFAULT '',
+        latitude DOUBLE PRECISION,
+        longitude DOUBLE PRECISION,
+        area_covered_sq_km DOUBLE PRECISION,
+        language TEXT NOT NULL DEFAULT 'en',
+        first_reported_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        effective_from TIMESTAMPTZ,
+        expires_at TIMESTAMPTZ,
+        last_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        raw_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS live_alerts_active_updated_idx ON live_external_alerts(is_active, last_updated_at DESC);
+      CREATE INDEX IF NOT EXISTS live_alerts_state_district_idx ON live_external_alerts(state_name, district_name);
+      CREATE INDEX IF NOT EXISTS live_alerts_source_idx ON live_external_alerts(source_id, is_active);
+
+      CREATE TABLE IF NOT EXISTS live_feed_sync_runs (
+        source_id TEXT PRIMARY KEY,
+        source_name TEXT NOT NULL,
+        source_kind TEXT NOT NULL DEFAULT 'official_cap',
+        endpoint_url TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'offline',
+        poll_interval_seconds INTEGER NOT NULL DEFAULT 180,
+        last_attempt_at TIMESTAMPTZ,
+        last_success_at TIMESTAMPTZ,
+        last_error TEXT NOT NULL DEFAULT '',
+        records_fetched INTEGER NOT NULL DEFAULT 0,
+        records_active INTEGER NOT NULL DEFAULT 0,
+        latency_ms INTEGER NOT NULL DEFAULT 0,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+    await queryWithRetry("INSERT INTO schema_migrations (version) VALUES ('v6_live_incident_intelligence') ON CONFLICT DO NOTHING");
+  }
+
   // Seed directory & demo accounts if PG database is newly provisioned
   const orgCnt = await queryWithRetry<{ cnt: number }>('SELECT COUNT(*)::int AS cnt FROM support_organizations');
   if (orgCnt.rows[0]?.cnt === 0) {
@@ -443,6 +509,30 @@ async function runPostgresMigrations(): Promise<string> {
       const ins = await pool.query(
         `INSERT INTO support_organizations (name, category, phone, website, email, verification_status, source, is_sample_data)
          VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE) RETURNING id`,
+        [o[0], o[1], o[2], o[3], o[4], o[5], o[6]]
+      );
+      await pool.query(
+        `INSERT INTO support_locations (organization_id, address, city, region, latitude, longitude, operating_hours, is_24_hours, availability_note)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [ins.rows[0].id, o[7], o[8], o[9], o[10], o[11], o[12], o[13], o[14]]
+      );
+    }
+  }
+
+  const kaCnt = await queryWithRetry<{ cnt: number }>(
+    "SELECT COUNT(*)::int AS cnt FROM support_locations WHERE region = 'Karnataka'"
+  );
+  if (kaCnt.rows[0]?.cnt === 0) {
+    const mysuruRefs = [
+      ['Karnataka ERSS 112 & Mysuru City Police Control Room', 'Government Helpline', '112 / 0821-2418139', 'https://ksp.karnataka.gov.in', '', 'Public Government Reference', 'Karnataka State Police / ERSS 112 Public Directory', 'Nazarbad / Irwin Road Police Command Area, Mysuru, Karnataka 570001', 'Mysuru', 'Karnataka', 12.3106, 76.6634, '24/7 Emergency Response Helpline', true, 'Official India-wide emergency number 112. Live unit dispatch is handled solely by official police control room.'],
+      ['K.R. Hospital (Mysore Medical College & Research Institute)', 'Hospital', '0821-2520512 / 108', 'https://mmcri.karnataka.gov.in', '', 'Public Government Reference', 'Government of Karnataka Health Directory', 'Irwin Road, Lashkar Mohalla, Mysuru, Karnataka 570001', 'Mysuru', 'Karnataka', 12.3137, 76.6524, '24/7 Public Emergency & Casualty', true, 'Capacity and bed availability are NOT auto-verified here — call 108 or hospital desk to confirm.'],
+      ['JSS Hospital Mysuru Emergency & Trauma Centre', 'Hospital', '0821-2335555', 'https://jsshospital.in', '', 'Public Medical Reference', 'Public Hospital Directory (Mysuru)', 'Mahatma Gandhi Road, Agrahara, Mysuru, Karnataka 570004', 'Mysuru', 'Karnataka', 12.2974, 76.6531, '24/7 Emergency & Trauma', true, 'Confirm live emergency bed & specialist availability by phone prior to transit.'],
+      ['Karnataka Women Helpline 181 & Mysuru Sakhi One Stop Centre', 'Womens Support', '181 / 1091', 'https://dwcd.karnataka.gov.in', '', 'Public Government Reference', 'Dept. of Women & Child Development Karnataka', 'K.R. Hospital Campus / Nazarbad, Mysuru, Karnataka 570010', 'Mysuru', 'Karnataka', 12.3095, 76.6542, '24/7 Toll-Free Women Crisis Support', true, 'Toll-free women safety helpline 181 (Karnataka) and national child helpline 1098.'],
+    ] as const;
+    for (const o of mysuruRefs) {
+      const ins = await pool.query(
+        `INSERT INTO support_organizations (name, category, phone, website, email, verification_status, source, is_sample_data)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,FALSE) RETURNING id`,
         [o[0], o[1], o[2], o[3], o[4], o[5], o[6]]
       );
       await pool.query(
@@ -489,7 +579,7 @@ async function runPostgresMigrations(): Promise<string> {
   }
 
   const latest = await pool.query('SELECT version FROM schema_migrations ORDER BY applied_at DESC, version DESC LIMIT 1');
-  return latest.rows[0]?.version || 'v3_sos_idempotency_and_delivery';
+  return latest.rows[0]?.version || 'v6_live_incident_intelligence';
 }
 
 export async function initializeDatabase(): Promise<DatabaseDialect> {
@@ -3821,6 +3911,592 @@ export async function listRealtimeEventsSince(
       unknown
     >,
   }));
+}
+
+// ========================
+// LIVE EXTERNAL INCIDENT & WEATHER INTELLIGENCE STORAGE
+// ========================
+export interface UpsertLiveExternalAlertInput {
+  externalKey: string;
+  sourceId: string;
+  sourceName: string;
+  sourceUrl: string;
+  category: string;
+  title: string;
+  description: string;
+  instruction?: string;
+  severity: LiveAlertSeverity;
+  severityColor: string;
+  certainty: string;
+  verificationStatus?: LiveIncidentVerificationStatus;
+  signalType?: 'official_alert' | 'observation' | 'forecast' | 'community_report';
+  locationLabel: string;
+  stateName?: string;
+  districtName?: string;
+  latitude: number | null;
+  longitude: number | null;
+  areaCoveredSqKm?: number | null;
+  language?: string;
+  firstReportedAt: string;
+  effectiveFrom?: string | null;
+  expiresAt?: string | null;
+  lastUpdatedAt: string;
+  isActive: boolean;
+  rawPayload?: Record<string, unknown>;
+}
+
+function toIsoStringOrNull(val: unknown): string | null {
+  if (val == null || val === '') return null;
+  if (val instanceof Date) return Number.isNaN(val.getTime()) ? null : val.toISOString();
+  const parsed = Date.parse(String(val));
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : String(val);
+}
+
+function mapLiveExternalAlertRow(row: Record<string, unknown>): LiveExternalAlert {
+  const firstRep = toIsoStringOrNull(row.first_reported_at ?? row.firstReportedAt) || new Date().toISOString();
+  const lastUpd = toIsoStringOrNull(row.last_updated_at ?? row.lastUpdatedAt) || firstRep;
+  return {
+    id: Number(row.id),
+    externalKey: String(row.external_key ?? row.externalKey),
+    sourceId: String(row.source_id ?? row.sourceId),
+    sourceName: String(row.source_name ?? row.sourceName),
+    sourceUrl: String(row.source_url ?? row.sourceUrl ?? ''),
+    category: String(row.category),
+    title: String(row.title),
+    description: String(row.description ?? ''),
+    instruction: String(row.instruction ?? ''),
+    severity: (String(row.severity ?? 'MODERATE') as LiveAlertSeverity) || 'MODERATE',
+    severityColor: String(row.severity_color ?? row.severityColor ?? 'amber'),
+    certainty: String(row.certainty ?? 'Observed'),
+    verificationStatus: (String(
+      row.verification_status ?? row.verificationStatus ?? 'Official Alert'
+    ) as LiveIncidentVerificationStatus) || 'Official Alert',
+    signalType:
+      (String(row.signal_type ?? row.signalType ?? 'official_alert') as LiveExternalAlert['signalType']) ||
+      'official_alert',
+    locationLabel: String(row.location_label ?? row.locationLabel ?? ''),
+    stateName: String(row.state_name ?? row.stateName ?? ''),
+    districtName: String(row.district_name ?? row.districtName ?? ''),
+    latitude: row.latitude != null ? Number(row.latitude) : null,
+    longitude: row.longitude != null ? Number(row.longitude) : null,
+    areaCoveredSqKm:
+      row.area_covered_sq_km != null
+        ? Number(row.area_covered_sq_km)
+        : row.areaCoveredSqKm != null
+        ? Number(row.areaCoveredSqKm)
+        : null,
+    language: String(row.language ?? 'en'),
+    firstReportedAt: firstRep,
+    effectiveFrom: toIsoStringOrNull(row.effective_from ?? row.effectiveFrom),
+    expiresAt: toIsoStringOrNull(row.expires_at ?? row.expiresAt),
+    lastUpdatedAt: lastUpd,
+    isActive: Boolean(row.is_active ?? row.isActive),
+  };
+}
+
+export async function upsertLiveExternalAlerts(
+  alerts: UpsertLiveExternalAlertInput[]
+): Promise<{ insertedCount: number; updatedCount: number; newActiveAlerts: LiveExternalAlert[] }> {
+  const dialect = await ensureDialect();
+  let insertedCount = 0;
+  let updatedCount = 0;
+  const newActiveAlerts: LiveExternalAlert[] = [];
+
+  if (alerts.length === 0) {
+    return { insertedCount, updatedCount, newActiveAlerts };
+  }
+
+  const t0 = performance.now();
+  if (dialect === 'postgres') {
+    const existingRes = await queryWithRetry<{ external_key: string }>(
+      'SELECT external_key FROM live_external_alerts WHERE external_key = ANY($1::text[])',
+      [alerts.map((a) => a.externalKey)],
+      2,
+      'upsertLiveExternalAlerts.check'
+    );
+    const existingSet = new Set(existingRes.rows.map((r) => r.external_key));
+
+    for (const a of alerts) {
+      const isNew = !existingSet.has(a.externalKey);
+      const res = await queryWithRetry<Record<string, unknown>>(
+        `INSERT INTO live_external_alerts (
+           external_key, source_id, source_name, source_url, category, title, description, instruction,
+           severity, severity_color, certainty, verification_status, signal_type, location_label,
+           state_name, district_name, latitude, longitude, area_covered_sq_km, language,
+           first_reported_at, effective_from, expires_at, last_updated_at, is_active, raw_payload, updated_at
+         )
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21::timestamptz,$22::timestamptz,$23::timestamptz,$24::timestamptz,$25,$26::jsonb,NOW())
+         ON CONFLICT (external_key) DO UPDATE SET
+           source_name = EXCLUDED.source_name,
+           source_url = EXCLUDED.source_url,
+           category = EXCLUDED.category,
+           title = EXCLUDED.title,
+           description = EXCLUDED.description,
+           instruction = EXCLUDED.instruction,
+           severity = EXCLUDED.severity,
+           severity_color = EXCLUDED.severity_color,
+           certainty = EXCLUDED.certainty,
+           verification_status = CASE
+             WHEN live_external_alerts.verification_status IN ('Verified Incident', 'Resolved Incident') THEN live_external_alerts.verification_status
+             ELSE EXCLUDED.verification_status
+           END,
+           location_label = EXCLUDED.location_label,
+           state_name = EXCLUDED.state_name,
+           district_name = EXCLUDED.district_name,
+           latitude = COALESCE(EXCLUDED.latitude, live_external_alerts.latitude),
+           longitude = COALESCE(EXCLUDED.longitude, live_external_alerts.longitude),
+           area_covered_sq_km = EXCLUDED.area_covered_sq_km,
+           effective_from = EXCLUDED.effective_from,
+           expires_at = EXCLUDED.expires_at,
+           last_updated_at = EXCLUDED.last_updated_at,
+           is_active = CASE
+             WHEN live_external_alerts.verification_status = 'Resolved Incident' THEN FALSE
+             ELSE EXCLUDED.is_active
+           END,
+           raw_payload = EXCLUDED.raw_payload,
+           updated_at = NOW()
+         RETURNING *`,
+        [
+          a.externalKey,
+          a.sourceId,
+          a.sourceName,
+          a.sourceUrl,
+          a.category,
+          a.title,
+          a.description,
+          a.instruction || '',
+          a.severity,
+          a.severityColor,
+          a.certainty,
+          a.verificationStatus || 'Official Alert',
+          a.signalType || 'official_alert',
+          a.locationLabel,
+          a.stateName || '',
+          a.districtName || '',
+          a.latitude,
+          a.longitude,
+          a.areaCoveredSqKm ?? null,
+          a.language || 'en',
+          a.firstReportedAt,
+          a.effectiveFrom || null,
+          a.expiresAt || null,
+          a.lastUpdatedAt,
+          a.isActive,
+          JSON.stringify(a.rawPayload || {}),
+        ],
+        2,
+        'upsertLiveExternalAlerts.row'
+      );
+      const mapped = mapLiveExternalAlertRow(res.rows[0]);
+      if (isNew) {
+        insertedCount++;
+        if (mapped.isActive) newActiveAlerts.push(mapped);
+      } else {
+        updatedCount++;
+      }
+    }
+    metrics.recordDbQuery(performance.now() - t0, 'upsertLiveExternalAlerts');
+    return { insertedCount, updatedCount, newActiveAlerts };
+  }
+
+  runSqliteTransaction(() => {
+    const checkStmt = sqlite.prepare('SELECT id, verification_status, is_active FROM live_external_alerts WHERE external_key = ?');
+    const insertStmt = sqlite.prepare(`
+      INSERT INTO live_external_alerts (
+        external_key, source_id, source_name, source_url, category, title, description, instruction,
+        severity, severity_color, certainty, verification_status, signal_type, location_label,
+        state_name, district_name, latitude, longitude, area_covered_sq_km, language,
+        first_reported_at, effective_from, expires_at, last_updated_at, is_active, raw_payload
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const updateStmt = sqlite.prepare(`
+      UPDATE live_external_alerts SET
+        source_name = ?, source_url = ?, category = ?, title = ?, description = ?, instruction = ?,
+        severity = ?, severity_color = ?, certainty = ?,
+        verification_status = CASE
+          WHEN verification_status IN ('Verified Incident', 'Resolved Incident') THEN verification_status
+          ELSE ?
+        END,
+        location_label = ?, state_name = ?, district_name = ?,
+        latitude = COALESCE(?, latitude), longitude = COALESCE(?, longitude),
+        area_covered_sq_km = ?, effective_from = ?, expires_at = ?, last_updated_at = ?,
+        is_active = CASE WHEN verification_status = 'Resolved Incident' THEN 0 ELSE ? END,
+        raw_payload = ?, updated_at = datetime('now')
+      WHERE external_key = ?
+    `);
+    const selectByKey = sqlite.prepare('SELECT * FROM live_external_alerts WHERE external_key = ?');
+
+    for (const a of alerts) {
+      const existing = checkStmt.get(a.externalKey) as { id: number } | undefined;
+      if (!existing) {
+        insertStmt.run(
+          a.externalKey,
+          a.sourceId,
+          a.sourceName,
+          a.sourceUrl,
+          a.category,
+          a.title,
+          a.description,
+          a.instruction || '',
+          a.severity,
+          a.severityColor,
+          a.certainty,
+          a.verificationStatus || 'Official Alert',
+          a.signalType || 'official_alert',
+          a.locationLabel,
+          a.stateName || '',
+          a.districtName || '',
+          a.latitude,
+          a.longitude,
+          a.areaCoveredSqKm ?? null,
+          a.language || 'en',
+          a.firstReportedAt,
+          a.effectiveFrom || null,
+          a.expiresAt || null,
+          a.lastUpdatedAt,
+          a.isActive ? 1 : 0,
+          JSON.stringify(a.rawPayload || {})
+        );
+        insertedCount++;
+        const row = selectByKey.get(a.externalKey) as Record<string, unknown>;
+        const mapped = mapLiveExternalAlertRow(row);
+        if (mapped.isActive) newActiveAlerts.push(mapped);
+      } else {
+        updateStmt.run(
+          a.sourceName,
+          a.sourceUrl,
+          a.category,
+          a.title,
+          a.description,
+          a.instruction || '',
+          a.severity,
+          a.severityColor,
+          a.certainty,
+          a.verificationStatus || 'Official Alert',
+          a.locationLabel,
+          a.stateName || '',
+          a.districtName || '',
+          a.latitude,
+          a.longitude,
+          a.areaCoveredSqKm ?? null,
+          a.effectiveFrom || null,
+          a.expiresAt || null,
+          a.lastUpdatedAt,
+          a.isActive ? 1 : 0,
+          JSON.stringify(a.rawPayload || {}),
+          a.externalKey
+        );
+        updatedCount++;
+      }
+    }
+  });
+  metrics.recordDbQuery(performance.now() - t0, 'upsertLiveExternalAlerts');
+  return { insertedCount, updatedCount, newActiveAlerts };
+}
+
+export async function markStaleSourceAlertsResolved(
+  sourceId: string,
+  stillActiveExternalKeys: string[]
+): Promise<number> {
+  const dialect = await ensureDialect();
+  const keySet = new Set(stillActiveExternalKeys);
+  const t0 = performance.now();
+
+  if (dialect === 'postgres') {
+    const res =
+      keySet.size === 0
+        ? await queryWithRetry(
+            `UPDATE live_external_alerts
+             SET is_active = FALSE, verification_status = 'Resolved Incident', last_updated_at = NOW(), updated_at = NOW()
+             WHERE source_id = $1 AND is_active = TRUE AND verification_status = 'Official Alert'`,
+            [sourceId],
+            2,
+            'markStaleSourceAlertsResolved'
+          )
+        : await queryWithRetry(
+            `UPDATE live_external_alerts
+             SET is_active = FALSE, verification_status = 'Resolved Incident', last_updated_at = NOW(), updated_at = NOW()
+             WHERE source_id = $1 AND is_active = TRUE AND verification_status = 'Official Alert'
+               AND NOT (external_key = ANY($2::text[]))`,
+            [sourceId, Array.from(keySet)],
+            2,
+            'markStaleSourceAlertsResolved'
+          );
+    metrics.recordDbQuery(performance.now() - t0, 'markStaleSourceAlertsResolved');
+    return res.rowCount ?? 0;
+  }
+
+  const activeRows = sqlite
+    .prepare(
+      "SELECT id, external_key FROM live_external_alerts WHERE source_id = ? AND is_active = 1 AND verification_status = 'Official Alert'"
+    )
+    .all(sourceId) as Array<{ id: number; external_key: string }>;
+  const toResolve = activeRows.filter((r) => !keySet.has(r.external_key));
+  if (toResolve.length > 0) {
+    const upd = sqlite.prepare(
+      "UPDATE live_external_alerts SET is_active = 0, verification_status = 'Resolved Incident', last_updated_at = datetime('now'), updated_at = datetime('now') WHERE id = ?"
+    );
+    runSqliteTransaction(() => {
+      for (const r of toResolve) upd.run(r.id);
+    });
+  }
+  metrics.recordDbQuery(performance.now() - t0, 'markStaleSourceAlertsResolved');
+  return toResolve.length;
+}
+
+export async function listLiveExternalAlerts(options?: {
+  activeOnly?: boolean;
+  region?: string;
+  category?: string;
+  limit?: number;
+}): Promise<LiveExternalAlert[]> {
+  const dialect = await ensureDialect();
+  const limit = Math.min(200, Math.max(1, options?.limit ?? 80));
+  const activeOnly = options?.activeOnly ?? false;
+  const region = (options?.region || '').trim().toLowerCase();
+  const category = (options?.category || '').trim().toLowerCase();
+  const t0 = performance.now();
+
+  let rows: Record<string, unknown>[];
+  if (dialect === 'postgres') {
+    const res = await queryWithRetry<Record<string, unknown>>(
+      `SELECT * FROM live_external_alerts
+       ${activeOnly ? 'WHERE is_active = TRUE' : ''}
+       ORDER BY is_active DESC, last_updated_at DESC, id DESC
+       LIMIT $1`,
+      [limit],
+      2,
+      'listLiveExternalAlerts'
+    );
+    rows = res.rows;
+  } else {
+    rows = sqlite
+      .prepare(
+        `SELECT * FROM live_external_alerts
+         ${activeOnly ? 'WHERE is_active = 1' : ''}
+         ORDER BY is_active DESC, last_updated_at DESC, id DESC
+         LIMIT ?`
+      )
+      .all(limit) as Record<string, unknown>[];
+    metrics.recordDbQuery(performance.now() - t0, 'listLiveExternalAlerts');
+  }
+
+  let mapped = rows.map(mapLiveExternalAlertRow);
+  if (region && region !== 'all' && region !== 'india') {
+    mapped = mapped.filter((a) => {
+      const hay = `${a.locationLabel} ${a.stateName} ${a.districtName} ${a.title} ${a.description}`.toLowerCase();
+      if (region === 'mysuru' || region === 'mysore') {
+        const nearMysuru =
+          a.latitude != null &&
+          a.longitude != null &&
+          Math.abs(a.latitude - 12.2958) <= 0.65 &&
+          Math.abs(a.longitude - 76.6394) <= 0.65;
+        return nearMysuru || hay.includes('mysuru') || hay.includes('mysore');
+      }
+      if (region === 'karnataka') {
+        return hay.includes('karnataka') || a.stateName.toLowerCase() === 'karnataka';
+      }
+      return hay.includes(region);
+    });
+  }
+  if (category && category !== 'all') {
+    mapped = mapped.filter((a) => a.category.toLowerCase().includes(category));
+  }
+  return mapped;
+}
+
+export async function getLiveExternalAlertById(id: number): Promise<LiveExternalAlert | null> {
+  const dialect = await ensureDialect();
+  if (dialect === 'postgres') {
+    const res = await queryWithRetry<Record<string, unknown>>(
+      'SELECT * FROM live_external_alerts WHERE id = $1 LIMIT 1',
+      [id],
+      2,
+      'getLiveExternalAlertById'
+    );
+    return res.rows[0] ? mapLiveExternalAlertRow(res.rows[0]) : null;
+  }
+  const row = sqlite.prepare('SELECT * FROM live_external_alerts WHERE id = ? LIMIT 1').get(id) as
+    | Record<string, unknown>
+    | undefined;
+  return row ? mapLiveExternalAlertRow(row) : null;
+}
+
+export async function updateLiveExternalAlertStatus(
+  id: number,
+  verificationStatus: LiveIncidentVerificationStatus,
+  instructionNote?: string
+): Promise<LiveExternalAlert | null> {
+  const dialect = await ensureDialect();
+  const isActive = verificationStatus !== 'Resolved Incident';
+
+  if (dialect === 'postgres') {
+    const res = await queryWithRetry<Record<string, unknown>>(
+      `UPDATE live_external_alerts
+       SET verification_status = $1,
+           is_active = $2,
+           instruction = CASE WHEN $3 <> '' THEN $3 ELSE instruction END,
+           last_updated_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $4
+       RETURNING *`,
+      [verificationStatus, isActive, instructionNote?.trim() || '', id],
+      2,
+      'updateLiveExternalAlertStatus'
+    );
+    return res.rows[0] ? mapLiveExternalAlertRow(res.rows[0]) : null;
+  }
+
+  sqlite
+    .prepare(
+      `UPDATE live_external_alerts
+       SET verification_status = ?,
+           is_active = ?,
+           instruction = CASE WHEN ? != '' THEN ? ELSE instruction END,
+           last_updated_at = datetime('now'),
+           updated_at = datetime('now')
+       WHERE id = ?`
+    )
+    .run(verificationStatus, isActive ? 1 : 0, instructionNote?.trim() || '', instructionNote?.trim() || '', id);
+
+  return getLiveExternalAlertById(id);
+}
+
+export async function upsertLiveFeedSyncRun(input: {
+  sourceId: string;
+  sourceName: string;
+  sourceKind: LiveFeedSyncRun['sourceKind'];
+  endpointUrl: string;
+  status: LiveFeedSyncRun['status'];
+  pollIntervalSeconds: number;
+  lastAttemptAt: string;
+  lastSuccessAt?: string | null;
+  lastError?: string;
+  recordsFetched: number;
+  recordsActive: number;
+  latencyMs: number;
+}): Promise<void> {
+  const dialect = await ensureDialect();
+  if (dialect === 'postgres') {
+    await queryWithRetry(
+      `INSERT INTO live_feed_sync_runs (
+         source_id, source_name, source_kind, endpoint_url, status, poll_interval_seconds,
+         last_attempt_at, last_success_at, last_error, records_fetched, records_active, latency_ms, updated_at
+       )
+       VALUES ($1,$2,$3,$4,$5,$6,$7::timestamptz,$8::timestamptz,$9,$10,$11,$12,NOW())
+       ON CONFLICT (source_id) DO UPDATE SET
+         source_name = EXCLUDED.source_name,
+         source_kind = EXCLUDED.source_kind,
+         endpoint_url = EXCLUDED.endpoint_url,
+         status = EXCLUDED.status,
+         poll_interval_seconds = EXCLUDED.poll_interval_seconds,
+         last_attempt_at = EXCLUDED.last_attempt_at,
+         last_success_at = COALESCE(EXCLUDED.last_success_at, live_feed_sync_runs.last_success_at),
+         last_error = EXCLUDED.last_error,
+         records_fetched = EXCLUDED.records_fetched,
+         records_active = EXCLUDED.records_active,
+         latency_ms = EXCLUDED.latency_ms,
+         updated_at = NOW()`,
+      [
+        input.sourceId,
+        input.sourceName,
+        input.sourceKind,
+        input.endpointUrl,
+        input.status,
+        input.pollIntervalSeconds,
+        input.lastAttemptAt,
+        input.lastSuccessAt ?? null,
+        input.lastError ?? '',
+        input.recordsFetched,
+        input.recordsActive,
+        Math.max(0, Math.round(input.latencyMs)),
+      ],
+      2,
+      'upsertLiveFeedSyncRun'
+    );
+    return;
+  }
+
+  sqlite
+    .prepare(
+      `INSERT INTO live_feed_sync_runs (
+         source_id, source_name, source_kind, endpoint_url, status, poll_interval_seconds,
+         last_attempt_at, last_success_at, last_error, records_fetched, records_active, latency_ms, updated_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+       ON CONFLICT(source_id) DO UPDATE SET
+         source_name = excluded.source_name,
+         source_kind = excluded.source_kind,
+         endpoint_url = excluded.endpoint_url,
+         status = excluded.status,
+         poll_interval_seconds = excluded.poll_interval_seconds,
+         last_attempt_at = excluded.last_attempt_at,
+         last_success_at = COALESCE(excluded.last_success_at, live_feed_sync_runs.last_success_at),
+         last_error = excluded.last_error,
+         records_fetched = excluded.records_fetched,
+         records_active = excluded.records_active,
+         latency_ms = excluded.latency_ms,
+         updated_at = datetime('now')`
+    )
+    .run(
+      input.sourceId,
+      input.sourceName,
+      input.sourceKind,
+      input.endpointUrl,
+      input.status,
+      input.pollIntervalSeconds,
+      input.lastAttemptAt,
+      input.lastSuccessAt ?? null,
+      input.lastError ?? '',
+      input.recordsFetched,
+      input.recordsActive,
+      Math.max(0, Math.round(input.latencyMs))
+    );
+}
+
+export async function listLiveFeedSyncRuns(): Promise<LiveFeedSyncRun[]> {
+  const dialect = await ensureDialect();
+  let rows: Record<string, unknown>[];
+  if (dialect === 'postgres') {
+    const res = await queryWithRetry<Record<string, unknown>>(
+      'SELECT * FROM live_feed_sync_runs ORDER BY source_id ASC',
+      [],
+      2,
+      'listLiveFeedSyncRuns'
+    );
+    rows = res.rows;
+  } else {
+    rows = sqlite
+      .prepare('SELECT * FROM live_feed_sync_runs ORDER BY source_id ASC')
+      .all() as Record<string, unknown>[];
+  }
+
+  const nowMs = Date.now();
+  return rows.map((r) => {
+    const pollSec = Number(r.poll_interval_seconds ?? r.pollIntervalSeconds ?? 180);
+    const lastSuccessAt = toIsoStringOrNull(r.last_success_at ?? r.lastSuccessAt);
+    const lastAttemptAt = toIsoStringOrNull(r.last_attempt_at ?? r.lastAttemptAt);
+    const status = String(r.status || 'offline') as LiveFeedSyncRun['status'];
+    const ageMs = lastSuccessAt ? nowMs - Date.parse(lastSuccessAt) : Infinity;
+    const isStale = status === 'unconfigured' ? false : !lastSuccessAt || ageMs > Math.max(900_000, pollSec * 3 * 1000);
+
+    return {
+      sourceId: String(r.source_id ?? r.sourceId),
+      sourceName: String(r.source_name ?? r.sourceName),
+      sourceKind: (String(r.source_kind ?? r.sourceKind ?? 'official_cap') as LiveFeedSyncRun['sourceKind']),
+      endpointUrl: String(r.endpoint_url ?? r.endpointUrl ?? ''),
+      status,
+      pollIntervalSeconds: pollSec,
+      lastAttemptAt,
+      lastSuccessAt,
+      lastError: String(r.last_error ?? r.lastError ?? ''),
+      recordsFetched: Number(r.records_fetched ?? r.recordsFetched ?? 0),
+      recordsActive: Number(r.records_active ?? r.recordsActive ?? 0),
+      latencyMs: Number(r.latency_ms ?? r.latencyMs ?? 0),
+      isStale,
+    };
+  });
 }
 
 

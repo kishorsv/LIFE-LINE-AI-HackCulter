@@ -29,6 +29,7 @@ import {
   getDemoAccounts,
   getIncidentById,
   getLatestRealtimeEventSeq,
+  getLiveExternalAlertById,
   getOperationalAnalytics,
   getOrInitSharedRuntimeSessionSecret,
   getSafetyJourneyById,
@@ -40,6 +41,8 @@ import {
   listAuditLogs,
   listIncidentsForPulse,
   listIncidentsForUser,
+  listLiveExternalAlerts,
+  listLiveFeedSyncRuns,
   listNotificationsForUser,
   listOperatorUserIds,
   listRealtimeEventsSince,
@@ -61,6 +64,7 @@ import {
   saveAiAssessment,
   updateIncidentDeliveryState,
   updateIncidentStatus,
+  updateLiveExternalAlertStatus,
   updateResponderAvailability,
   updateSafetyJourneyState,
   updateTrustedContact,
@@ -115,6 +119,7 @@ import {
   runEmergencyAssessmentAgent,
   runEmergencyCoordinationAgent,
   runIncidentFollowUpAgent,
+  runLiveIncidentIntelligenceAgent,
   runResourceDiscoveryAgent,
   runSafeRouteAgent,
   runSafetyIntelligenceAgent,
@@ -129,9 +134,13 @@ import {
   computeSafeRoutesWithGoogle,
   fetchOpenMeteoWeather,
 } from './src/services/pulse.ts';
+import { fetchMysuruAndCityWeather, resolveIndiaDistrictCoordinates } from './src/services/liveFeeds.ts';
+import { computeSafetyGapScore, runDeterministicWhatIfScenario } from './src/services/incidentIntelligence.ts';
+import { pollAllLiveSources, startLiveFeedPolling, stopLiveFeedPolling } from './src/services/livePoller.ts';
 import { cacheQueue } from './src/services/cacheQueue.ts';
 import { httpMetricsMiddleware, metrics } from './src/services/metrics.ts';
 import { errorHandlerMiddleware, requestLoggerMiddleware } from './src/services/logger.ts';
+import type { LiveIncidentVerificationStatus } from './src/types/lifeline.ts';
 
 const MAPS_ATTRIBUTION_ID = 'gmp_mcp_codeassist_v1_aistudio';
 const OPERATOR_ROLES: UserRole[] = ['emergency_operator', 'support_organization', 'administrator'];
@@ -278,6 +287,7 @@ export async function createAppServer(options?: {
     eventId: string;
     targetUserId?: number;
     includeOperators: boolean;
+    broadcastAll?: boolean;
     userPayload: Record<string, unknown>;
     operatorPayload: Record<string, unknown>;
   }
@@ -309,7 +319,9 @@ export async function createAppServer(options?: {
       if (client.ws.readyState !== WebSocket.OPEN) continue;
       const isOperator = OPERATOR_ROLES.includes(client.role);
       const isTargetUser = ev.targetUserId !== undefined && client.userId === ev.targetUserId;
-      if (ev.includeOperators && isOperator) {
+      if (ev.broadcastAll) {
+        client.ws.send(isOperator ? serializedOp : serializedUser);
+      } else if (ev.includeOperators && isOperator) {
         client.ws.send(serializedOp);
       } else if (isTargetUser) {
         client.ws.send(serializedUser);
@@ -330,12 +342,14 @@ export async function createAppServer(options?: {
   function pushAndBroadcastRealtimeEvent(params: {
     targetUserId?: number;
     includeOperators?: boolean;
+    broadcastAll?: boolean;
     userPayload: Record<string, unknown>;
     operatorPayload?: Record<string, unknown>;
   }) {
     const seq = ++currentEventSeq;
     const eventId = crypto.randomUUID();
     const includeOperators = Boolean(params.includeOperators);
+    const broadcastAll = Boolean(params.broadcastAll);
     const userMsg = { ...params.userPayload, seq };
     const opMsg = { ...(params.operatorPayload || params.userPayload), seq };
 
@@ -344,6 +358,7 @@ export async function createAppServer(options?: {
       eventId,
       targetUserId: params.targetUserId,
       includeOperators,
+      broadcastAll,
       userPayload: userMsg,
       operatorPayload: opMsg,
     };
@@ -1778,6 +1793,352 @@ export async function createAppServer(options?: {
     }
   });
 
+  // ========================
+  // LIVE INCIDENT INTELLIGENCE (NDMA SACHET, IMD CAP, OPEN-METEO, USGS, MYSURU PILOT + MINUTES-TO-SAFETY)
+  // ========================
+  const VALID_LIVE_VERIFICATION_STATUSES = new Set<LiveIncidentVerificationStatus>([
+    'Official Alert',
+    'Awaiting Verification',
+    'Verified Incident',
+    'Resolved Incident',
+  ]);
+
+  function resolveFocusCoordinates(query: Record<string, unknown>) {
+    const cityRaw = sanitizeBoundedString(query.city, 80);
+    const regionRaw = sanitizeBoundedString(query.region, 40).toLowerCase() || 'mysuru';
+    const latRaw = query.lat !== undefined ? Number(query.lat) : undefined;
+    const lngRaw = query.lng !== undefined ? Number(query.lng) : undefined;
+
+    if (latRaw !== undefined && lngRaw !== undefined && isValidLatitude(latRaw) && isValidLongitude(lngRaw)) {
+      return {
+        lat: latRaw,
+        lng: lngRaw,
+        city: cityRaw || 'Custom Locality',
+        state: sanitizeBoundedString(query.state, 80) || 'India',
+        region: regionRaw,
+      };
+    }
+
+    if (cityRaw) {
+      const resolved = resolveIndiaDistrictCoordinates(cityRaw);
+      if (resolved) {
+        return {
+          lat: resolved.lat,
+          lng: resolved.lng,
+          city: resolved.districtName || cityRaw,
+          state: resolved.stateName || 'India',
+          region: regionRaw,
+        };
+      }
+    }
+
+    if (regionRaw === 'karnataka') {
+      return { lat: 12.9716, lng: 77.5946, city: 'Bengaluru / Karnataka', state: 'Karnataka', region: 'karnataka' };
+    }
+    if (regionRaw === 'india' || regionRaw === 'all') {
+      return { lat: 12.2958, lng: 76.6394, city: 'Mysuru (National View)', state: 'Karnataka', region: regionRaw };
+    }
+    return { lat: 12.2958, lng: 76.6394, city: 'Mysuru', state: 'Karnataka', region: 'mysuru' };
+  }
+
+  app.get('/api/live-incidents', mapsLimiter, async (req, res) => {
+    try {
+      const q = req.query as Record<string, unknown>;
+      const statusParam = sanitizeBoundedString(q.status, 24).toLowerCase() || 'all';
+      const categoryParam = sanitizeBoundedString(q.category, 64) || 'all';
+      const focus = resolveFocusCoordinates(q);
+      const cacheKey = `live_incidents:feed:${focus.region}:${focus.city.toLowerCase()}:${focus.lat.toFixed(2)}:${focus.lng.toFixed(2)}:${statusParam}:${categoryParam.toLowerCase()}`;
+
+      const cached = await cacheQueue.getCachedJson<Record<string, unknown>>(cacheKey);
+      if (cached) {
+        res.setHeader('Cache-Control', 'public, max-age=20, stale-while-revalidate=40');
+        return res.json(cached);
+      }
+
+      const [alerts, allCommunityReports, sources, weather, supportHubs] = await Promise.all([
+        listLiveExternalAlerts({
+          activeOnly: statusParam === 'active',
+          region: focus.region,
+          category: categoryParam,
+          limit: 120,
+        }),
+        listSafetyReportsForPulse(80),
+        listLiveFeedSyncRuns(),
+        fetchMysuruAndCityWeather(focus.lat, focus.lng, focus.city, focus.state),
+        listSupportDirectory(),
+      ]);
+
+      const filteredAlerts =
+        statusParam === 'resolved'
+          ? alerts.filter((a) => !a.isActive || a.verificationStatus === 'Resolved Incident')
+          : alerts;
+
+      const communityReports = allCommunityReports.filter((r) => !r.isSimulated);
+      const activeAlerts = alerts.filter((a) => a.isActive && a.verificationStatus !== 'Resolved Incident');
+      const healthySourcesCount = sources.filter((s) => s.status === 'healthy').length;
+
+      const safetyGap = computeSafetyGapScore({
+        localityName: focus.city,
+        latitude: focus.lat,
+        longitude: focus.lng,
+        alerts: activeAlerts,
+        communityReports,
+        weather,
+        supportHubs,
+        sourcesAvailableCount: healthySourcesCount,
+      });
+
+      const hasActiveLocalIncidents = activeAlerts.length > 0;
+      const zeroStateMessage = hasActiveLocalIncidents
+        ? `${activeAlerts.length} active external/verified alert(s) monitored in ${focus.region.toUpperCase()}.`
+        : 'NO VERIFIED ACTIVE INCIDENTS — CONTINUOUS MONITORING ACTIVE.';
+
+      const payload = {
+        evaluatedAt: new Date().toISOString(),
+        region: focus.region,
+        hasActiveLocalIncidents,
+        zeroStateMessage,
+        alerts: filteredAlerts,
+        communityReports,
+        sources,
+        weather,
+        safetyGap,
+      };
+
+      await cacheQueue.setCachedJson(cacheKey, payload, 20);
+      res.setHeader('Cache-Control', 'public, max-age=20, stale-while-revalidate=40');
+      res.json(payload);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load live incident intelligence.' });
+    }
+  });
+
+  app.get('/api/live-incidents/sources', async (_req, res) => {
+    try {
+      const sources = await listLiveFeedSyncRuns();
+      res.json({
+        evaluatedAt: new Date().toISOString(),
+        sources,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to inspect live data sources.' });
+    }
+  });
+
+  app.get('/api/live-incidents/mysuru-intel', mapsLimiter, async (req, res) => {
+    try {
+      const q = req.query as Record<string, unknown>;
+      const focus = resolveFocusCoordinates({ ...q, region: q.region || 'mysuru' });
+      const scenarioRaw = sanitizeBoundedString(q.scenario, 40);
+      const blockedHubId = parsePositiveInt(q.blockedHubId) ?? undefined;
+
+      const [alerts, allReports, sources, weather, supportHubs] = await Promise.all([
+        listLiveExternalAlerts({ activeOnly: true, region: focus.region, limit: 80 }),
+        listSafetyReportsForPulse(60),
+        listLiveFeedSyncRuns(),
+        fetchMysuruAndCityWeather(focus.lat, focus.lng, focus.city, focus.state),
+        listSupportDirectory(),
+      ]);
+
+      const communityReports = allReports.filter((r) => !r.isSimulated);
+      const baseline = computeSafetyGapScore({
+        localityName: focus.city,
+        latitude: focus.lat,
+        longitude: focus.lng,
+        alerts,
+        communityReports,
+        weather,
+        supportHubs,
+        sourcesAvailableCount: sources.filter((s) => s.status === 'healthy').length,
+      });
+
+      const validScenarios = new Set(['hospital_offline', 'corridor_flooded', 'heatwave_peak', 'multi_locality_surge']);
+      const whatIf = validScenarios.has(scenarioRaw)
+        ? runDeterministicWhatIfScenario({
+            scenarioType: scenarioRaw as 'hospital_offline' | 'corridor_flooded' | 'heatwave_peak' | 'multi_locality_surge',
+            baseline,
+            localityName: focus.city,
+            latitude: focus.lat,
+            longitude: focus.lng,
+            alerts,
+            communityReports,
+            weather,
+            supportHubs,
+            blockedHubId,
+          })
+        : null;
+
+      res.json({
+        evaluatedAt: new Date().toISOString(),
+        focus,
+        weather,
+        safetyGap: baseline,
+        whatIf,
+        supportHubs: supportHubs.filter((h) => h.region === 'Karnataka' || h.city.toLowerCase().includes(focus.city.toLowerCase())),
+        sources,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to compute Mysuru intelligence.' });
+    }
+  });
+
+  app.post('/api/live-incidents/sync', requireAuth, requireRole(OPERATOR_ROLES), mapsLimiter, async (req: AuthRequest, res) => {
+    try {
+      const summary = await pollAllLiveSources({
+        force: true,
+        onNewAlerts: (newAlerts) => {
+          pushAndBroadcastRealtimeEvent({
+            includeOperators: true,
+            broadcastAll: true,
+            userPayload: { type: 'live_incident:sync', alerts: newAlerts },
+            operatorPayload: { type: 'live_incident:sync', alerts: newAlerts },
+          });
+        },
+      });
+
+      await writeAuditLog({
+        actorUserId: req.appUser!.id,
+        actorEmail: req.appUser!.email,
+        actorRole: req.appUser!.role,
+        action: 'LIVE_INCIDENTS_MANUAL_SYNC',
+        resourceType: 'live_external_alerts',
+        resourceId: 'all',
+        details: {
+          insertedCount: summary.insertedCount,
+          updatedCount: summary.updatedCount,
+          resolvedCount: summary.resolvedCount,
+        },
+        ipAddress: req.ip,
+      });
+
+      res.json({ summary });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Live source synchronization failed.' });
+    }
+  });
+
+  app.patch(
+    '/api/live-incidents/:id/status',
+    requireAuth,
+    requireRole(OPERATOR_ROLES),
+    async (req: AuthRequest, res) => {
+      try {
+        const alertId = parsePositiveInt(req.params.id);
+        if (!alertId) {
+          return res.status(400).json({ error: 'Valid live alert ID is required.' });
+        }
+        const body = (req.body || {}) as Record<string, unknown>;
+        const verificationStatus = sanitizeBoundedString(body.verificationStatus, 48) as LiveIncidentVerificationStatus;
+        if (!VALID_LIVE_VERIFICATION_STATUSES.has(verificationStatus)) {
+          return res.status(400).json({
+            error: 'verificationStatus must be Official Alert, Awaiting Verification, Verified Incident, or Resolved Incident.',
+          });
+        }
+        const existing = await getLiveExternalAlertById(alertId);
+        if (!existing) {
+          return res.status(404).json({ error: 'Live alert not found.' });
+        }
+
+        const instructionNote = sanitizeBoundedString(body.instructionNote, 600);
+        const updated = await updateLiveExternalAlertStatus(alertId, verificationStatus, instructionNote);
+        await cacheQueue.invalidateCachePrefix('live_incidents:');
+
+        await writeAuditLog({
+          actorUserId: req.appUser!.id,
+          actorEmail: req.appUser!.email,
+          actorRole: req.appUser!.role,
+          action: 'LIVE_INCIDENT_STATUS_UPDATED',
+          resourceType: 'live_external_alert',
+          resourceId: String(alertId),
+          details: {
+            previousStatus: existing.verificationStatus,
+            newStatus: verificationStatus,
+          },
+          ipAddress: req.ip,
+        });
+
+        if (updated) {
+          pushAndBroadcastRealtimeEvent({
+            includeOperators: true,
+            broadcastAll: true,
+            userPayload: { type: 'live_incident:status_updated', alert: updated },
+            operatorPayload: { type: 'live_incident:status_updated', alert: updated },
+          });
+        }
+
+        res.json({ alert: updated });
+      } catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to update live incident status.' });
+      }
+    }
+  );
+
+  app.post('/api/ai/analyze-live-incident', requireAuth, aiLimiter, async (req: AuthRequest, res) => {
+    try {
+      const body = (req.body || {}) as Record<string, unknown>;
+      const focus = resolveFocusCoordinates(body);
+      const whatIfQuestion = sanitizeBoundedString(body.whatIfQuestion, 400) || undefined;
+      const language = body.language === 'kn' ? 'kn' : 'en';
+
+      const [alerts, allReports, sources, weather, supportHubs] = await Promise.all([
+        listLiveExternalAlerts({ activeOnly: true, region: focus.region, limit: 60 }),
+        listSafetyReportsForPulse(40),
+        listLiveFeedSyncRuns(),
+        fetchMysuruAndCityWeather(focus.lat, focus.lng, focus.city, focus.state),
+        listSupportDirectory(),
+      ]);
+
+      const communityReports = allReports.filter((r) => !r.isSimulated);
+      const safetyGap = computeSafetyGapScore({
+        localityName: focus.city,
+        latitude: focus.lat,
+        longitude: focus.lng,
+        alerts,
+        communityReports,
+        weather,
+        supportHubs,
+        sourcesAvailableCount: sources.filter((s) => s.status === 'healthy').length,
+      });
+
+      const weatherSummary = weather.available
+        ? `${weather.city}: ${weather.temperatureC ?? '--'}°C (feels ${weather.apparentTemperatureC ?? '--'}°C), ${weather.weatherLabel}, rain ${weather.precipitationMm ?? 0} mm/h, wind ${weather.windSpeedKmh ?? 0} km/h. Forecast: ${weather.horizons.slice(0, 3).map((h) => `${h.horizonLabel} ${h.temperatureC ?? '--'}°C/${h.precipitationMm ?? 0}mm`).join(', ')}`
+        : 'Weather telemetry temporarily unreachable';
+
+      const nearestHubSummary = safetyGap.nearestSupportHub
+        ? `${safetyGap.nearestSupportHub.name} (${safetyGap.nearestSupportHub.category}, ${safetyGap.nearestSupportHub.distanceKm} km, phone ${safetyGap.nearestSupportHub.phone || '112'})`
+        : 'No directory hub in immediate dataset';
+
+      const analysis = await runLiveIncidentIntelligenceAgent({
+        localityName: focus.city,
+        region: focus.region,
+        alerts: alerts.map((a) => ({
+          sourceName: a.sourceName,
+          category: a.category,
+          severity: a.severity,
+          verificationStatus: a.verificationStatus,
+          title: a.title,
+          locationLabel: a.locationLabel,
+          firstReportedAt: a.firstReportedAt,
+          expiresAt: a.expiresAt,
+        })),
+        weatherSummary,
+        safetyGapScore: safetyGap.safetyGapScore,
+        riskBand: safetyGap.riskBand,
+        missingResources: safetyGap.missingResources,
+        nearestHubSummary,
+        whatIfQuestion,
+        language,
+      });
+
+      res.json({ analysis, safetyGap, weather });
+    } catch (err) {
+      if (err instanceof GeminiServiceError) {
+        return res.status(err.statusCode).json({ error: err.message, reason: err.reason });
+      }
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Live incident AI analysis failed.' });
+    }
+  });
+
   app.get('/api/maps/sos-clusters', mapsLimiter, async (req, res) => {
     try {
       const latRaw = req.query.lat !== undefined ? Number(req.query.lat) : undefined;
@@ -2941,8 +3302,21 @@ export async function createAppServer(options?: {
     });
   }
 
+  startLiveFeedPolling({
+    intervalMs: 180_000,
+    onNewAlerts: (newAlerts) => {
+      pushAndBroadcastRealtimeEvent({
+        includeOperators: true,
+        broadcastAll: true,
+        userPayload: { type: 'live_incident:sync', alerts: newAlerts },
+        operatorPayload: { type: 'live_incident:sync', alerts: newAlerts },
+      });
+    },
+  });
+
   const shutdown = async () => {
     isDraining = true;
+    stopLiveFeedPolling();
     clearInterval(heartbeatInterval);
     for (const c of realtimeClients) {
       try {

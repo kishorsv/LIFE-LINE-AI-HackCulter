@@ -303,7 +303,154 @@ export interface AuditLogEntry {
 
 export type AppLanguage = 'en' | 'kn';
 
-export type ActiveView = 'landing' | 'dashboard' | 'pulse' | 'map' | 'agents' | 'operator' | 'profile';
+export type ActiveView = 'landing' | 'dashboard' | 'incidents' | 'pulse' | 'map' | 'agents' | 'operator' | 'profile';
+
+export type LiveIncidentVerificationStatus =
+  | 'Official Alert'
+  | 'Awaiting Verification'
+  | 'Verified Incident'
+  | 'Resolved Incident';
+
+export type LiveAlertSeverity = 'EXTREME' | 'SEVERE' | 'MODERATE' | 'MINOR' | 'ADVISORY';
+
+export type LiveAlertCategory =
+  | 'Cyclone'
+  | 'Flooding'
+  | 'Heavy Rainfall'
+  | 'Thunderstorm & Lightning'
+  | 'Heatwave'
+  | 'Fire'
+  | 'Earthquake'
+  | 'Road Disruption'
+  | 'Water Supply Emergency'
+  | 'Other Verified Emergency';
+
+export interface LiveExternalAlert {
+  id: number;
+  externalKey: string;
+  sourceId: string;
+  sourceName: string;
+  sourceUrl: string;
+  category: LiveAlertCategory | string;
+  title: string;
+  description: string;
+  instruction: string;
+  severity: LiveAlertSeverity;
+  severityColor: string;
+  certainty: string;
+  verificationStatus: LiveIncidentVerificationStatus;
+  signalType: 'official_alert' | 'observation' | 'forecast' | 'community_report';
+  locationLabel: string;
+  stateName: string;
+  districtName: string;
+  latitude: number | null;
+  longitude: number | null;
+  areaCoveredSqKm: number | null;
+  language: string;
+  firstReportedAt: string;
+  effectiveFrom: string | null;
+  expiresAt: string | null;
+  lastUpdatedAt: string;
+  isActive: boolean;
+}
+
+export interface LiveFeedSyncRun {
+  sourceId: string;
+  sourceName: string;
+  sourceKind: 'official_cap' | 'meteorology' | 'geophysical' | 'satellite_fire';
+  endpointUrl: string;
+  status: 'healthy' | 'degraded' | 'offline' | 'unconfigured';
+  pollIntervalSeconds: number;
+  lastAttemptAt: string | null;
+  lastSuccessAt: string | null;
+  lastError: string;
+  recordsFetched: number;
+  recordsActive: number;
+  latencyMs: number;
+  isStale: boolean;
+}
+
+export interface LiveWeatherForecastPoint {
+  timeIso: string;
+  horizonLabel: string;
+  temperatureC: number | null;
+  apparentTemperatureC: number | null;
+  precipitationMm: number | null;
+  precipitationProbability: number | null;
+  windSpeedKmh: number | null;
+  weatherCode: number | null;
+  weatherLabel: string;
+}
+
+export interface MysuruWeatherIntel {
+  available: boolean;
+  city: string;
+  state: string;
+  latitude: number;
+  longitude: number;
+  source: string;
+  retrievedAt: string;
+  temperatureC: number | null;
+  apparentTemperatureC: number | null;
+  humidityPercent: number | null;
+  precipitationMm: number | null;
+  rainMm: number | null;
+  windSpeedKmh: number | null;
+  weatherCode: number | null;
+  weatherLabel: string;
+  visibilityMeters: number | null;
+  isDay: boolean | null;
+  reason?: string;
+  horizons: LiveWeatherForecastPoint[];
+}
+
+export interface SafetyGapBreakdown {
+  localityName: string;
+  latitude: number;
+  longitude: number;
+  evaluatedAt: string;
+  safetyGapScore: number;
+  riskBand: 'LOW' | 'MODERATE' | 'HIGH' | 'CRITICAL' | 'INSUFFICIENT_DATA';
+  isInformationalOnly: true;
+  disclaimer: string;
+  components: {
+    hazardSeverityH: number;
+    vulnerabilityExposureV: number;
+    accessibilityGapA: number;
+    resourceGapR: number;
+    dataFreshnessC: number;
+  };
+  missingResources: string[];
+  estimatedMinutesToNearestHub: number | null;
+  nearestSupportHub: {
+    id: number;
+    name: string;
+    category: string;
+    distanceKm: number;
+    phone: string;
+    is24Hours: boolean;
+    capacityNote: string;
+  } | null;
+  recommendedPreventiveActions: string[];
+  evidenceSources: Array<{
+    label: string;
+    signalKind: 'observation' | 'official_alert' | 'forecast' | 'community_report';
+    timestamp: string;
+    detail: string;
+  }>;
+}
+
+export interface LiveIncidentsFeedResponse {
+  evaluatedAt: string;
+  region: string;
+  hasActiveLocalIncidents: boolean;
+  zeroStateMessage: string;
+  alerts: LiveExternalAlert[];
+  communityReports: SafetyReportItem[];
+  sources: LiveFeedSyncRun[];
+  weather: MysuruWeatherIntel;
+  safetyGap: SafetyGapBreakdown;
+}
 
 export interface WorkspaceConfirmPayload {
   actionType: 'gmail_send' | 'calendar_checkin' | 'sheets_export' | 'docs_safety_plan' | 'drive_backup' | 'tasks_create';

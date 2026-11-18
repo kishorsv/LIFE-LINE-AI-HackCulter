@@ -468,10 +468,68 @@ export function runSqliteMigrations(): string {
     });
   }
 
+  if (!applied.has('v6_live_incident_intelligence')) {
+    runSqliteTransaction(() => {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS live_external_alerts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          external_key TEXT NOT NULL UNIQUE,
+          source_id TEXT NOT NULL,
+          source_name TEXT NOT NULL,
+          source_url TEXT NOT NULL DEFAULT '',
+          category TEXT NOT NULL,
+          title TEXT NOT NULL,
+          description TEXT NOT NULL DEFAULT '',
+          instruction TEXT NOT NULL DEFAULT '',
+          severity TEXT NOT NULL DEFAULT 'MODERATE',
+          severity_color TEXT NOT NULL DEFAULT 'amber',
+          certainty TEXT NOT NULL DEFAULT 'Observed',
+          verification_status TEXT NOT NULL DEFAULT 'Official Alert',
+          signal_type TEXT NOT NULL DEFAULT 'official_alert',
+          location_label TEXT NOT NULL,
+          state_name TEXT NOT NULL DEFAULT '',
+          district_name TEXT NOT NULL DEFAULT '',
+          latitude REAL,
+          longitude REAL,
+          area_covered_sq_km REAL,
+          language TEXT NOT NULL DEFAULT 'en',
+          first_reported_at TEXT NOT NULL DEFAULT (datetime('now')),
+          effective_from TEXT,
+          expires_at TEXT,
+          last_updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          is_active INTEGER NOT NULL DEFAULT 1,
+          raw_payload TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS live_alerts_active_updated_idx ON live_external_alerts(is_active, last_updated_at DESC);
+        CREATE INDEX IF NOT EXISTS live_alerts_state_district_idx ON live_external_alerts(state_name, district_name);
+        CREATE INDEX IF NOT EXISTS live_alerts_source_idx ON live_external_alerts(source_id, is_active);
+
+        CREATE TABLE IF NOT EXISTS live_feed_sync_runs (
+          source_id TEXT PRIMARY KEY,
+          source_name TEXT NOT NULL,
+          source_kind TEXT NOT NULL DEFAULT 'official_cap',
+          endpoint_url TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'offline',
+          poll_interval_seconds INTEGER NOT NULL DEFAULT 180,
+          last_attempt_at TEXT,
+          last_success_at TEXT,
+          last_error TEXT NOT NULL DEFAULT '',
+          records_fetched INTEGER NOT NULL DEFAULT 0,
+          records_active INTEGER NOT NULL DEFAULT 0,
+          latency_ms INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+      sqlite.prepare("INSERT OR IGNORE INTO schema_migrations (version) VALUES ('v6_live_incident_intelligence')").run();
+    });
+  }
+
   const latest = sqlite
     .prepare('SELECT version FROM schema_migrations ORDER BY applied_at DESC, version DESC LIMIT 1')
     .get() as { version: string } | undefined;
-  return latest?.version || 'v5_scalability_indexes';
+  return latest?.version || 'v6_live_incident_intelligence';
 }
 
 export function seedSqliteInitialData() {
@@ -613,6 +671,115 @@ export function seedSqliteInitialData() {
           org.hours,
           org.is24,
           org.note
+        );
+      }
+    });
+  }
+
+  const kaCount = sqlite
+    .prepare("SELECT COUNT(*) as cnt FROM support_locations WHERE region = 'Karnataka'")
+    .get() as { cnt: number };
+  if (kaCount.cnt === 0) {
+    runSqliteTransaction(() => {
+      const insertOrg = sqlite.prepare(`
+        INSERT INTO support_organizations (name, category, phone, website, email, verification_status, source, is_sample_data)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+      `);
+      const insertLoc = sqlite.prepare(`
+        INSERT INTO support_locations (organization_id, address, city, region, latitude, longitude, operating_hours, is_24_hours, availability_note)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      const mysuruRefs = [
+        {
+          name: 'Karnataka ERSS 112 & Mysuru City Police Control Room',
+          category: 'Government Helpline',
+          phone: '112 / 0821-2418139',
+          website: 'https://ksp.karnataka.gov.in',
+          email: '',
+          verificationStatus: 'Public Government Reference',
+          source: 'Karnataka State Police / ERSS 112 Public Directory',
+          address: 'Nazarbad / Irwin Road Police Command Area, Mysuru, Karnataka 570001',
+          city: 'Mysuru',
+          region: 'Karnataka',
+          lat: 12.3106,
+          lng: 76.6634,
+          hours: '24/7 Emergency Response Helpline',
+          is24: 1,
+          note: 'Official India-wide emergency number 112. Live unit dispatch is handled solely by official police control room.',
+        },
+        {
+          name: 'K.R. Hospital (Mysore Medical College & Research Institute)',
+          category: 'Hospital',
+          phone: '0821-2520512 / 108',
+          website: 'https://mmcri.karnataka.gov.in',
+          email: '',
+          verificationStatus: 'Public Government Reference',
+          source: 'Government of Karnataka Health Directory',
+          address: 'Irwin Road, Lashkar Mohalla, Mysuru, Karnataka 570001',
+          city: 'Mysuru',
+          region: 'Karnataka',
+          lat: 12.3137,
+          lng: 76.6524,
+          hours: '24/7 Public Emergency & Casualty',
+          is24: 1,
+          note: 'Capacity and bed availability are NOT auto-verified here — call 108 or hospital desk to confirm.',
+        },
+        {
+          name: 'JSS Hospital Mysuru Emergency & Trauma Centre',
+          category: 'Hospital',
+          phone: '0821-2335555',
+          website: 'https://jsshospital.in',
+          email: '',
+          verificationStatus: 'Public Medical Reference',
+          source: 'Public Hospital Directory (Mysuru)',
+          address: 'Mahatma Gandhi Road, Agrahara, Mysuru, Karnataka 570004',
+          city: 'Mysuru',
+          region: 'Karnataka',
+          lat: 12.2974,
+          lng: 76.6531,
+          hours: '24/7 Emergency & Trauma',
+          is24: 1,
+          note: 'Confirm live emergency bed & specialist availability by phone prior to transit.',
+        },
+        {
+          name: 'Karnataka Women Helpline 181 & Mysuru Sakhi One Stop Centre',
+          category: 'Womens Support',
+          phone: '181 / 1091',
+          website: 'https://dwcd.karnataka.gov.in',
+          email: '',
+          verificationStatus: 'Public Government Reference',
+          source: 'Dept. of Women & Child Development Karnataka',
+          address: 'K.R. Hospital Campus / Nazarbad, Mysuru, Karnataka 570010',
+          city: 'Mysuru',
+          region: 'Karnataka',
+          lat: 12.3095,
+          lng: 76.6542,
+          hours: '24/7 Toll-Free Women Crisis Support',
+          is24: 1,
+          note: 'Toll-free women safety helpline 181 (Karnataka) and national child helpline 1098.',
+        },
+      ];
+      for (const ref of mysuruRefs) {
+        const res = insertOrg.run(
+          ref.name,
+          ref.category,
+          ref.phone,
+          ref.website,
+          ref.email,
+          ref.verificationStatus,
+          ref.source
+        );
+        const orgId = Number(res.lastInsertRowid);
+        insertLoc.run(
+          orgId,
+          ref.address,
+          ref.city,
+          ref.region,
+          ref.lat,
+          ref.lng,
+          ref.hours,
+          ref.is24,
+          ref.note
         );
       }
     });
