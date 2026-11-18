@@ -1,28 +1,59 @@
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { promisify } from 'node:util';
 
 const pbkdf2Async = promisify(crypto.pbkdf2);
 
-const resolvedDbPath = process.env.LIFELINE_DB_PATH
-  ? path.resolve(process.env.LIFELINE_DB_PATH)
-  : path.resolve(process.cwd(), '.data', 'lifeline.db');
-
-const dbDir = path.dirname(resolvedDbPath);
-if (!fs.existsSync(dbDir)) {
-  fs.mkdirSync(dbDir, { recursive: true });
+export function resolveWritableSqlitePath(env: NodeJS.ProcessEnv = process.env): string {
+  if (env.LIFELINE_DB_PATH) {
+    return path.resolve(env.LIFELINE_DB_PATH);
+  }
+  if (env.VERCEL || env.AWS_LAMBDA_FUNCTION_NAME) {
+    return path.join(os.tmpdir(), '.data', 'lifeline.db');
+  }
+  const preferredDir = path.resolve(process.cwd(), '.data');
+  try {
+    if (!fs.existsSync(preferredDir)) {
+      fs.mkdirSync(preferredDir, { recursive: true });
+    }
+    fs.accessSync(preferredDir, fs.constants.W_OK);
+    return path.join(preferredDir, 'lifeline.db');
+  } catch {
+    return path.join(os.tmpdir(), '.data', 'lifeline.db');
+  }
 }
 
-const sqlite = new DatabaseSync(resolvedDbPath);
-sqlite.exec('PRAGMA foreign_keys = ON;');
-sqlite.exec('PRAGMA journal_mode = WAL;');
-sqlite.exec('PRAGMA synchronous = NORMAL;');
-sqlite.exec('PRAGMA busy_timeout = 5000;');
-sqlite.exec('PRAGMA cache_size = -16000;');
-sqlite.exec('PRAGMA temp_store = MEMORY;');
-sqlite.exec('PRAGMA mmap_size = 67108864;');
+const resolvedDbPath = resolveWritableSqlitePath();
+let _sqliteInstance: DatabaseSync | null = null;
+
+function getSqlite(): DatabaseSync {
+  if (_sqliteInstance) return _sqliteInstance;
+  const dbDir = path.dirname(resolvedDbPath);
+  if (!fs.existsSync(dbDir)) {
+    fs.mkdirSync(dbDir, { recursive: true });
+  }
+  const instance = new DatabaseSync(resolvedDbPath);
+  instance.exec('PRAGMA foreign_keys = ON;');
+  instance.exec('PRAGMA journal_mode = WAL;');
+  instance.exec('PRAGMA synchronous = NORMAL;');
+  instance.exec('PRAGMA busy_timeout = 5000;');
+  instance.exec('PRAGMA cache_size = -16000;');
+  instance.exec('PRAGMA temp_store = MEMORY;');
+  instance.exec('PRAGMA mmap_size = 67108864;');
+  _sqliteInstance = instance;
+  return _sqliteInstance;
+}
+
+const sqlite = new Proxy({} as DatabaseSync, {
+  get(_target, prop) {
+    const instance = getSqlite() as unknown as Record<PropertyKey, unknown>;
+    const value = Reflect.get(instance, prop, instance);
+    return typeof value === 'function' ? value.bind(instance) : value;
+  },
+});
 
 export function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16).toString('hex');
@@ -881,7 +912,4 @@ export function seedSqliteInitialData() {
   }
 }
 
-runSqliteMigrations();
-seedSqliteInitialData();
-
-export { sqlite, resolvedDbPath };
+export { sqlite, resolvedDbPath, getSqlite };

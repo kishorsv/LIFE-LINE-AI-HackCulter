@@ -7,7 +7,6 @@ import compression from 'compression';
 import express from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
-import { createServer as createViteServer } from 'vite';
 import { closePool, getPoolStats } from './src/db/index.ts';
 import {
   addTrustedContact,
@@ -171,6 +170,20 @@ function getPublicClientMapsApiKey(): string {
   return '';
 }
 
+function getConfiguredAppUrl(): string {
+  const direct = (process.env.APP_URL || '').trim();
+  if (direct && direct !== 'MY_APP_URL') {
+    return direct.replace(/\/+$/, '');
+  }
+  if (process.env.VERCEL_PROJECT_PRODUCTION_URL) {
+    return `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL.trim()}`.replace(/\/+$/, '');
+  }
+  if (process.env.VERCEL_URL) {
+    return `https://${process.env.VERCEL_URL.trim()}`.replace(/\/+$/, '');
+  }
+  return '';
+}
+
 function isDemoLoginAllowed(): boolean {
   return process.env.NODE_ENV !== 'production' || process.env.ALLOW_DEMO_LOGIN === 'true';
 }
@@ -188,8 +201,11 @@ function extractWsToken(req: http.IncomingMessage): string {
 
 export async function createAppServer(options?: {
   enableVite?: boolean;
+  serverless?: boolean;
   firebaseVerifier?: FirebaseTokenVerifier;
 }) {
+  const isServerless = Boolean(options?.serverless || process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+
   // Initialize authoritative DB first, then resolve or provision shared CSPRNG SESSION_SECRET
   await initializeDatabase();
   await initializeRuntimeSessionSecret(getOrInitSharedRuntimeSessionSecret);
@@ -251,12 +267,15 @@ export async function createAppServer(options?: {
 
   const allowedOrigins = new Set(
     [
-      process.env.APP_URL || '',
+      getConfiguredAppUrl(),
+      process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '',
+      process.env.VERCEL_BRANCH_URL ? `https://${process.env.VERCEL_BRANCH_URL}` : '',
+      process.env.VERCEL_PROJECT_PRODUCTION_URL ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}` : '',
       ...(process.env.CORS_ALLOWED_ORIGINS || '').split(','),
       ...(process.env.NODE_ENV !== 'production' ? ['http://localhost:3000', 'http://127.0.0.1:3000'] : []),
     ]
       .map((s) => s.trim().replace(/\/+$/, ''))
-      .filter(Boolean)
+      .filter((s) => Boolean(s && s !== 'MY_APP_URL'))
   );
 
   app.use((req, res, next) => {
@@ -468,6 +487,7 @@ export async function createAppServer(options?: {
       status: dbHealth.ok ? 'ok' : 'degraded',
       service: 'LIFE-LINE AI',
       timestamp: new Date().toISOString(),
+      realtimeTransport: isServerless ? 'polling' : 'websocket',
       database: dbHealth,
       redisActive: cacheQueue.isRedisActive(),
       aiConfigured: isGeminiConfigured(),
@@ -514,7 +534,8 @@ export async function createAppServer(options?: {
     res.setHeader('Cache-Control', 'public, max-age=300, stale-while-revalidate=600');
     res.json({
       mapsApiKey: getPublicClientMapsApiKey(),
-      appUrl: process.env.APP_URL || '',
+      appUrl: getConfiguredAppUrl(),
+      realtimeTransport: isServerless ? 'polling' : 'websocket',
       demoSandboxEnabled: isDemoLoginAllowed(),
       developerContactEmail: (process.env.DEVELOPER_CONTACT_EMAIL || '').trim(),
       googleAuth: {
@@ -1653,8 +1674,28 @@ export async function createAppServer(options?: {
           error: { status: 'RESOURCE_EXHAUSTED', message: data.error_message || 'Geocoding quota exceeded.' },
         });
       }
+      if (data.status === 'REQUEST_DENIED') {
+        return res.status(403).json({
+          error:
+            data.error_message ||
+            'Geocoding request denied. Verify Geocoding API is enabled and the server key has no conflicting HTTP referrer restriction.',
+          status: data.status,
+        });
+      }
+      if (data.status === 'INVALID_REQUEST') {
+        return res.status(400).json({
+          error: data.error_message || 'Invalid geocoding request.',
+          status: data.status,
+        });
+      }
+      if (data.status === 'UNKNOWN_ERROR') {
+        return res.status(502).json({
+          error: data.error_message || 'Geocoding upstream service temporarily unavailable.',
+          status: data.status,
+        });
+      }
       if (!resp.ok) {
-        return res.status(502).json({ error: 'Geocoding upstream service error.' });
+        return res.status(502).json({ error: data.error_message || 'Geocoding upstream service error.' });
       }
       res.json({ status: data.status, results: data.results || [] });
     } catch (err) {
@@ -1841,6 +1882,39 @@ export async function createAppServer(options?: {
     return { lat: 12.2958, lng: 76.6394, city: 'Mysuru', state: 'Karnataka', region: 'mysuru' };
   }
 
+  let inFlightColdSync: Promise<void> | null = null;
+  async function ensureFreshLiveFeedData() {
+    if (process.env.NODE_ENV === 'test' || process.env.LIFELINE_DISABLE_AUTO_POLL === 'true') {
+      return;
+    }
+    try {
+      const existingSources = await listLiveFeedSyncRuns();
+      const newestAttemptMs = existingSources.reduce((max, s) => {
+        const ts = s.lastAttemptAt ? Date.parse(s.lastAttemptAt) : 0;
+        return Number.isFinite(ts) && ts > max ? ts : max;
+      }, 0);
+      if (existingSources.length > 0 && Date.now() - newestAttemptMs <= 180_000) {
+        return;
+      }
+      if (!inFlightColdSync) {
+        inFlightColdSync = pollAllLiveSources({ minIntervalMs: 120_000 })
+          .then(() => undefined)
+          .catch((err) => {
+            console.warn('[live-poller] On-demand live feed sync failed:', err instanceof Error ? err.message : err);
+          })
+          .finally(() => {
+            inFlightColdSync = null;
+          });
+      }
+      await Promise.race([
+        inFlightColdSync,
+        new Promise<void>((resolve) => setTimeout(resolve, 6000)),
+      ]);
+    } catch {
+      // Never block request if upstream feed sync errors
+    }
+  }
+
   app.get('/api/live-incidents', mapsLimiter, async (req, res) => {
     try {
       const q = req.query as Record<string, unknown>;
@@ -1854,6 +1928,8 @@ export async function createAppServer(options?: {
         res.setHeader('Cache-Control', 'public, max-age=20, stale-while-revalidate=40');
         return res.json(cached);
       }
+
+      await ensureFreshLiveFeedData();
 
       const [alerts, allCommunityReports, sources, weather, supportHubs] = await Promise.all([
         listLiveExternalAlerts({
@@ -1931,6 +2007,8 @@ export async function createAppServer(options?: {
       const focus = resolveFocusCoordinates({ ...q, region: q.region || 'mysuru' });
       const scenarioRaw = sanitizeBoundedString(q.scenario, 40);
       const blockedHubId = parsePositiveInt(q.blockedHubId) ?? undefined;
+
+      await ensureFreshLiveFeedData();
 
       const [alerts, allReports, sources, weather, supportHubs] = await Promise.all([
         listLiveExternalAlerts({ activeOnly: true, region: focus.region, limit: 80 }),
@@ -3220,50 +3298,59 @@ export async function createAppServer(options?: {
     });
   });
 
-  const heartbeatInterval = setInterval(() => {
-    for (const client of realtimeClients) {
-      if (!client.isAlive) {
-        realtimeClients.delete(client);
-        client.ws.terminate();
-        continue;
-      }
-      client.isAlive = false;
-      if (client.ws.readyState === WebSocket.OPEN) {
-        client.ws.ping();
-      }
-    }
-    for (const client of liveClients) {
-      if (!client.isAlive) {
-        liveClients.delete(client);
-        client.ws.terminate();
-        continue;
-      }
-      client.isAlive = false;
-      if (client.ws.readyState === WebSocket.OPEN) {
-        client.ws.ping();
-      }
-    }
-  }, WS_HEARTBEAT_INTERVAL_MS);
+  const heartbeatInterval = isServerless
+    ? null
+    : setInterval(() => {
+        for (const client of realtimeClients) {
+          if (!client.isAlive) {
+            realtimeClients.delete(client);
+            client.ws.terminate();
+            continue;
+          }
+          client.isAlive = false;
+          if (client.ws.readyState === WebSocket.OPEN) {
+            client.ws.ping();
+          }
+        }
+        for (const client of liveClients) {
+          if (!client.isAlive) {
+            liveClients.delete(client);
+            client.ws.terminate();
+            continue;
+          }
+          client.isAlive = false;
+          if (client.ws.readyState === WebSocket.OPEN) {
+            client.ws.ping();
+          }
+        }
+      }, WS_HEARTBEAT_INTERVAL_MS);
 
-  httpServer.on('upgrade', (request, socket, head) => {
-    const pathname = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`).pathname;
-    if (pathname === '/ws/realtime') {
-      wssRealtime.handleUpgrade(request, socket, head, (ws) => {
-        wssRealtime.emit('connection', ws, request);
-      });
-    } else if (pathname === '/ws/live') {
-      wssLive.handleUpgrade(request, socket, head, (ws) => {
-        wssLive.emit('connection', ws, request);
-      });
-    } else {
-      socket.destroy();
-    }
-  });
+  if (!isServerless) {
+    httpServer.on('upgrade', (request, socket, head) => {
+      const pathname = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`).pathname;
+      if (pathname === '/ws/realtime') {
+        wssRealtime.handleUpgrade(request, socket, head, (ws) => {
+          wssRealtime.emit('connection', ws, request);
+        });
+      } else if (pathname === '/ws/live') {
+        wssLive.handleUpgrade(request, socket, head, (ws) => {
+          wssLive.emit('connection', ws, request);
+        });
+      } else {
+        socket.destroy();
+      }
+    });
+  }
 
-  const enableVite = options?.enableVite ?? process.env.NODE_ENV !== 'production';
-  let viteServer: Awaited<ReturnType<typeof createViteServer>> | null = null;
+  const enableVite = options?.enableVite ?? (!isServerless && process.env.NODE_ENV !== 'production');
+  let viteServer: {
+    transformRequest: (url: string) => Promise<{ code: string } | null>;
+    middlewares: express.RequestHandler;
+    close: () => Promise<void>;
+  } | null = null;
 
   if (enableVite) {
+    const { createServer: createViteServer } = await import('vite');
     viteServer = await createViteServer({
       server: { middlewareMode: true, hmr: false, ws: false },
       appType: 'spa',
@@ -3286,7 +3373,7 @@ export async function createAppServer(options?: {
     });
 
     app.use(viteServer.middlewares);
-  } else if (process.env.NODE_ENV === 'production') {
+  } else if (!isServerless && process.env.NODE_ENV === 'production') {
     const distDir = path.resolve(process.cwd(), 'dist');
     app.use(
       '/assets',
@@ -3302,22 +3389,26 @@ export async function createAppServer(options?: {
     });
   }
 
-  startLiveFeedPolling({
-    intervalMs: 180_000,
-    onNewAlerts: (newAlerts) => {
-      pushAndBroadcastRealtimeEvent({
-        includeOperators: true,
-        broadcastAll: true,
-        userPayload: { type: 'live_incident:sync', alerts: newAlerts },
-        operatorPayload: { type: 'live_incident:sync', alerts: newAlerts },
-      });
-    },
-  });
+  if (!isServerless) {
+    startLiveFeedPolling({
+      intervalMs: 180_000,
+      onNewAlerts: (newAlerts) => {
+        pushAndBroadcastRealtimeEvent({
+          includeOperators: true,
+          broadcastAll: true,
+          userPayload: { type: 'live_incident:sync', alerts: newAlerts },
+          operatorPayload: { type: 'live_incident:sync', alerts: newAlerts },
+        });
+      },
+    });
+  }
 
   const shutdown = async () => {
     isDraining = true;
     stopLiveFeedPolling();
-    clearInterval(heartbeatInterval);
+    if (heartbeatInterval) {
+      clearInterval(heartbeatInterval);
+    }
     for (const c of realtimeClients) {
       try {
         c.ws.close(1012, 'Server restarting');

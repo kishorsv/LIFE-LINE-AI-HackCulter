@@ -1027,14 +1027,53 @@ export async function synthesizeSafetyGuidanceSpeech(
       'Calm Voice TTS'
     );
 
-    const base64Audio = resp.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    const inlinePart = resp.candidates?.[0]?.content?.parts?.[0]?.inlineData;
+    const base64Audio = inlinePart?.data;
     if (!base64Audio) {
       throw new GeminiServiceError('Speech synthesis returned no audio data.', 502, 'malformed_response');
     }
+
+    const rawMime = (inlinePart?.mimeType || '').toLowerCase();
+    const audioBuf = Buffer.from(base64Audio, 'base64');
+    const isAlreadyContainer =
+      rawMime.includes('wav') ||
+      rawMime.includes('mpeg') ||
+      rawMime.includes('mp3') ||
+      rawMime.includes('ogg') ||
+      (audioBuf.length >= 4 && audioBuf.subarray(0, 4).toString('ascii') === 'RIFF');
+
+    let finalMime = inlinePart?.mimeType || 'audio/wav';
+    let finalBase64 = base64Audio;
+
+    if (!isAlreadyContainer) {
+      const rateMatch = /rate=(\d+)/i.exec(rawMime);
+      const sampleRate = rateMatch ? Number(rateMatch[1]) : 24000;
+      const numChannels = 1;
+      const bitsPerSample = 16;
+      const byteRate = (sampleRate * numChannels * bitsPerSample) / 8;
+      const blockAlign = (numChannels * bitsPerSample) / 8;
+      const wavHeader = Buffer.alloc(44);
+      wavHeader.write('RIFF', 0);
+      wavHeader.writeUInt32LE(36 + audioBuf.length, 4);
+      wavHeader.write('WAVE', 8);
+      wavHeader.write('fmt ', 12);
+      wavHeader.writeUInt32LE(16, 16);
+      wavHeader.writeUInt16LE(1, 20);
+      wavHeader.writeUInt16LE(numChannels, 22);
+      wavHeader.writeUInt32LE(sampleRate, 24);
+      wavHeader.writeUInt32LE(byteRate, 28);
+      wavHeader.writeUInt16LE(blockAlign, 32);
+      wavHeader.writeUInt16LE(bitsPerSample, 34);
+      wavHeader.write('data', 36);
+      wavHeader.writeUInt32LE(audioBuf.length, 40);
+      finalMime = 'audio/wav';
+      finalBase64 = Buffer.concat([wavHeader, audioBuf]).toString('base64');
+    }
+
     return {
       modelUsed: GEMINI_MODELS.tts,
-      mimeType: 'audio/wav',
-      audioBase64: base64Audio,
+      mimeType: finalMime,
+      audioBase64: finalBase64,
     };
   } catch (err) {
     if (err instanceof GeminiServiceError) throw err;

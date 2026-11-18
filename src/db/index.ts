@@ -11,7 +11,21 @@ declare global {
 
 const TRANSIENT_PG_CODES = new Set(['57P01', '57P02', '57P03', '40001', '40P01', 'ECONNRESET', 'ETIMEDOUT']);
 
+export function getPostgresConnectionString(env: NodeJS.ProcessEnv = process.env): string {
+  const candidates = [env.DATABASE_URL, env.POSTGRES_URL, env.POSTGRES_PRISMA_URL];
+  for (const val of candidates) {
+    const trimmed = (val || '').trim();
+    if (trimmed && !trimmed.includes('MY_SQL_PASSWORD')) {
+      return trimmed;
+    }
+  }
+  return '';
+}
+
 export function hasPostgresConfig(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (getPostgresConnectionString(env)) {
+    return true;
+  }
   return Boolean(
     env.SQL_HOST &&
       env.SQL_DB_NAME &&
@@ -69,26 +83,49 @@ export function resolvePostgresHost(
   return trimmed;
 }
 
-const PG_POOL_MAX = Math.min(100, Math.max(5, Number(process.env.PG_POOL_MAX || 15)));
+const isServerlessRuntime = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+const PG_POOL_MAX = Math.min(100, Math.max(2, Number(process.env.PG_POOL_MAX || (isServerlessRuntime ? 5 : 15))));
 const DB_STATEMENT_TIMEOUT_MS = Math.min(30_000, Math.max(1000, Number(process.env.DB_STATEMENT_TIMEOUT_MS || 8000)));
 
 let activePoolHost: string | undefined;
 
+function resolveSslOption(connectionString: string, host?: string): false | { rejectUnauthorized: false } | undefined {
+  if (process.env.DB_SSL === 'false') return false;
+  if (process.env.DB_SSL === 'true') return { rejectUnauthorized: false };
+  if (connectionString) {
+    if (/sslmode=disable/i.test(connectionString)) return false;
+    if (/@(localhost|127\.0\.0\.1)(:|\/)/i.test(connectionString)) return undefined;
+    return { rejectUnauthorized: false };
+  }
+  if (host && !host.startsWith('/') && host !== 'localhost' && host !== '127.0.0.1') {
+    return { rejectUnauthorized: false };
+  }
+  return undefined;
+}
+
 export const createPool = () => {
   if (!global._postgresPool) {
-    activePoolHost = resolvePostgresHost(process.env.SQL_HOST);
+    const connectionString = getPostgresConnectionString();
+    activePoolHost = connectionString ? undefined : resolvePostgresHost(process.env.SQL_HOST);
+    const ssl = resolveSslOption(connectionString, activePoolHost);
+
     global._postgresPool = new Pool({
-      host: activePoolHost,
-      user: process.env.SQL_USER,
-      password: process.env.SQL_PASSWORD,
-      database: process.env.SQL_DB_NAME,
+      ...(connectionString
+        ? { connectionString }
+        : {
+            host: activePoolHost,
+            user: process.env.SQL_USER,
+            password: process.env.SQL_PASSWORD,
+            database: process.env.SQL_DB_NAME,
+          }),
+      ...(ssl !== undefined ? { ssl } : {}),
       max: PG_POOL_MAX,
       min: 0,
-      idleTimeoutMillis: 30_000,
+      idleTimeoutMillis: isServerlessRuntime ? 10_000 : 30_000,
       connectionTimeoutMillis: 15_000,
       statement_timeout: DB_STATEMENT_TIMEOUT_MS,
       query_timeout: DB_STATEMENT_TIMEOUT_MS + 2000,
-      allowExitOnIdle: false,
+      allowExitOnIdle: isServerlessRuntime,
     });
 
     global._postgresPool.on('error', (err) => {
@@ -102,6 +139,9 @@ export let pool = createPool();
 export let db = drizzle(pool, { schema });
 
 export function refreshPostgresPoolHost(): boolean {
+  if (getPostgresConnectionString()) {
+    return false;
+  }
   const nextHost = resolvePostgresHost(process.env.SQL_HOST);
   if (!nextHost || nextHost === activePoolHost) {
     return false;

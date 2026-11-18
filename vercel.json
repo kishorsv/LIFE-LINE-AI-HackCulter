@@ -1,0 +1,23 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "vite",
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "functions": {
+    "api/index.ts": {
+      "maxDuration": 30,
+      "memory": 1024,
+      "includeFiles": "firebase-applet-config.json"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api"
+    },
+    {
+      "source": "/((?!api/|assets/|sw\\.js|workbox-.*|manifest\\.webmanifest|favicon.*|pwa-.*|icon\\.svg|apple-touch-icon\\.png).*)",
+      "destination": "/index.html"
+    }
+  ]
+}
