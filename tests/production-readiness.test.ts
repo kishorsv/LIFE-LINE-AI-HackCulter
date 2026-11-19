@@ -391,4 +391,76 @@ describe('Production Readiness & Scalability Hardening', () => {
     assert.equal(data.pagination.limit, 2);
     assert.ok(data.pagination.total >= data.users.length);
   });
+
+  it('recognizes DATABASE_URL / POSTGRES_URL and resolves os.tmpdir() SQLite path on Vercel', async () => {
+    const dbMod = await import('../src/db/index.ts');
+    const localStoreMod = await import('../src/db/local-store.ts');
+
+    assert.equal(
+      dbMod.hasPostgresConfig({ DATABASE_URL: 'postgresql://user:pass@ep-cool-rain.us-east-2.aws.neon.tech/neondb?sslmode=require' }),
+      true
+    );
+    assert.equal(
+      dbMod.hasPostgresConfig({ POSTGRES_URL: 'postgres://user:pass@db.vercel-storage.com:5432/verceldb' }),
+      true
+    );
+    assert.equal(dbMod.hasPostgresConfig({}), false);
+
+    const vercelSqlitePath = localStoreMod.resolveWritableSqlitePath({ VERCEL: '1' });
+    assert.ok(vercelSqlitePath.startsWith(os.tmpdir()));
+    assert.ok(vercelSqlitePath.endsWith(path.join('.data', 'lifeline.db')));
+  });
+
+  it('serves /api/health, /api/config/public (realtimeTransport=polling), and /api/live-incidents through Vercel /api/index.ts handler', async () => {
+    const http = await import('node:http');
+    const prevVercel = process.env.VERCEL;
+    const prevProdUrl = process.env.VERCEL_PROJECT_PRODUCTION_URL;
+    const prevAppUrl = process.env.APP_URL;
+    process.env.VERCEL = '1';
+    process.env.VERCEL_PROJECT_PRODUCTION_URL = 'life-line-ai-hack-culter-eight.vercel.app';
+    delete process.env.APP_URL;
+
+    const { default: vercelHandler } = await import('../api/index.ts');
+    const server = http.createServer((req, res) => {
+      void vercelHandler(req, res);
+    });
+
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', () => resolve());
+    });
+
+    try {
+      const addr = server.address();
+      assert.ok(addr && typeof addr === 'object');
+      const base = `http://127.0.0.1:${addr.port}`;
+
+      const healthResp = await fetch(`${base}/api/health`);
+      assert.equal(healthResp.status, 200);
+      const healthBody = (await healthResp.json()) as { status: string; realtimeTransport: string };
+      assert.equal(healthBody.status, 'ok');
+      assert.equal(healthBody.realtimeTransport, 'polling');
+
+      const cfgResp = await fetch(`${base}/api/config/public`);
+      assert.equal(cfgResp.status, 200);
+      const cfgBody = (await cfgResp.json()) as { realtimeTransport: string; appUrl: string };
+      assert.equal(cfgBody.realtimeTransport, 'polling');
+      assert.equal(cfgBody.appUrl, 'https://life-line-ai-hack-culter-eight.vercel.app');
+
+      const liveResp = await fetch(`${base}/api/live-incidents?region=mysuru`);
+      assert.equal(liveResp.status, 200);
+      const liveBody = (await liveResp.json()) as { region: string; alerts: unknown[]; sources: unknown[] };
+      assert.equal(liveBody.region, 'mysuru');
+      assert.ok(Array.isArray(liveBody.alerts));
+      assert.ok(Array.isArray(liveBody.sources));
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (prevVercel !== undefined) process.env.VERCEL = prevVercel;
+      else delete process.env.VERCEL;
+      if (prevProdUrl !== undefined) process.env.VERCEL_PROJECT_PRODUCTION_URL = prevProdUrl;
+      else delete process.env.VERCEL_PROJECT_PRODUCTION_URL;
+      if (prevAppUrl !== undefined) process.env.APP_URL = prevAppUrl;
+      else delete process.env.APP_URL;
+    }
+  });
 });
+

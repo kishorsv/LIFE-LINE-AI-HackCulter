@@ -48,6 +48,7 @@ interface AuthContextValue {
   reportAuthBlockedAlert: (err: unknown, mode?: 'login' | 'workspace') => PersistedAuthBlockedAlert;
   dismissAuthBlockedAlert: () => void;
   realtimeConnected: boolean;
+  realtimeTransport: 'websocket' | 'polling';
   apiFetch: <T = unknown>(url: string, options?: RequestInit) => Promise<T>;
   loginWithEmail: (email: string, password: string) => Promise<void>;
   registerWithEmail: (input: {
@@ -113,6 +114,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     loadPersistedAuthBlockedAlert()
   );
   const [realtimeConnected, setRealtimeConnected] = useState(false);
+  const [realtimeTransport, setRealtimeTransport] = useState<'websocket' | 'polling'>('websocket');
 
   const wsRef = useRef<WebSocket | null>(null);
   const lastEventSeqRef = useRef<number>(0);
@@ -137,15 +139,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const controller = new AbortController();
     fetch('/api/config/public', { signal: controller.signal })
       .then((r) => r.json())
-      .then((data: { mapsApiKey?: string; demoSandboxEnabled?: boolean; developerContactEmail?: string }) => {
-        if (!initialMapsKeyRef.current && data.mapsApiKey) setMapsApiKey(data.mapsApiKey);
-        if (typeof data.demoSandboxEnabled === 'boolean') {
-          setDemoSandboxEnabled(data.demoSandboxEnabled);
+      .then(
+        (data: {
+          mapsApiKey?: string;
+          demoSandboxEnabled?: boolean;
+          developerContactEmail?: string;
+          realtimeTransport?: 'websocket' | 'polling';
+        }) => {
+          if (!initialMapsKeyRef.current && data.mapsApiKey) setMapsApiKey(data.mapsApiKey);
+          if (typeof data.demoSandboxEnabled === 'boolean') {
+            setDemoSandboxEnabled(data.demoSandboxEnabled);
+          }
+          if (data.developerContactEmail) {
+            setDeveloperContactEmail(data.developerContactEmail);
+          }
+          if (data.realtimeTransport === 'polling' || data.realtimeTransport === 'websocket') {
+            setRealtimeTransport(data.realtimeTransport);
+          }
         }
-        if (data.developerContactEmail) {
-          setDeveloperContactEmail(data.developerContactEmail);
-        }
-      })
+      )
       .catch(() => {});
     return () => controller.abort();
   }, []);
@@ -256,13 +268,59 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     })();
   }, [token, refreshAllData]);
 
-  // Real-time WebSocket connection with heartbeat, exponential-backoff reconnect & missed-event recovery
+  // Real-time WebSocket connection with automatic visibility-aware REST polling fallback for serverless environments
   useEffect(() => {
     if (!token || !user) {
       wsRef.current?.close();
       wsRef.current = null;
       setRealtimeConnected(false);
       return;
+    }
+
+    if (realtimeTransport === 'polling') {
+      wsRef.current?.close();
+      wsRef.current = null;
+      let disposed = false;
+
+      const syncPoll = async () => {
+        if (disposed) return;
+        if (typeof navigator !== 'undefined' && !navigator.onLine) {
+          setRealtimeConnected(false);
+          return;
+        }
+        try {
+          await refreshAllData();
+          if (!disposed) {
+            setRealtimeConnected(true);
+            window.dispatchEvent(new CustomEvent('lifeline-live-incidents-updated'));
+          }
+        } catch {
+          if (!disposed) setRealtimeConnected(false);
+        }
+      };
+
+      setRealtimeConnected(typeof navigator === 'undefined' ? true : navigator.onLine);
+      const pollTimer = setInterval(() => {
+        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+        void syncPoll();
+      }, 15_000);
+
+      const onOnline = () => void syncPoll();
+      const onOffline = () => setRealtimeConnected(false);
+      const onVisible = () => {
+        if (document.visibilityState === 'visible') void syncPoll();
+      };
+      window.addEventListener('online', onOnline);
+      window.addEventListener('offline', onOffline);
+      document.addEventListener('visibilitychange', onVisible);
+
+      return () => {
+        disposed = true;
+        clearInterval(pollTimer);
+        window.removeEventListener('online', onOnline);
+        window.removeEventListener('offline', onOffline);
+        document.removeEventListener('visibilitychange', onVisible);
+      };
     }
 
     let disposed = false;
@@ -310,8 +368,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
         // Do not retry if server closed due to failed authentication (1008)
         if (disposed || ev.code === 1008) return;
-        const backoffMs = Math.min(30_000, 1000 * Math.pow(2, attempt));
         attempt += 1;
+        // If WebSocket upgrades fail consecutively before ever opening (e.g. serverless proxy), switch to polling mode
+        if (!hasConnectedOnce && attempt >= 2) {
+          setRealtimeTransport('polling');
+          return;
+        }
+        const backoffMs = Math.min(30_000, 1000 * Math.pow(2, attempt - 1));
         reconnectTimer = setTimeout(connectSocket, backoffMs);
       };
 
@@ -395,7 +458,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (pingTimer) clearInterval(pingTimer);
       wsRef.current?.close();
     };
-  }, [token, user, apiFetch, refreshAllData]);
+  }, [token, user, realtimeTransport, apiFetch, refreshAllData]);
 
   const reportAuthBlockedAlert = useCallback(
     (err: unknown, mode: 'login' | 'workspace' = 'login'): PersistedAuthBlockedAlert => {
@@ -547,6 +610,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       reportAuthBlockedAlert,
       dismissAuthBlockedAlert,
       realtimeConnected,
+      realtimeTransport,
       apiFetch,
       loginWithEmail,
       registerWithEmail,
@@ -581,6 +645,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       reportAuthBlockedAlert,
       dismissAuthBlockedAlert,
       realtimeConnected,
+      realtimeTransport,
       apiFetch,
       refreshAllData,
       refreshJourneys,

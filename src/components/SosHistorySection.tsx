@@ -35,6 +35,7 @@ interface SosHistorySectionProps {
   incidents: EmergencyIncident[];
   language: AppLanguage;
   realtimeConnected: boolean;
+  realtimeTransport?: 'websocket' | 'polling';
   onMarkSafeIncident: (incidentId: number) => Promise<void>;
   onRefresh: () => Promise<void>;
   cancellingId: number | null;
@@ -84,6 +85,7 @@ export function SosHistorySection({
   incidents,
   language,
   realtimeConnected,
+  realtimeTransport = 'websocket',
   onMarkSafeIncident,
   onRefresh,
   cancellingId,
@@ -191,7 +193,13 @@ export function SosHistorySection({
             }`}
           >
             <Radio className="h-3 w-3" />
-            <span>{realtimeConnected ? 'Live Status Updates Active' : 'Offline / Reconnecting'}</span>
+            <span>
+              {realtimeConnected
+                ? realtimeTransport === 'polling'
+                  ? 'Live Polling Active'
+                  : 'Live Status Updates Active'
+                : 'Offline / Reconnecting'}
+            </span>
           </span>
           <button
             type="button"

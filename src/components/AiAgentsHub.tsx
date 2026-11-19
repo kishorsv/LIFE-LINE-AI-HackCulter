@@ -50,7 +50,7 @@ function base64PcmToAudioBuffer(ctx: AudioContext, base64: string): AudioBuffer 
 }
 
 export function AiAgentsHub({ onNavigate }: { onNavigate?: (view: ActiveView) => void }) {
-  const { apiFetch, profile, token, incidents, language } = useAuth();
+  const { apiFetch, profile, token, incidents, language, realtimeTransport } = useAuth();
   const [activeTab, setActiveTab] = useState<AgentTab>('assessment');
   const [agentError, setAgentError] = useState('');
 
@@ -160,19 +160,32 @@ export function AiAgentsHub({ onNavigate }: { onNavigate?: (view: ActiveView) =>
     uncertaintyNotes: string;
   } | null>(null);
 
-  // Live Voice Companion Refs
+  // Live Voice Companion Refs & Serverless Turn-Based Fallback
   const [liveActive, setLiveActive] = useState(false);
+  const [voiceMode, setVoiceMode] = useState<'websocket' | 'turn_based'>('websocket');
+  const [voiceProcessing, setVoiceProcessing] = useState(false);
   const [liveCaptions, setLiveCaptions] = useState<string[]>([]);
   const [liveError, setLiveError] = useState('');
   const liveWsRef = useRef<WebSocket | null>(null);
   const liveInputCtxRef = useRef<AudioContext | null>(null);
   const liveOutputCtxRef = useRef<AudioContext | null>(null);
   const liveStreamRef = useRef<MediaStream | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
   const nextStartTimeRef = useRef<number>(0);
 
   const handleImagePick = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    setAgentError('');
+    if (!file.type.startsWith('image/')) {
+      setAgentError('Please select a valid image file (JPEG, PNG, or WebP).');
+      return;
+    }
+    if (file.size > 6 * 1024 * 1024) {
+      setAgentError('Image is larger than 6 MB. Please upload a smaller photo.');
+      return;
+    }
     const reader = new FileReader();
     reader.onloadend = () => {
       const dataUrl = String(reader.result || '');
@@ -373,11 +386,95 @@ export function AiAgentsHub({ onNavigate }: { onNavigate?: (view: ActiveView) =>
       });
       const audio = new Audio(`data:${res.mimeType};base64,${res.audioBase64}`);
       await audio.play();
-    } catch {
-      // fallback silently if browser blocks autoplay or key unconfigured
+    } catch (err) {
+      setAgentError(err instanceof Error ? err.message : 'Unable to play calm voice guidance audio.');
     } finally {
       setTtsBusy(false);
     }
+  };
+
+  const cleanupVoiceResources = () => {
+    liveWsRef.current?.close();
+    liveWsRef.current = null;
+    liveStreamRef.current?.getTracks().forEach((t) => t.stop());
+    liveStreamRef.current = null;
+    liveInputCtxRef.current?.close().catch(() => {});
+    liveInputCtxRef.current = null;
+    liveOutputCtxRef.current?.close().catch(() => {});
+    liveOutputCtxRef.current = null;
+    setLiveActive(false);
+  };
+
+  const startTurnBasedVoiceRecording = async () => {
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+      setLiveError('Microphone recording is not supported in this browser.');
+      return;
+    }
+    setVoiceMode('turn_based');
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    liveStreamRef.current = stream;
+    recordedChunksRef.current = [];
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '';
+    const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+    mediaRecorderRef.current = recorder;
+
+    recorder.ondataavailable = (ev) => {
+      if (ev.data.size > 0) recordedChunksRef.current.push(ev.data);
+    };
+
+    recorder.onstop = async () => {
+      const blob = new Blob(recordedChunksRef.current, { type: recorder.mimeType || 'audio/webm' });
+      stream.getTracks().forEach((t) => t.stop());
+      liveStreamRef.current = null;
+      if (blob.size < 256) {
+        setLiveError('Recording too short. Hold and speak for at least 1 second.');
+        return;
+      }
+      setVoiceProcessing(true);
+      setLiveError('');
+      try {
+        const base64Audio = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            const raw = String(reader.result || '');
+            resolve(raw.split(',')[1] || '');
+          };
+          reader.onerror = () => reject(new Error('Failed to encode audio clip.'));
+          reader.readAsDataURL(blob);
+        });
+        const tr = await apiFetch<{ transcript: string }>('/api/ai/transcribe', {
+          method: 'POST',
+          body: JSON.stringify({
+            audioBase64: base64Audio,
+            mimeType: blob.type || 'audio/webm',
+          }),
+        });
+        const spokenText = (tr.transcript || '').trim();
+        if (!spokenText) {
+          setLiveError('No speech detected. Try speaking closer to the microphone.');
+          return;
+        }
+        setLiveCaptions((prev) => [...prev.slice(-8), `You: ${spokenText}`]);
+        const reply = await apiFetch<{ reply: string }>('/api/ai/assistant', {
+          method: 'POST',
+          body: JSON.stringify({
+            message: spokenText,
+            history: chatHistory,
+            fastMode: true,
+            language,
+          }),
+        });
+        setLiveCaptions((prev) => [...prev.slice(-8), `LIFE-LINE AI: ${reply.reply}`]);
+        await playCalmTts(reply.reply);
+      } catch (err) {
+        setLiveError(err instanceof Error ? err.message : 'Voice companion turn failed.');
+      } finally {
+        setVoiceProcessing(false);
+      }
+    };
+
+    recorder.start();
+    setLiveActive(true);
   };
 
   const startLiveVoiceSession = async () => {
@@ -386,6 +483,21 @@ export function AiAgentsHub({ onNavigate }: { onNavigate?: (view: ActiveView) =>
       setLiveError('Please sign in first to open an authenticated voice session.');
       return;
     }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setLiveError('Microphone access is unavailable in this browser.');
+      return;
+    }
+
+    if (realtimeTransport === 'polling') {
+      try {
+        await startTurnBasedVoiceRecording();
+      } catch (err) {
+        setLiveError(err instanceof Error ? err.message : 'Unable to start microphone recording.');
+      }
+      return;
+    }
+
+    setVoiceMode('websocket');
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       liveStreamRef.current = stream;
@@ -398,6 +510,7 @@ export function AiAgentsHub({ onNavigate }: { onNavigate?: (view: ActiveView) =>
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const ws = new WebSocket(`${proto}//${window.location.host}/ws/live?token=${encodeURIComponent(token)}`);
       liveWsRef.current = ws;
+      let receivedReady = false;
 
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data) as {
@@ -408,9 +521,10 @@ export function AiAgentsHub({ onNavigate }: { onNavigate?: (view: ActiveView) =>
           error?: string;
           interrupted?: boolean;
         };
+        if (msg.ready) receivedReady = true;
         if (msg.error) {
           setLiveError(msg.error);
-          stopLiveVoiceSession();
+          cleanupVoiceResources();
           return;
         }
         if (msg.inputTranscript) {
@@ -433,6 +547,22 @@ export function AiAgentsHub({ onNavigate }: { onNavigate?: (view: ActiveView) =>
         }
       };
 
+      ws.onerror = () => {
+        cleanupVoiceResources();
+        setVoiceMode('turn_based');
+        setLiveError('Live WebSocket stream unavailable — switched to Turn-Based Voice Mode. Click Start again to record.');
+      };
+
+      ws.onclose = () => {
+        if (!receivedReady) {
+          cleanupVoiceResources();
+          setVoiceMode('turn_based');
+          setLiveError('Live WebSocket stream closed — switched to Turn-Based Voice Mode. Click Start again to record.');
+        } else {
+          cleanupVoiceResources();
+        }
+      };
+
       const source = inputCtx.createMediaStreamSource(stream);
       const processor = inputCtx.createScriptProcessor(4096, 1, 1);
       source.connect(processor);
@@ -447,16 +577,18 @@ export function AiAgentsHub({ onNavigate }: { onNavigate?: (view: ActiveView) =>
 
       setLiveActive(true);
     } catch (err) {
+      cleanupVoiceResources();
       setLiveError(err instanceof Error ? err.message : 'Unable to start live voice session.');
     }
   };
 
   const stopLiveVoiceSession = () => {
-    liveWsRef.current?.close();
-    liveStreamRef.current?.getTracks().forEach((t) => t.stop());
-    liveInputCtxRef.current?.close().catch(() => {});
-    liveOutputCtxRef.current?.close().catch(() => {});
-    setLiveActive(false);
+    if (voiceMode === 'turn_based' && mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+      setLiveActive(false);
+      return;
+    }
+    cleanupVoiceResources();
   };
 
   const tabs: Array<{ id: AgentTab; label: string; icon: React.ReactNode }> = [
@@ -914,7 +1046,9 @@ export function AiAgentsHub({ onNavigate }: { onNavigate?: (view: ActiveView) =>
                 <h2 className="font-display text-base font-bold">Real-Time Voice Safety Companion</h2>
               </div>
               <p className="mt-1.5 text-xs text-slate-500 dark:text-slate-400">
-                Hands-free two-way audio conversation over WebSocket (16kHz mic input, 24kHz calm audio output).
+                {realtimeTransport === 'polling' || voiceMode === 'turn_based'
+                  ? 'Turn-based voice safety mode: record your voice, transcribe securely, and hear calm AI guidance.'
+                  : 'Hands-free two-way audio conversation over WebSocket (16kHz mic input, 24kHz calm audio output).'}
               </p>
 
               {liveError && (
@@ -941,11 +1075,18 @@ export function AiAgentsHub({ onNavigate }: { onNavigate?: (view: ActiveView) =>
             {!liveActive ? (
               <button
                 type="button"
+                disabled={voiceProcessing}
                 onClick={startLiveVoiceSession}
-                className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-violet-600 py-3 text-sm font-semibold text-white hover:bg-violet-500"
+                className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-violet-600 py-3 text-sm font-semibold text-white hover:bg-violet-500 disabled:opacity-60"
               >
                 <Mic className="h-4 w-4" />
-                <span>Start Voice Companion</span>
+                <span>
+                  {voiceProcessing
+                    ? 'Processing Voice Turn...'
+                    : realtimeTransport === 'polling' || voiceMode === 'turn_based'
+                    ? 'Record Voice Question'
+                    : 'Start Voice Companion'}
+                </span>
               </button>
             ) : (
               <button
@@ -954,7 +1095,11 @@ export function AiAgentsHub({ onNavigate }: { onNavigate?: (view: ActiveView) =>
                 className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-rose-600 py-3 text-sm font-semibold text-white hover:bg-rose-500"
               >
                 <PhoneOff className="h-4 w-4" />
-                <span>End Voice Session</span>
+                <span>
+                  {voiceMode === 'turn_based' || realtimeTransport === 'polling'
+                    ? 'Stop & Send Voice Question'
+                    : 'End Voice Session'}
+                </span>
               </button>
             )}
           </div>

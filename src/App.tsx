@@ -19,6 +19,7 @@ import {
   recordQueuedSosRetryFailure,
   removeQueuedSos,
 } from './lib/offlineSosQueue.ts';
+import type { GoogleMapsAuthErrorDetail } from './lib/googleMapsStatus.ts';
 
 const UserDashboard = React.lazy(() =>
   import('./components/UserDashboard.tsx').then((m) => ({ default: m.UserDashboard }))
@@ -81,6 +82,9 @@ function AppShell() {
   const [notifDrawerOpen, setNotifDrawerOpen] = useState(false);
   const [workspaceConfirm, setWorkspaceConfirm] = useState<WorkspaceConfirmPayload | null>(null);
   const [mapsQuotaExceeded, setMapsQuotaExceeded] = useState(false);
+  const [mapsAuthError, setMapsAuthError] = useState<GoogleMapsAuthErrorDetail | null>(() =>
+    typeof window !== 'undefined' ? window.__lifelineMapsAuthError || null : null
+  );
   const [queuedSosCount, setQueuedSosCount] = useState(0);
   const [failedSosCount, setFailedSosCount] = useState(0);
   const flushingRef = React.useRef(false);
@@ -113,8 +117,22 @@ function AppShell() {
   useEffect(() => {
     clearLegacySharedSosQueue();
     const onQuota = () => setMapsQuotaExceeded(true);
+    const onAuthErr = (ev: Event) => {
+      const detail = (ev as CustomEvent<GoogleMapsAuthErrorDetail>).detail;
+      if (detail) setMapsAuthError(detail);
+    };
+    const onCleared = () => {
+      setMapsQuotaExceeded(false);
+      setMapsAuthError(null);
+    };
     window.addEventListener('gmp-quota-exceeded', onQuota);
-    return () => window.removeEventListener('gmp-quota-exceeded', onQuota);
+    window.addEventListener('gmp-auth-error', onAuthErr);
+    window.addEventListener('gmp-auth-cleared', onCleared);
+    return () => {
+      window.removeEventListener('gmp-quota-exceeded', onQuota);
+      window.removeEventListener('gmp-auth-error', onAuthErr);
+      window.removeEventListener('gmp-auth-cleared', onCleared);
+    };
   }, []);
 
   useEffect(() => {
@@ -285,7 +303,7 @@ function AppShell() {
 
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-[#060916] text-slate-900 dark:text-slate-100 transition-colors">
-      {/* Case A Demo Key Quota Banner */}
+      {/* Google Maps Quota & Referrer/Auth Banners */}
       {mapsQuotaExceeded && (
         <div className="bg-amber-50 border-b border-amber-200 text-amber-900 px-4 py-2.5 text-xs md:text-sm text-center sticky top-0 z-50 shadow-sm">
           <span>
@@ -300,6 +318,26 @@ function AppShell() {
             </a>{' '}
             for instructions to update your account.
           </span>
+        </div>
+      )}
+      {mapsAuthError && !mapsQuotaExceeded && (
+        <div className="bg-amber-50 border-b border-amber-200 text-amber-950 px-4 py-2.5 text-xs md:text-sm sticky top-0 z-50 shadow-sm flex items-center justify-center gap-3">
+          <span>
+            <strong>Google Maps ({mapsAuthError.code}):</strong> {mapsAuthError.message}{' '}
+            {mapsAuthError.origin && (
+              <span>
+                Allowlist referrer <code className="rounded bg-amber-200/70 px-1 py-0.5 font-mono text-[11px]">{mapsAuthError.origin}/*</code> in Google Cloud Console.
+              </span>
+            )}
+          </span>
+          <button
+            type="button"
+            onClick={() => setMapsAuthError(null)}
+            className="rounded px-1.5 py-0.5 text-amber-800 hover:bg-amber-200/60"
+            aria-label="Dismiss Google Maps error banner"
+          >
+            <X className="h-4 w-4" />
+          </button>
         </div>
       )}
 

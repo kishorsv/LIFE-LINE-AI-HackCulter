@@ -631,7 +631,12 @@ export function OperatorDashboard() {
               <button
                 type="button"
                 onClick={() => {
-                  apiFetch<MonitoringSnapshot>('/api/admin/monitoring').then(setMonitoring).catch(() => {});
+                  setActionError('');
+                  apiFetch<MonitoringSnapshot>('/api/admin/monitoring')
+                    .then(setMonitoring)
+                    .catch((err) => {
+                      setActionError(err instanceof Error ? err.message : 'Failed to refresh monitoring snapshot.');
+                    });
                 }}
                 className="inline-flex items-center gap-1.5 rounded-xl bg-violet-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-violet-500"
               >

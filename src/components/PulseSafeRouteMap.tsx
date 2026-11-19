@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { APIProvider, AdvancedMarker, Map as GoogleMap, Pin, useMap } from '@vis.gl/react-google-maps';
 import { SafeRouteCandidateItem } from '../types/lifeline.ts';
+import { GoogleMapsErrorOverlay, MapCameraController, useGoogleMapsStatus } from './GoogleMapsHelpers.tsx';
 
 function PulsePolylineRenderer({
   routes,
@@ -81,23 +82,31 @@ export default function PulseSafeRouteMap({
   routes,
   selectedRouteIdx,
 }: PulseSafeRouteMapProps) {
+  const { mapsAuthError, mapsQuotaExceeded, retrySeed, handleApiError, retryMaps } = useGoogleMapsStatus();
+  const originCenter = { lat, lng };
+
   return (
-    <APIProvider apiKey={mapsApiKey}>
-      <GoogleMap
-        defaultCenter={{ lat, lng }}
-        defaultZoom={14}
-        mapId="DEMO_MAP_ID"
-        internalUsageAttributionIds={['gmp_mcp_codeassist_v1_aistudio']}
-        className="h-full w-full"
-      >
-        <AdvancedMarker position={{ lat, lng }} title="Origin">
-          <Pin background="#8B5CF6" glyphColor="#FFFFFF" borderColor="#DDD6FE" />
-        </AdvancedMarker>
-        <AdvancedMarker position={{ lat: destLat, lng: destLng }} title={destLabel}>
-          <Pin background="#10B981" glyphColor="#FFFFFF" borderColor="#A7F3D0" />
-        </AdvancedMarker>
-        <PulsePolylineRenderer routes={routes} selectedIndex={selectedRouteIdx} />
-      </GoogleMap>
-    </APIProvider>
+    <div className="relative h-full w-full">
+      <APIProvider key={retrySeed} apiKey={mapsApiKey} onError={handleApiError}>
+        <GoogleMap
+          defaultCenter={originCenter}
+          defaultZoom={14}
+          mapId="DEMO_MAP_ID"
+          gestureHandling="greedy"
+          internalUsageAttributionIds={['gmp_mcp_codeassist_v1_aistudio']}
+          className="h-full w-full"
+        >
+          {routes.length === 0 && <MapCameraController center={originCenter} />}
+          <AdvancedMarker position={originCenter} title="Origin">
+            <Pin background="#8B5CF6" glyphColor="#FFFFFF" borderColor="#DDD6FE" />
+          </AdvancedMarker>
+          <AdvancedMarker position={{ lat: destLat, lng: destLng }} title={destLabel}>
+            <Pin background="#10B981" glyphColor="#FFFFFF" borderColor="#A7F3D0" />
+          </AdvancedMarker>
+          <PulsePolylineRenderer routes={routes} selectedIndex={selectedRouteIdx} />
+        </GoogleMap>
+      </APIProvider>
+      <GoogleMapsErrorOverlay authError={mapsAuthError} quotaExceeded={mapsQuotaExceeded} onRetry={retryMaps} />
+    </div>
   );
 }

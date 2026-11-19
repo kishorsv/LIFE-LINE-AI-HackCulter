@@ -31,6 +31,7 @@ import {
   D3HourlyIncidentChart,
   D3SpatialFallbackClusterMap,
 } from './D3SosClusterLayer.tsx';
+import { GoogleMapsErrorOverlay, MapCameraController, useGoogleMapsStatus } from './GoogleMapsHelpers.tsx';
 
 interface LivePlaceResult {
   id: string;
@@ -127,7 +128,7 @@ function SafeRouteOverlay({ origin, destination, travelMode, onRouteComputed }: 
         if (msg.includes('OVER_QUERY_LIMIT') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('429')) {
           window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
         }
-        onRouteComputed(null, 'Route preview unavailable right now.');
+        onRouteComputed(null, msg && !msg.includes('ZERO_RESULTS') ? `Route preview unavailable: ${msg}` : 'Route preview unavailable right now.');
       });
 
     return () => {
@@ -142,8 +143,10 @@ function SafeRouteOverlay({ origin, destination, travelMode, onRouteComputed }: 
 
 function AreaAutocompleteInput({
   onSelectLocation,
+  onError,
 }: {
   onSelectLocation: (lat: number, lng: number, label: string) => void;
+  onError?: (msg: string) => void;
 }) {
   const placesLib = useMapsLibrary('places');
   const [query, setQuery] = useState('');
@@ -178,6 +181,8 @@ function AreaAutocompleteInput({
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes('OVER_QUERY_LIMIT') || msg.includes('RESOURCE_EXHAUSTED')) {
           window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+        } else if (!cancelled && onError && msg) {
+          onError(`Places autocomplete error: ${msg}`);
         }
       });
 
@@ -247,6 +252,7 @@ const CATEGORIES = [
 
 export function LiveMapPage() {
   const { mapsApiKey, profile, apiFetch, user } = useAuth();
+  const { mapsAuthError, mapsQuotaExceeded, retrySeed, handleApiError, retryMaps } = useGoogleMapsStatus();
   const [userCoords, setUserCoords] = useState<{ lat: number; lng: number }>({
     lat: profile?.lastKnownLat ?? 37.7749,
     lng: profile?.lastKnownLng ?? -122.4194,
@@ -318,7 +324,11 @@ export function LiveMapPage() {
       .then((d) => {
         if (!controller.signal.aborted) setDirectory(d.resources || []);
       })
-      .catch(() => {});
+      .catch((err: unknown) => {
+        if (!controller.signal.aborted) {
+          setPlacesError(err instanceof Error ? err.message : 'Unable to load support directory.');
+        }
+      });
 
     return () => controller.abort();
   }, [categoryFilter, debouncedSearchQuery]);
@@ -368,7 +378,11 @@ export function LiveMapPage() {
   }, [userCoords.lat, userCoords.lng, clusterWindowDays, includeSimulatedClusters]);
 
   const detectBrowserLocation = () => {
-    if (!('geolocation' in navigator)) return;
+    if (!('geolocation' in navigator)) {
+      setPlacesError('Browser geolocation is unavailable in this environment. Use manual area search below.');
+      return;
+    }
+    setPlacesError('');
     navigator.geolocation.getCurrentPosition(
       (pos) => {
         const { latitude, longitude } = pos.coords;
@@ -448,15 +462,23 @@ export function LiveMapPage() {
     setPlacesError('');
     try {
       const resp = await fetch(`/api/maps/geocode?address=${encodeURIComponent(manualAddress.trim())}`);
-      const data = await resp.json();
+      const data = (await resp.json().catch(() => ({}))) as {
+        error?: string | { message?: string };
+        results?: Array<{ formatted_address?: string; geometry?: { location?: { lat: number; lng: number } } }>;
+      };
       if (resp.status === 429) {
         window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+        return;
+      }
+      if (!resp.ok) {
+        const errMsg = typeof data.error === 'string' ? data.error : data.error?.message || `Address lookup failed (${resp.status}).`;
+        setPlacesError(errMsg);
         return;
       }
       const loc = data?.results?.[0]?.geometry?.location;
       if (loc) {
         setUserCoords({ lat: loc.lat, lng: loc.lng });
-        setLocationLabel(data.results[0].formatted_address || manualAddress.trim());
+        setLocationLabel(data.results?.[0]?.formatted_address || manualAddress.trim());
       } else {
         setPlacesError('Address not found. Try a city or landmark name.');
       }
@@ -564,13 +586,14 @@ export function LiveMapPage() {
         </div>
 
         {mapsApiKey ? (
-          <APIProvider apiKey={mapsApiKey}>
+          <APIProvider key={retrySeed} apiKey={mapsApiKey} onError={handleApiError}>
             <div className="flex flex-wrap items-center gap-3">
               <AreaAutocompleteInput
                 onSelectLocation={(lat, lng, label) => {
                   setUserCoords({ lat, lng });
                   setLocationLabel(label);
                 }}
+                onError={(msg) => setPlacesError(msg)}
               />
               <form onSubmit={handleManualGeocode} className="flex items-center gap-2">
                 <input
@@ -627,15 +650,16 @@ export function LiveMapPage() {
               </div>
             )}
 
-            <div className="h-[460px] w-full overflow-hidden rounded-xl border border-slate-200 dark:border-slate-800">
+            <div className="relative h-[460px] w-full overflow-hidden rounded-xl border border-slate-200 dark:border-slate-800">
               <GoogleMap
-                center={userCoords}
+                defaultCenter={userCoords}
                 defaultZoom={13}
                 mapId="DEMO_MAP_ID"
                 gestureHandling="greedy"
                 internalUsageAttributionIds={['gmp_mcp_codeassist_v1_aistudio']}
                 style={{ width: '100%', height: '100%' }}
               >
+                <MapCameraController center={userCoords} />
                 {/* User Position Pin */}
                 <AdvancedMarker
                   position={userCoords}
@@ -744,6 +768,7 @@ export function LiveMapPage() {
                   onRouteComputed={handleRouteResult}
                 />
               </GoogleMap>
+              <GoogleMapsErrorOverlay authError={mapsAuthError} quotaExceeded={mapsQuotaExceeded} onRetry={retryMaps} />
             </div>
           </APIProvider>
         ) : (

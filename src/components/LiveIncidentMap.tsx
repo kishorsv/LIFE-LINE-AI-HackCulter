@@ -2,6 +2,7 @@ import React, { useMemo, useState } from 'react';
 import { APIProvider, AdvancedMarker, InfoWindow, Map as GoogleMap, Pin } from '@vis.gl/react-google-maps';
 import { ExternalLink, MapPin, Phone, ShieldAlert, ShieldCheck } from 'lucide-react';
 import { LiveExternalAlert, SupportResource } from '../types/lifeline.ts';
+import { GoogleMapsErrorOverlay, MapCameraController, useGoogleMapsStatus } from './GoogleMapsHelpers.tsx';
 
 export interface LiveIncidentMapProps {
   mapsApiKey: string;
@@ -39,6 +40,7 @@ export default function LiveIncidentMap({
   onSelectAlert,
 }: LiveIncidentMapProps) {
   const [selectedHub, setSelectedHub] = useState<SupportResource | null>(null);
+  const { mapsAuthError, mapsQuotaExceeded, retrySeed, handleApiError, retryMaps } = useGoogleMapsStatus();
 
   const mappableAlerts = useMemo(
     () =>
@@ -148,14 +150,16 @@ export default function LiveIncidentMap({
 
   return (
     <div className="relative h-[420px] w-full overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm">
-      <APIProvider apiKey={mapsApiKey}>
+      <APIProvider key={retrySeed} apiKey={mapsApiKey} onError={handleApiError}>
         <GoogleMap
-          center={center}
+          defaultCenter={center}
           defaultZoom={mappableAlerts.length > 5 ? 6 : 11}
           mapId="DEMO_MAP_ID"
+          gestureHandling="greedy"
           internalUsageAttributionIds={['gmp_mcp_codeassist_v1_aistudio']}
           style={{ width: '100%', height: '100%' }}
         >
+          <MapCameraController center={center} />
           {/* Locality Focus Pin */}
           <AdvancedMarker position={center} title={localityName}>
             <Pin background="#0284C7" borderColor="#FFFFFF" glyphColor="#FFFFFF" />
@@ -254,6 +258,7 @@ export default function LiveIncidentMap({
           )}
         </GoogleMap>
       </APIProvider>
+      <GoogleMapsErrorOverlay authError={mapsAuthError} quotaExceeded={mapsQuotaExceeded} onRetry={retryMaps} />
     </div>
   );
 }

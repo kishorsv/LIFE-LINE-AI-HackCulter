@@ -86,7 +86,7 @@ const VERIFICATION_BADGE: Record<LiveIncidentVerificationStatus, string> = {
 };
 
 export function LiveIncidentsPage({ onOpenAuth }: { onOpenAuth: () => void }) {
-  const { user, mapsApiKey, apiFetch, language, realtimeConnected } = useAuth();
+  const { user, mapsApiKey, apiFetch, language, realtimeConnected, realtimeTransport } = useAuth();
 
   const [region, setRegion] = useState<'mysuru' | 'karnataka' | 'india'>('mysuru');
   const [selectedPreset, setSelectedPreset] = useState(CITY_PRESETS[0]);
@@ -159,14 +159,24 @@ export function LiveIncidentsPage({ onOpenAuth }: { onOpenAuth: () => void }) {
     void loadFeed();
   }, [loadFeed]);
 
-  // Listen to WebSocket live_incident updates dispatched via AuthContext
+  // Listen to WebSocket live_incident updates and poll periodically when using serverless polling transport
   useEffect(() => {
     const onRealtimeLiveEvent = () => {
       void loadFeed();
     };
     window.addEventListener('lifeline-live-incidents-updated', onRealtimeLiveEvent);
-    return () => window.removeEventListener('lifeline-live-incidents-updated', onRealtimeLiveEvent);
-  }, [loadFeed]);
+    const pollTimer =
+      realtimeTransport === 'polling'
+        ? setInterval(() => {
+            if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+            void loadFeed();
+          }, 45_000)
+        : null;
+    return () => {
+      window.removeEventListener('lifeline-live-incidents-updated', onRealtimeLiveEvent);
+      if (pollTimer) clearInterval(pollTimer);
+    };
+  }, [loadFeed, realtimeTransport]);
 
   const handleManualSync = async () => {
     if (!isPrivilegedOperator) return;
@@ -220,11 +230,14 @@ export function LiveIncidentsPage({ onOpenAuth }: { onOpenAuth: () => void }) {
       });
       const resp = await fetch(`/api/live-incidents/mysuru-intel?${qs.toString()}`);
       const data = await resp.json();
-      if (resp.ok && data.whatIf) {
+      if (!resp.ok) {
+        throw new Error(data.error || `Scenario simulation failed (${resp.status}).`);
+      }
+      if (data.whatIf) {
         setWhatIfResult(data.whatIf as WhatIfSimResult);
       }
-    } catch {
-      // ignore transient error
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to run scenario simulation.');
     } finally {
       setWhatIfLoading(false);
     }
@@ -294,7 +307,12 @@ export function LiveIncidentsPage({ onOpenAuth }: { onOpenAuth: () => void }) {
           <div className="inline-flex items-center gap-2 rounded-lg border border-violet-500/30 bg-violet-500/10 px-3 py-1 text-xs font-semibold text-violet-700 dark:text-violet-300">
             <Radio className="h-3.5 w-3.5" />
             <span>LIVE INCIDENT INTELLIGENCE · MYSURU PILOT &amp; ALL INDIA</span>
-            {realtimeConnected && <span className="h-2 w-2 rounded-full bg-emerald-500" title="WebSocket Live" />}
+            {(realtimeConnected || realtimeTransport === 'polling') && (
+              <span
+                className="h-2 w-2 rounded-full bg-emerald-500"
+                title={realtimeTransport === 'polling' ? 'Live Polling Active' : 'WebSocket Live'}
+              />
+            )}
           </div>
           <h1 className="mt-2 font-display text-2xl sm:text-3xl font-bold text-slate-900 dark:text-white">
             Real-World Disaster Monitoring &amp; Minutes-to-Safety Engine

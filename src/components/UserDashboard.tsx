@@ -62,6 +62,7 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
     refreshJourneys,
     markAllNotificationsRead,
     realtimeConnected,
+    realtimeTransport,
   } = useAuth();
 
   const [safetyStatus, setSafetyStatus] = useState(profile?.safetyStatus || 'Safe');
@@ -131,7 +132,10 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
   };
 
   const handleCaptureGps = () => {
-    if (!('geolocation' in navigator)) return;
+    if (!('geolocation' in navigator)) {
+      setDashboardError('Browser geolocation is unavailable in this environment.');
+      return;
+    }
     setDashboardError('');
     navigator.geolocation.getCurrentPosition(
       async (pos) => {
@@ -462,8 +466,13 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
                   Welcome back, {user?.displayName}
                 </h1>
                 <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                  Real-time WebSocket link: {realtimeConnected ? 'Connected' : 'Reconnecting...'} ·{' '}
-                  {user?.isDemoAccount ? 'Hackathon Demo Sandbox Account [SIMULATED]' : 'Verified Standard Session'}
+                  Live sync ({realtimeTransport === 'polling' ? 'Polling' : 'WebSocket'}):{' '}
+                  {realtimeConnected
+                    ? realtimeTransport === 'polling'
+                      ? 'Active'
+                      : 'Connected'
+                    : 'Reconnecting...'}{' '}
+                  · {user?.isDemoAccount ? 'Hackathon Demo Sandbox Account [SIMULATED]' : 'Verified Standard Session'}
                 </p>
               </div>
             </div>
@@ -593,6 +602,7 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
         incidents={incidents}
         language={language}
         realtimeConnected={realtimeConnected}
+        realtimeTransport={realtimeTransport}
         onMarkSafeIncident={handleMarkSafeIncident}
         onRefresh={refreshAllData}
         cancellingId={cancellingId}
@@ -724,7 +734,9 @@ export function UserDashboard({ onNavigate, onOpenSos, onRequestWorkspaceConfirm
               <button
                 type="button"
                 onClick={() => {
-                  void markAllNotificationsRead();
+                  markAllNotificationsRead().catch((err) => {
+                    setDashboardError(err instanceof Error ? err.message : 'Unable to mark notifications as read.');
+                  });
                 }}
                 className="inline-flex items-center gap-1 text-[11px] font-semibold text-violet-600 dark:text-violet-400 hover:underline"
               >

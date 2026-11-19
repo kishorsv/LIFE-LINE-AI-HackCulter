@@ -5,9 +5,22 @@ import App from './App.tsx';
 import './index.css';
 import { initWebVitalsReporting } from './lib/webVitals.ts';
 
-// Tier 1 Google Maps Demo Key Quota Defense (registered before React mounts)
+import {
+  detectMapsErrorCodeFromText,
+  dispatchMapsAuthError,
+  dispatchMapsQuotaExceeded,
+} from './lib/googleMapsStatus.ts';
+
+let lastQuotaErrorAt = 0;
+let lastAuthErrorAt = 0;
+
+// Google Maps Auth & Quota Defense (registered before React mounts)
 (window as unknown as { gm_authFailure?: () => void }).gm_authFailure = () => {
-  window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+  setTimeout(() => {
+    const now = Date.now();
+    if (now - lastQuotaErrorAt < 800 || now - lastAuthErrorAt < 800) return;
+    dispatchMapsAuthError('AuthFailure');
+  }, 80);
 };
 
 const origConsoleError = console.error;
@@ -15,7 +28,14 @@ console.error = (...args: unknown[]) => {
   origConsoleError.apply(console, args);
   const msg = args.map((a) => String(a)).join(' ');
   if (msg.includes('OverQuotaMapError') || msg.includes('QuotaExceededError')) {
-    window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+    lastQuotaErrorAt = Date.now();
+    dispatchMapsQuotaExceeded();
+    return;
+  }
+  const detectedCode = detectMapsErrorCodeFromText(msg);
+  if (detectedCode || msg.includes('Google Maps JavaScript API error')) {
+    lastAuthErrorAt = Date.now();
+    dispatchMapsAuthError(detectedCode || 'AuthFailure', msg);
   }
 };
 
