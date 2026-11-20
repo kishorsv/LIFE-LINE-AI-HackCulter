@@ -73,7 +73,7 @@ import {
   verifyUserEmailCode,
   writeAuditLog,
 } from './src/db/repository.ts';
-import firebaseConfig from './firebase-applet-config.json';
+import firebaseConfig from './firebase-applet-config.json' with { type: 'json' };
 import {
   AuthRequest,
   FirebaseTokenVerifier,
